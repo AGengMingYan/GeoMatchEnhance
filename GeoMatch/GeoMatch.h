@@ -13,6 +13,7 @@
 //***********************************************************************
 #pragma once
 
+#include <opencv2/core/types.hpp>
 #include <opencv2/opencv.hpp>
 #include <string>
 #include <vector>
@@ -192,6 +193,7 @@ public:
     // the model points, their gradients and the outline
     cv::Mat drawResult(const cv::Mat& gray, const std::vector<Detection>& dets) const;
 
+    std::vector<cv::Point2d> getDrawResult(const std::vector<Detection>& dets);
     //---- batch ----------------------------------------------------------
     // match every image in the list, write the annotated images into outDir
     // and return the statistics.  writeImages=false skips drawing + imwrite

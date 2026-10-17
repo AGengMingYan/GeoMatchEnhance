@@ -1,6 +1,7 @@
 //***********************************************************************
 //  GeoMatch - implementation of the facade declared in GeoMatch.h
 //***********************************************************************
+#include <opencv2/core/types.hpp>
 #define _CRT_SECURE_NO_WARNINGS
 
 #include "GeoMatch.h"
@@ -344,6 +345,26 @@ cv::Mat Matcher::drawResult(const cv::Mat& gray, const std::vector<Detection>& d
     cv::putText(vis, hdr.str(), cv::Point(6, 17),
                 cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 255), 1, cv::LINE_AA);
     return vis;
+}
+
+std::vector<cv::Point2d> Matcher::getDrawResult(const std::vector<Detection>& dets)
+{
+    std::vector<cv::Point2d> res;
+    const std::vector<ModelPoint>& modelPts = core_->modelPoints(0);
+    const cv::Point2f tplCtr = core_->modelCenter();
+    for (size_t k = 0; k < dets.size(); k++)
+    {
+        const Detection& d = dets[k];
+        const float ca = (float)std::cos(d.angle), sa = (float)std::sin(d.angle);
+        const float s  = d.scale;
+        for (const ModelPoint& mp : modelPts) {
+            const float x = s * (mp.x * ca + mp.y * sa) + d.pos.x;
+            const float y = s * (-mp.x * sa + mp.y * ca) + d.pos.y;
+            res.push_back(cv::Point2d(x, y));
+        }
+    }
+
+    return res;
 }
 
 //=======================================================================
