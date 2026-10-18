@@ -221,7 +221,7 @@ namespace
             const Detection& d = dets[k];
             std::cout << "        #" << k
                       << "  score=" << std::setprecision(3) << d.score
-                      << "  pos=(" << (int)d.pos.x << "," << (int)d.pos.y << ")"
+                      << "  pos=(" << (int)d.pos.x << ";" << (int)d.pos.y << ")"
                       << "  angle=" << std::setprecision(1) << (d.angle * 180.0 / CV_PI)
                       << "deg  scale=" << std::setprecision(3) << d.scale << "\n";
         }
@@ -458,10 +458,9 @@ int main(int argc, char** argv)
                 for (size_t k = 0; k < p.detections->size(); k++)
                 {
                     const Detection& d = (*p.detections)[k];
-                    std::cout << "    #" << k << "  s=" << std::setprecision(3) << d.score
-                              << "  a=" << std::setprecision(1) << (d.angle * 180.0 / CV_PI)
-                              << "deg  k=" << std::setprecision(3) << d.scale
-                              << "  pos=(" << (int)d.pos.x << "," << (int)d.pos.y << ")\n";
+                    printf("    #%zu  s=%.3f  a=%.1fdeg  k=%.3f  pos=(%d;%d)\n",
+                           k, d.score, d.angle * 180.0 / CV_PI, d.scale,
+                           (int)d.pos.x, (int)d.pos.y);
                 }
         });
 
