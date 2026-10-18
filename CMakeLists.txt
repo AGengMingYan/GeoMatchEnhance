@@ -6,7 +6,7 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
-set(OPENCV_ROOT "D:/Develop/OpenCV455/opencv/build" CACHE PATH "OpenCV build/install root")
+set(OPENCV_ROOT "D:/develop2/OpenCV455/opencv/build" CACHE PATH "OpenCV build/install root")
 
 if(EXISTS "${OPENCV_ROOT}/OpenCVConfig.cmake")
     set(OpenCV_DIR "${OPENCV_ROOT}")
@@ -69,14 +69,18 @@ endif()
 #  command line front end - now only argument parsing and printing
 #-----------------------------------------------------------------------
 add_executable(GeoMatchDemo main.cpp)
+add_executable(Demo1 main1.cpp)
+
 
 target_include_directories(GeoMatchDemo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(GeoMatchDemo PRIVATE GeoMatch)
+target_link_libraries(Demo1 PRIVATE GeoMatch)
 
 # release build uses fast math + SIMD; MSVC also gets /arch:AVX2 when available
 if(MSVC)
     target_compile_options(GeoMatch  PRIVATE $<$<CONFIG:Release>:/O2 /arch:AVX2>)
     target_compile_options(GeoMatchDemo PRIVATE $<$<CONFIG:Release>:/O2 /arch:AVX2>)
+    target_compile_options(Demo1 PRIVATE $<$<CONFIG:Release>:/O2 /arch:AVX2>)
 endif()
 
 target_compile_definitions(GeoMatchDemo PRIVATE _USE_MATH_DEFINES)

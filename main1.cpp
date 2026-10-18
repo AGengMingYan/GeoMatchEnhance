@@ -64,23 +64,21 @@ void t2() {
                     << "  angle=" << std::setprecision(1) << (d.angle * 180.0 / CV_PI)
                     << "deg  scale=" << std::setprecision(3) << d.scale << "\n";
     }
-    // cv::Mat vis = m.drawResult(img, dets);
-    // imshow("", vis);
+    cv::Mat vis = m.drawResult(img, dets);
+    imshow("", vis);
 
     auto pos = m.getDrawResult(dets);
     for(cv::Point2d p : pos) {
         cv::circle(drawImg, p, 1,
             cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
     }
-    cv::imshow("", drawImg);
+    cv::imshow("points", drawImg);
 
     cv::waitKey(0);
 
 }
 
 int main() {
-    
     t2();
-    
     return 0;
 }
