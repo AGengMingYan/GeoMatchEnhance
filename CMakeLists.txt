@@ -6,29 +6,36 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
-set(OPENCV_ROOT "D:/develop2/OpenCV455/opencv/build" CACHE PATH "OpenCV build/install root")
+set(OpenCV_INCLUDE_DIRS "D:/Develop/OpenCV455_32/include")
+set(OpenCV_LIBS "D:/Develop/OpenCV455_32/opencv_world455.lib")
 
-if(EXISTS "${OPENCV_ROOT}/OpenCVConfig.cmake")
-    set(OpenCV_DIR "${OPENCV_ROOT}")
-    find_package(OpenCV QUIET)
-endif()
+# set(OPENCV_ROOT "D:/develop2/OpenCV455/opencv/build" CACHE PATH "OpenCV build/install root")
 
-if(NOT OpenCV_FOUND)
-    message(STATUS "OpenCVConfig.cmake not usable -> falling back to explicit paths")
-    set(OPENCV_INCLUDE_DIR "${OPENCV_ROOT}/include")
-    if(EXISTS "${OPENCV_ROOT}/x64/vc15/lib")
-        set(OPENCV_LIB_DIR "${OPENCV_ROOT}/x64/vc15/lib")
-    else()
-        set(OPENCV_LIB_DIR "${OPENCV_ROOT}/x64/vc14/lib")
-    endif()
-    set(OpenCV_INCLUDE_DIRS "${OPENCV_INCLUDE_DIR}")
-    set(OpenCV_LIBS
-        optimized "${OPENCV_LIB_DIR}/opencv_world455.lib"
-        debug     "${OPENCV_LIB_DIR}/opencv_world455d.lib")
-endif()
+# if(EXISTS "${OPENCV_ROOT}/OpenCVConfig.cmake")
+#     set(OpenCV_DIR "${OPENCV_ROOT}")
+#     find_package(OpenCV QUIET)
+# endif()
+
+# if(NOT OpenCV_FOUND)
+#     message(STATUS "OpenCVConfig.cmake not usable -> falling back to explicit paths")
+#     set(OPENCV_INCLUDE_DIR "${OPENCV_ROOT}/include")
+#     if(EXISTS "${OPENCV_ROOT}/x64/vc15/lib")
+#         set(OPENCV_LIB_DIR "${OPENCV_ROOT}/x64/vc15/lib")
+#     else()
+#         set(OPENCV_LIB_DIR "${OPENCV_ROOT}/x64/vc14/lib")
+#     endif()
+#     set(OpenCV_INCLUDE_DIRS "${OPENCV_INCLUDE_DIR}")
+#     set(OpenCV_LIBS
+#         optimized "${OPENCV_LIB_DIR}/opencv_world455.lib"
+#         debug     "${OPENCV_LIB_DIR}/opencv_world455d.lib")
+# endif()
+
+
+
+
 
 include_directories(${OpenCV_INCLUDE_DIRS})
-
+message("${OpenCV_INCLUDE_DIRS}")
 #-----------------------------------------------------------------------
 #  GeoMatch library: shape matcher core + high level facade.
 #  GEOMATCH_BUILD_SHARED=ON  -> shared library (dll / so)

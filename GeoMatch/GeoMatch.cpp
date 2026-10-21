@@ -5,7 +5,6 @@
 #define _CRT_SECURE_NO_WARNINGS
 
 #include "GeoMatch.h"
-
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -250,6 +249,41 @@ cv::Mat Matcher::drawModelInfo(const std::string& title) const
         y += lineSpacing(ln);
     }
     return canvas;
+}
+
+//=======================================================================
+//  model visualisation without the info panel: template + points + dirs
+//=======================================================================
+cv::Mat Matcher::drawModelFeatures(double scaleFactor) const
+{
+    if (!ready()) return cv::Mat();
+
+    const double sf = scaleFactor > 0 ? scaleFactor : 1.0;
+
+    const cv::Mat modelG = core_->getModelGray();
+    cv::Mat modelColor;
+    cv::cvtColor(modelG, modelColor, cv::COLOR_GRAY2BGR);
+    if (sf != 1.0)
+        cv::resize(modelColor, modelColor, cv::Size(), sf, sf, cv::INTER_NEAREST);
+
+    const std::vector<ModelPoint>& pts = core_->modelPoints(0);
+    const cv::Point2f ctr = core_->modelCenter();
+    for (size_t k = 0; k < pts.size(); k++)
+    {
+        const ModelPoint& p = pts[k];
+        cv::Point2f pp((ctr.x + p.x) * (float)sf, (ctr.y + p.y) * (float)sf);
+        cv::circle(modelColor, pp, 2, cv::Scalar(0, 0, 255), -1, cv::LINE_AA);
+        float gnorm = std::sqrt(p.gx * p.gx + p.gy * p.gy);
+        if (gnorm > 1e-3f)
+        {
+            cv::Point2f dir(p.gx / gnorm * 9.f, p.gy / gnorm * 9.f);
+            cv::line(modelColor, pp, pp + dir, cv::Scalar(0, 255, 0), 1, cv::LINE_AA);
+        }
+    }
+    cv::circle(modelColor, cv::Point(cvRound(ctr.x * sf), cvRound(ctr.y * sf)),
+               4, cv::Scalar(255, 0, 0), -1, cv::LINE_AA);
+
+    return modelColor;
 }
 
 //=======================================================================

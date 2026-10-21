@@ -189,6 +189,12 @@ public:
     // parameter panel on the right
     cv::Mat drawModelInfo(const std::string& title = "") const;
 
+    // same template drawing as drawModelInfo() but without the parameter
+    // panel: only the enlarged model image, the model points (red), their
+    // gradient directions (green) and the model centre (blue).
+    // scaleFactor <= 0 means "no enlargement" (1:1 pixel size).
+    cv::Mat drawModelFeatures(double scaleFactor = 3.0) const;
+
     // search image with the template texture overlaid at each match pose,
     // the model points, their gradients and the outline
     cv::Mat drawResult(const cv::Mat& gray, const std::vector<Detection>& dets) const;
