@@ -34,6 +34,7 @@ MatchParams Config::toMatchParams() const
     MatchParams p;
     p.angleStart   = angleStart;
     p.angleExtent  = angleExtent;
+    p.angleStep    = angleStep;
     p.scaleMin     = scaleMin;
     p.scaleMax     = scaleMax;
     p.contrast     = contrast;

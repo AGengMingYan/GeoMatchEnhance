@@ -56,6 +56,7 @@ struct Config
     // ---- model ----
     double angleStart   = -CV_PI;
     double angleExtent  = 2 * CV_PI;
+    double angleStep    = 0;       // 0 = auto (radians), Halcon AngleStep
     double scaleMin     = 1.0;
     double scaleMax     = 1.0;
     double contrast     = 30.0;  // high edge threshold (hysteresis seed), Halcon Contrast

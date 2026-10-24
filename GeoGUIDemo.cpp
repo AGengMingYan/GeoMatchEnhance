@@ -315,6 +315,7 @@ struct App
     //---- 界面上的参数(度/百分比等单位) ----
     float angleStartDeg  = -180.f;
     float angleExtentDeg = 360.f;
+    float angleStepDeg   = 0.f;        // 0 = 自动
     float scaleMin       = 1.f;
     float scaleMax       = 1.f;
     float minContrast    = 12.f;
@@ -363,6 +364,7 @@ struct App
         geomatch::Config c;
         c.angleStart   = angleStartDeg  * (float)CV_PI / 180.f;
         c.angleExtent  = angleExtentDeg * (float)CV_PI / 180.f;
+        c.angleStep    = angleStepDeg   * (float)CV_PI / 180.f;
         c.scaleMin     = std::min(scaleMin, scaleMax);
         c.scaleMax     = std::max(scaleMin, scaleMax);
         c.minContrast  = minContrast;
@@ -382,6 +384,7 @@ struct App
     {
         angleStartDeg  = (float)(c.angleStart  * 180.0 / CV_PI);
         angleExtentDeg = (float)(c.angleExtent * 180.0 / CV_PI);
+        angleStepDeg   = (float)(c.angleStep   * 180.0 / CV_PI);
         scaleMin    = (float)c.scaleMin;
         scaleMax    = (float)c.scaleMax;
         minContrast = (float)c.minContrast;
@@ -837,6 +840,7 @@ static void drawPanel()
     bool changedModel = false, commitModel = false;
     changedModel |= sliderF("起始角(度)",  &a.angleStartDeg,  -180.f, 180.f, "%.0f", commitModel);
     changedModel |= sliderF("角度范围(度)", &a.angleExtentDeg,   0.f, 360.f, "%.0f", commitModel);
+    changedModel |= sliderF("角度步长(度, 0=自动)", &a.angleStepDeg, 0.f, 5.f, "%.2f", commitModel);
     changedModel |= sliderF("最小缩放", &a.scaleMin, 0.2f, 2.f, "%.2f", commitModel);
     changedModel |= sliderF("最大缩放", &a.scaleMax, 0.2f, 2.f, "%.2f", commitModel);
     if (a.scaleMax < a.scaleMin) a.scaleMax = a.scaleMin;
