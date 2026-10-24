@@ -23,12 +23,15 @@
 #include <windows.h>
 #include <commdlg.h>
 #include <d3d11.h>
+#include <objbase.h>
+#include <shobjidl_core.h>      // IFileDialog / 文件夹选择框
 
 #include <algorithm>
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <cwctype>
 #include <fstream>
 #include <iterator>
 #include <string>
@@ -135,6 +138,66 @@ static bool loadGrayImage(const std::wstring& path, cv::Mat& gray)
     return true;
 }
 
+// 文件夹选择框
+static std::wstring pickFolder()
+{
+    std::wstring out;
+    HRESULT co = ::CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+
+    IFileDialog* dlg = nullptr;
+    if (SUCCEEDED(::CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&dlg))))
+    {
+        DWORD flags = 0;
+        dlg->GetOptions(&flags);
+        dlg->SetOptions(flags | FOS_PICKFOLDERS | FOS_PATHMUSTEXIST | FOS_FORCEFILESYSTEM);
+        dlg->SetTitle(L"选择目标图片目录");
+        if (SUCCEEDED(dlg->Show(g_hwnd)))
+        {
+            IShellItem* item = nullptr;
+            if (SUCCEEDED(dlg->GetResult(&item)))
+            {
+                PWSTR psz = nullptr;
+                if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &psz)) && psz)
+                {
+                    out = psz;
+                    ::CoTaskMemFree(psz);
+                }
+                item->Release();
+            }
+        }
+        dlg->Release();
+    }
+    if (SUCCEEDED(co)) ::CoUninitialize();
+    return out;
+}
+
+// 用 Win32 枚举目录里的图片，避免 cv::glob 在中文路径上失败
+static std::vector<std::wstring> listDirImages(const std::wstring& dir)
+{
+    static const wchar_t* exts[] = { L".jpg", L".jpeg", L".png", L".bmp", L".tif", L".tiff" };
+    std::vector<std::wstring> out;
+
+    WIN32_FIND_DATAW fd;
+    HANDLE h = ::FindFirstFileW((dir + L"\\*").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return out;
+
+    do
+    {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        std::wstring n = fd.cFileName;
+        const size_t p = n.rfind(L'.');
+        if (p == std::wstring::npos) continue;
+        std::wstring ext = n.substr(p);
+        for (size_t i = 0; i < ext.size(); i++) ext[i] = (wchar_t)::towlower(ext[i]);
+        for (const wchar_t* e : exts)
+            if (ext == e) { out.push_back(dir + L"\\" + n); break; }
+    } while (::FindNextFileW(h, &fd));
+    ::FindClose(h);
+
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
 static cv::Mat toBGRA(const cv::Mat& m)
 {
     if (m.empty()) return cv::Mat();
@@ -158,6 +221,24 @@ struct Texture
     ID3D11Texture2D*          tex = nullptr;
     ID3D11ShaderResourceView* srv = nullptr;
     int w = 0, h = 0;
+
+    // 纹理放进 vector 里会搬动，所以只允许移动，不允许拷贝(否则会重复 Release)
+    Texture() {}
+    Texture(const Texture&)            = delete;
+    Texture& operator=(const Texture&) = delete;
+    Texture(Texture&& o) noexcept
+        : tex(o.tex), srv(o.srv), w(o.w), h(o.h)
+    { o.tex = nullptr; o.srv = nullptr; o.w = o.h = 0; }
+    Texture& operator=(Texture&& o) noexcept
+    {
+        if (this != &o)
+        {
+            release();
+            tex = o.tex; srv = o.srv; w = o.w; h = o.h;
+            o.tex = nullptr; o.srv = nullptr; o.w = o.h = 0;
+        }
+        return *this;
+    }
 
     bool valid() const { return srv != nullptr; }
 
@@ -216,6 +297,17 @@ struct Texture
 };
 
 //=======================================================================
+//  图片列表里的一项: 只有缩略图纹理，点中时才读原图
+//=======================================================================
+struct Thumb
+{
+    std::wstring wpath;         // 读图用
+    std::string  path;          // utf8，显示/比较用
+    std::string  name;          // 文件名
+    Texture      tex;
+};
+
+//=======================================================================
 //  应用状态
 //=======================================================================
 struct App
@@ -248,6 +340,11 @@ struct App
     std::string tplPath, tgtPath;
     cv::Mat tplGray, tgtGray;
     cv::Mat modelVis, resultVis;
+
+    //---- 目标图片目录 ----
+    std::vector<Thumb> thumbs;
+    int    thumbSel = -1;
+    std::string dirPath;
 
     Texture texTarget, texResult, texTplSrc, texModel;
 
@@ -413,12 +510,85 @@ static void loadTargetImage(App& a, const std::wstring& path)
         logf("无法读取目标图片: %s", ws2s(path).c_str());
         return;
     }
+    const std::string utf8 = ws2s(path);
     a.tgtGray = g;
-    a.tgtPath = ws2s(path);
+    a.tgtPath = utf8;
     a.texTarget.set(toBGRA(g));
-    logf("目标图: %s (%dx%d)", a.tgtPath.c_str(), g.cols, g.rows);
+    logf("目标图: %s (%dx%d)", utf8.c_str(), g.cols, g.rows);
+
+    // 如果这张图在列表里，把选中框跟上
+    a.thumbSel = -1;
+    for (size_t i = 0; i < a.thumbs.size(); i++)
+        if (a.thumbs[i].path == utf8) { a.thumbSel = (int)i; break; }
 
     if (a.autoRun && a.modelReady) runMatch(a, 1);
+}
+
+// 切换到列表里的第 idx 张(支持负数/越界回绕)
+static void selectThumb(App& a, int idx)
+{
+    if (a.thumbs.empty()) return;
+    const int n = (int)a.thumbs.size();
+    int i = idx % n;
+    if (i < 0) i += n;
+    a.thumbSel = i;
+    loadTargetImage(a, a.thumbs[i].wpath);
+}
+
+// 读一个目录: 列出全部图片 + 生成缩略图，然后自动选中第一张
+static void loadTargetDir(App& a, const std::wstring& dir)
+{
+    for (Thumb& t : a.thumbs) t.tex.release();
+    a.thumbs.clear();
+    a.thumbSel = -1;
+    a.dirPath  = ws2s(dir);
+
+    const int64 t0 = cv::getTickCount();
+    const std::vector<std::wstring> files = listDirImages(dir);
+    if (files.empty())
+    {
+        logf("目录里没有图片: %s", a.dirPath.c_str());
+        return;
+    }
+
+    const int maxThumbs = 200;                       // 再多就没必要了
+    const int thumbH    = (int)(96 * g_scale);
+    int bad = 0;
+
+    for (size_t i = 0; i < files.size() && (int)a.thumbs.size() < maxThumbs; i++)
+    {
+        std::ifstream f(files[i], std::ios::binary);
+        if (!f) { bad++; continue; }
+        std::vector<char> data((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        if (data.empty()) { bad++; continue; }
+
+        cv::Mat buf(1, (int)data.size(), CV_8U, data.data());
+        // REDUCED_GRAYSCALE_4: 只解 1/4 尺寸，列几十张也不会卡
+        cv::Mat small = cv::imdecode(buf, cv::IMREAD_REDUCED_GRAYSCALE_4);
+        if (small.empty()) small = cv::imdecode(buf, cv::IMREAD_GRAYSCALE);
+        if (small.empty()) { bad++; continue; }
+
+        int tw = (int)((float)small.cols / (float)small.rows * (float)thumbH);
+        tw = std::max(16, std::min(tw, thumbH * 3));
+        cv::Mat thumb;
+        cv::resize(small, thumb, cv::Size(tw, thumbH), 0, 0, cv::INTER_AREA);
+
+        Thumb t;
+        t.wpath = files[i];
+        t.path  = ws2s(files[i]);
+        const size_t s = t.path.find_last_of("\\/");
+        t.name = (s == std::string::npos) ? t.path : t.path.substr(s + 1);
+        t.tex.set(toBGRA(thumb));
+        a.thumbs.push_back(std::move(t));
+    }
+
+    const double ms = (cv::getTickCount() - t0) * 1000.0 / cv::getTickFrequency();
+    logf("目录: %s  %d 张图片 (缩略图 %.0f ms%s)",
+         a.dirPath.c_str(), (int)a.thumbs.size(), ms,
+         (int)files.size() > (int)a.thumbs.size() ? "，已截断到 200 张" : "");
+    if (bad) logf("其中 %d 个文件读不出来", bad);
+
+    if (a.autoRun && !a.thumbs.empty()) selectThumb(a, 0);   // 选中第一张(有模型就顺带匹配)
 }
 
 //=======================================================================
@@ -553,6 +723,44 @@ static void drawViewPane()
 }
 
 //=======================================================================
+//  左侧下方: 目标图片预览列表(点一张就匹配一张)
+//=======================================================================
+static void drawThumbBar()
+{
+    App& a = g_app;
+
+    if (a.thumbs.empty())
+    {
+        ImGui::TextDisabled("图片列表为空 - 点右侧 \"选择图片目录...\" 载入一个目录");
+        return;
+    }
+
+    ImGui::Text("%d 张，点缩略图切换 (%d/%d)",
+                (int)a.thumbs.size(), a.thumbSel + 1, (int)a.thumbs.size());
+
+    for (int i = 0; i < (int)a.thumbs.size(); i++)
+    {
+        const Thumb& t = a.thumbs[i];
+        if (!t.tex.valid()) continue;
+
+        if (i != 0) ImGui::SameLine();
+
+        ImGui::PushID(i);
+        const bool sel = (i == a.thumbSel);
+        const ImVec4 bg = sel ? ImVec4(0.20f, 0.60f, 0.28f, 1.00f) : ImVec4(0.12f, 0.12f, 0.14f, 1.00f);
+        if (ImGui::ImageButton("##thumb",
+                               ImTextureRef((ImTextureID)(uintptr_t)t.tex.srv),
+                               ImVec2((float)t.tex.w, (float)t.tex.h),
+                               ImVec2(0, 0), ImVec2(1, 1), bg))
+        {
+            selectThumb(a, i);
+        }
+        ImGui::SetItemTooltip("%s", t.name.c_str());
+        ImGui::PopID();
+    }
+}
+
+//=======================================================================
 //  右侧: 操作面板
 //=======================================================================
 static bool sliderF(const char* label, float* v, float lo, float hi, const char* fmt, bool& commit)
@@ -651,12 +859,13 @@ static void drawPanel()
     static char modelPath[260] = "case1/model.shm";
     ImGui::SetNextItemWidth(-1);
     ImGui::InputText("##modelpath", modelPath, sizeof(modelPath));
-    if (ImGui::Button("保存模型", ImVec2(-1, 0)))
+    if (ImGui::Button("保存模型", ImVec2(-120, 0)))
     {
         if (!a.modelReady) logLine("没有模型可保存");
         else if (a.matcher.save(modelPath)) logf("模型已保存: %s", modelPath);
         else logf("保存失败: %s", modelPath);
     }
+    ImGui::SameLine();
     if (ImGui::Button("加载模型", ImVec2(-1, 0)))
     {
         if (a.matcher.load(modelPath))
@@ -675,11 +884,27 @@ static void drawPanel()
     //---------------- 2. 匹配目标 ----------------
     ImGui::SeparatorText("2. 匹配目标");
 
-    if (ImGui::Button("选择匹配目标...", ImVec2(-1, 0)))
+    if (ImGui::Button("选择图片目录...", ImVec2(-1, 0)))
+    {
+        std::wstring d = pickFolder();
+        if (!d.empty()) loadTargetDir(a, d);
+    }
+    if (ImGui::Button("选择单张图片...", ImVec2(-1, 0)))
     {
         std::wstring p = pickImageFile(L"选择匹配目标图片");
         if (!p.empty()) loadTargetImage(a, p);
     }
+
+    if (!a.thumbs.empty())
+    {
+        ImGui::Text("目录: %s", a.dirPath.c_str());
+        ImGui::Text("%d 张  当前 %d/%d", (int)a.thumbs.size(),
+                    a.thumbSel + 1, (int)a.thumbs.size());
+        if (ImGui::Button("<< 上一张", ImVec2(-110, 0))) selectThumb(a, a.thumbSel - 1);
+        ImGui::SameLine();
+        if (ImGui::Button("下一张 >>", ImVec2(-1, 0)))  selectThumb(a, a.thumbSel + 1);
+    }
+
     ImGui::TextWrapped("目标: %s", a.tgtPath.empty() ? "(未选择)" : a.tgtPath.c_str());
     if (!a.tgtGray.empty())
         ImGui::Text("尺寸: %dx%d", a.tgtGray.cols, a.tgtGray.rows);
@@ -785,7 +1010,9 @@ static void drawPanel()
 
     //---------------- 日志 ----------------
     ImGui::SeparatorText("日志");
-    ImGui::BeginChild("##log", ImVec2(-1, -1), ImGuiChildFlags_Borders);
+    // 填满面板剩下的高度；面板内容超高时可滚动，日志最少保留 100px
+    const float logH = std::max(100.f, ImGui::GetContentRegionAvail().y);
+    ImGui::BeginChild("##log", ImVec2(-1, logH), ImGuiChildFlags_Borders);
     for (size_t i = 0; i < g_log.size(); i++)
         ImGui::TextUnformatted(g_log[i].c_str());
     if (g_logDirty)
@@ -809,13 +1036,26 @@ static void drawUI()
                  ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
                  ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoSavedSettings);
 
-    const float panelW = 390.f * g_scale;
-    const float gap    = ImGui::GetStyle().ItemSpacing.x;
+    const float panelW  = 390.f * g_scale;
+    const float gap     = ImGui::GetStyle().ItemSpacing.x;
+    const float thumbH  = 150.f * g_scale;      // 底部图片预览列表的高度
 
-    ImGui::BeginChild("##view", ImVec2(-panelW - gap, -1), ImGuiChildFlags_Borders);
-    drawViewPane();
+    //---------------- 左列: 上=图像视图, 下=图片列表 ----------------
+    ImGui::BeginChild("##left", ImVec2(-panelW - gap, -1), ImGuiChildFlags_Borders);
+    {
+        ImGui::BeginChild("##view", ImVec2(-1, -thumbH - gap), ImGuiChildFlags_Borders);
+        drawViewPane();
+        ImGui::EndChild();
+
+        // 图片预览列表: 横向排开，可左右滚动
+        ImGui::BeginChild("##thumbs", ImVec2(-1, thumbH), ImGuiChildFlags_Borders,
+                          ImGuiWindowFlags_HorizontalScrollbar);
+        drawThumbBar();
+        ImGui::EndChild();
+    }
     ImGui::EndChild();
 
+    //---------------- 右列: 操作面板 ----------------
     ImGui::SameLine();
     ImGui::BeginChild("##panel", ImVec2(panelW, -1), ImGuiChildFlags_Borders);
     drawPanel();
@@ -842,18 +1082,17 @@ static void autoInit(App& a, const std::string& dir)
 
     createTemplate(a);
 
-    std::vector<std::string> fs = geomatch::listImages(dir);
-    fs = geomatch::excludeFile(fs, tpl);
-    for (size_t i = 0; i < fs.size(); i++)
+    // 把整个目录读进来做成预览列表，并自动选中第一张跑一次
+    loadTargetDir(a, s2ws(dir));
+    if (a.tgtGray.empty())
     {
-        if (!loadGrayImage(s2ws(fs[i]), a.tgtGray)) continue;
-        a.tgtPath = fs[i];
-        a.texTarget.set(toBGRA(a.tgtGray));
-        logf("目标图: %s (%dx%d)", fs[i].c_str(), a.tgtGray.cols, a.tgtGray.rows);
-        runMatch(a, 1);
-        break;
+        logf("%s 里没有可用于匹配的图片", dir.c_str());
+        return;
     }
-    if (a.tgtGray.empty()) logf("%s 里没有可用于匹配的图片", dir.c_str());
+    // 第一张如果正好是模板本身，直接跳到下一张
+    const std::string tplName = tpl.substr(tpl.find_last_of("\\/") + 1);
+    if (a.thumbSel == 0 && a.thumbs.size() > 1 && a.thumbs[0].name == tplName)
+        selectThumb(a, 1);
 }
 
 //=======================================================================
@@ -966,6 +1205,8 @@ int main(int argc, char** argv)
     g_app.texResult.release();
     g_app.texTplSrc.release();
     g_app.texModel.release();
+    for (Thumb& t : g_app.thumbs) t.tex.release();
+    g_app.thumbs.clear();
 
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();
