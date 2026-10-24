@@ -6,8 +6,15 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
-set(OpenCV_INCLUDE_DIRS "D:/Develop/OpenCV455_32/include")
-set(OpenCV_LIBS "D:/Develop/OpenCV455_32/opencv_world455.lib")
+
+
+# set(OpenCV_INCLUDE_DIRS "D:/Develop/OpenCV455_32/include")
+# set(OpenCV_LIBS "D:/Develop/OpenCV455_32/opencv_world455.lib")
+
+
+set(OpenCV_INCLUDE_DIRS "C:/Develop/OpenCV455_32/include")
+set(OpenCV_LIBS "C:/Develop/OpenCV455_32/opencv_world455.lib")
+
 
 # set(OPENCV_ROOT "D:/develop2/OpenCV455/opencv/build" CACHE PATH "OpenCV build/install root")
 
@@ -77,11 +84,43 @@ endif()
 #-----------------------------------------------------------------------
 add_executable(GeoMatchDemo main.cpp)
 add_executable(Demo1 main1.cpp)
-
+add_executable(GeoGUIDemo GeoGUIDemo.cpp)
 
 target_include_directories(GeoMatchDemo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(GeoMatchDemo PRIVATE GeoMatch)
 target_link_libraries(Demo1 PRIVATE GeoMatch)
+
+#-----------------------------------------------------------------------
+#  Dear ImGui - Win32 + DirectX11 backends (used by GeoGUIDemo)
+#  the sources live in imgui/imgui/imgui-master/imgui-master
+#-----------------------------------------------------------------------
+set(IMGUI_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/imgui/imgui/imgui-master/imgui-master")
+
+add_library(imgui STATIC
+    ${IMGUI_ROOT}/imgui.cpp
+    ${IMGUI_ROOT}/imgui_draw.cpp
+    ${IMGUI_ROOT}/imgui_tables.cpp
+    ${IMGUI_ROOT}/imgui_widgets.cpp
+    ${IMGUI_ROOT}/backends/imgui_impl_win32.cpp
+    ${IMGUI_ROOT}/backends/imgui_impl_dx11.cpp
+)
+target_include_directories(imgui PUBLIC ${IMGUI_ROOT} ${IMGUI_ROOT}/backends)
+target_link_libraries(imgui PUBLIC d3d11 dxgi d3dcompiler)
+
+#-----------------------------------------------------------------------
+#  GeoGUIDemo - imgui front end for quick template matching checks
+#-----------------------------------------------------------------------
+target_include_directories(GeoGUIDemo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${IMGUI_ROOT} ${IMGUI_ROOT}/backends)
+target_compile_definitions(GeoGUIDemo PRIVATE _USE_MATH_DEFINES)
+if(OpenCV_LIBS)
+    target_link_libraries(GeoGUIDemo PRIVATE GeoMatch imgui ${OpenCV_LIBS} comdlg32)
+else()
+    target_link_libraries(GeoGUIDemo PRIVATE GeoMatch imgui ${OpenCV_LIBS} ${OpenCV_LIBRARIES} comdlg32)
+endif()
+if(MSVC)
+    # /utf-8: the source contains chinese labels, MSVC must not read it as cp936
+    target_compile_options(GeoGUIDemo PRIVATE /utf-8 $<$<CONFIG:Release>:/O2 /arch:AVX2>)
+endif()
 
 # release build uses fast math + SIMD; MSVC also gets /arch:AVX2 when available
 if(MSVC)
