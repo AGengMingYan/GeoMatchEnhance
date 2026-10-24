@@ -58,7 +58,8 @@ struct Config
     double angleExtent  = 2 * CV_PI;
     double scaleMin     = 1.0;
     double scaleMax     = 1.0;
-    double minContrast  = 12.0;
+    double contrast     = 30.0;  // high edge threshold (hysteresis seed), Halcon Contrast
+    double minContrast  = 12.0;  // low edge threshold (hysteresis link), Halcon MinContrast
     int    maxPoints    = 1200;
     int    numLevels    = 0;      // 0 = auto
 

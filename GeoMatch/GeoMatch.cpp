@@ -36,6 +36,7 @@ MatchParams Config::toMatchParams() const
     p.angleExtent  = angleExtent;
     p.scaleMin     = scaleMin;
     p.scaleMax     = scaleMax;
+    p.contrast     = contrast;
     p.minContrast  = minContrast;
     p.maxPoints    = maxPoints;
     p.numLevels    = numLevels;
@@ -208,7 +209,8 @@ cv::Mat Matcher::drawModelInfo(const std::string& title) const
     add("levels   : " + std::to_string(core_->numLevels()));
     add("points   : " + std::to_string(core_->modelPointCount()),
         cv::Scalar(0, 255, 0));
-    add("contrast : " + std::to_string((int)P.minContrast));
+    add("contrast : hi " + std::to_string((int)P.contrast) +
+        " / lo " + std::to_string((int)P.minContrast));
     add("Search Space", cv::Scalar(0, 255, 255), 0.7, sectionGap);
     add("angle    : " + std::to_string((int)(P.angleStart * 180 / CV_PI)) + " .. " +
         std::to_string((int)((P.angleStart + P.angleExtent) * 180 / CV_PI)) + " deg");

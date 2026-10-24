@@ -55,8 +55,8 @@ struct MatchParams
     double scaleMin    = 1.0;
     double scaleMax    = 1.0;
     double scaleStep   = 0;    // 0 = auto
-    double contrast    = 30;   // (kept for compatibility, edge selection is adaptive)
-    double minContrast = 12;   // minimum gradient magnitude of a model / image edge
+    double contrast    = 30;   // high threshold: a ridge must reach it to become a seed
+    double minContrast = 12;   // low threshold: weaker edges are kept while they touch a seed
     int    maxPoints   = 1200; // model points kept at the finest level
     double minScore    = 0.6;
     int    maxMatches  = 20;

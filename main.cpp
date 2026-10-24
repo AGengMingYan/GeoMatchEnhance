@@ -106,6 +106,7 @@ namespace
 
         Config cfg;
         cfg.minContrast = gArgD(a, "-contrast", 12.0);
+        cfg.contrast    = gArgD(a, "-hi", 30.0);
         applyModelRange(cfg, a);
 
         cv::Mat tpl = cv::imread(templ, cv::IMREAD_GRAYSCALE);
@@ -274,6 +275,7 @@ int main(int argc, char** argv)
     cfg.minScore    = gArgD(args, "-minscore", 0.55);
     cfg.maxMatches  = (int)gArgD(args, "-max", 12);
     cfg.minContrast = gArgD(args, "-contrast", 12.0);
+    cfg.contrast    = gArgD(args, "-hi", 30.0);
     cfg.useOpenCL   = (int)gArgD(args, "-ocl", 1) != 0;
     cfg.debug       = (int)gArgD(args, "-debug", 0);
 

@@ -202,9 +202,228 @@ bool ShapeMatcher::createShapeModel(const cv::Mat& gray, const MatchParams& p)
     return true;
 }
 
+namespace
+{
+    // keep a pixel only when it is the maximum along its own gradient
+    // direction (quantised to 0/45/90/135 deg) -> one pixel wide ridges
+    void thinRidges(const cv::Mat& mag, const cv::Mat& gx, const cv::Mat& gy, cv::Mat& thin)
+    {
+        const int w = mag.cols, h = mag.rows;
+        thin.create(h, w, CV_8U);
+        thin.setTo(0);
+
+        for (int y = 1; y < h - 1; y++)
+        {
+            const float* pm = mag.ptr<float>(y);
+            const float* px = gx.ptr<float>(y);
+            const float* py = gy.ptr<float>(y);
+            uchar* pt = thin.ptr<uchar>(y);
+            for (int x = 1; x < w - 1; x++)
+            {
+                const float m = pm[x];
+                if (m <= 0.f) continue;
+                const float dx = px[x], dy = py[x];
+                const float adx = std::fabs(dx), ady = std::fabs(dy);
+                const int sx = dx >= 0.f ? 1 : -1, sy = dy >= 0.f ? 1 : -1;
+                int ox = 0, oy = 0;
+                if (adx >= ady) { ox = sx; if (ady > 0.41421356f * adx) oy = sy; }
+                else            { oy = sy; if (adx > 0.41421356f * ady) ox = sx; }
+                if (m >= mag.ptr<float>(y + oy)[x + ox] &&
+                    m >= mag.ptr<float>(y - oy)[x - ox])
+                    pt[x] = 1;
+            }
+        }
+    }
+
+    // hysteresis: a ridge that reaches hi is a seed, everything connected to
+    // it stays while it is above lo -> weak but continuous edges survive
+    void growEdges(const cv::Mat& mag, const cv::Mat& thin, float lo, float hi, cv::Mat& edge)
+    {
+        const int w = mag.cols, h = mag.rows;
+        edge.create(h, w, CV_8U);
+        edge.setTo(0);
+        const float* pm = mag.ptr<float>();
+        const uchar* pt = thin.ptr<uchar>();
+
+        uchar* pe = edge.ptr<uchar>();
+        std::vector<int> stack;
+        for (int i = 0; i < w * h; i++)
+            if (pt[i] && pm[i] >= hi && !pe[i])
+            {
+                pe[i] = 1;
+                stack.push_back(i);
+            }
+
+        while (!stack.empty())
+        {
+            const int i = stack.back();
+            stack.pop_back();
+            const int y = i / w, x = i - y * w;
+            for (int dy = -1; dy <= 1; dy++)
+            {
+                const int yy = y + dy;
+                if (yy < 0 || yy >= h) continue;
+                uchar* er = edge.ptr<uchar>(yy);
+                const uchar* tr = thin.ptr<uchar>(yy);
+                const float* mr = mag.ptr<float>(yy);
+                for (int dx = -1; dx <= 1; dx++)
+                {
+                    const int xx = x + dx;
+                    if (xx < 0 || xx >= w) continue;
+                    if (er[xx] || !tr[xx] || mr[xx] < lo) continue;
+                    er[xx] = 1;
+                    stack.push_back(yy * w + xx);
+                }
+            }
+        }
+    }
+
+    // walk the thinned edges into chains and take the points at equal arc
+    // length, so the model follows the texture instead of clustering on the
+    // few strongest ridges (this is what Halcon's model contours look like)
+    std::vector<int> sampleAlongContours(const cv::Mat& edge, const cv::Mat& mag, int maxPts)
+    {
+        const int w = edge.cols, h = edge.rows, nPix = w * h;
+        const uchar* pe = edge.ptr<uchar>();
+        const float* pm = mag.ptr<float>();
+        std::vector<uchar> used((size_t)nPix, 0);
+        std::vector<std::vector<int>> chains;
+
+        auto degree = [&](int i)
+        {
+            const int y = i / w, x = i - y * w;
+            int d = 0;
+            for (int dy = -1; dy <= 1; dy++)
+                for (int dx = -1; dx <= 1; dx++)
+                {
+                    if (!dy && !dx) continue;
+                    const int yy = y + dy, xx = x + dx;
+                    if (yy < 0 || yy >= h || xx < 0 || xx >= w) continue;
+                    if (pe[yy * w + xx]) d++;
+                }
+            return d;
+        };
+
+        auto trace = [&](int start)
+        {
+            std::vector<int> ch;
+            for (int cur = start; cur >= 0;)
+            {
+                used[cur] = 1;
+                ch.push_back(cur);
+                const int y = cur / w, x = cur - y * w;
+                int nxt = -1;
+                float best = -1.f;
+                for (int dy = -1; dy <= 1; dy++)
+                {
+                    const int yy = y + dy;
+                    if (yy < 0 || yy >= h) continue;
+                    for (int dx = -1; dx <= 1; dx++)
+                    {
+                        if (!dy && !dx) continue;
+                        const int xx = x + dx;
+                        if (xx < 0 || xx >= w) continue;
+                        const int j = yy * w + xx;
+                        if (!pe[j] || used[j]) continue;
+                        if (pm[j] > best) { best = pm[j]; nxt = j; }
+                    }
+                }
+                cur = nxt;
+            }
+            if (ch.size() >= 2) chains.push_back(std::move(ch));
+        };
+
+        for (int i = 0; i < nPix; i++)
+            if (pe[i] && !used[i] && degree(i) == 1) trace(i);
+        for (int i = 0; i < nPix; i++)
+            if (pe[i] && !used[i]) trace(i);
+
+        std::vector<int> out;
+        if (chains.empty() || maxPts <= 0) return out;
+
+        // the budget goes to a chain by its contrast (length x strength), not
+        // by its length alone, otherwise a long faint chain eats the points
+        std::vector<double> weight(chains.size(), 0.0);
+        double total = 0.0;
+        for (size_t k = 0; k < chains.size(); k++)
+        {
+            double w = 0.0;
+            for (int i : chains[k]) w += pm[i];
+            weight[k] = w;
+            total += w;
+        }
+        if (total <= 0.0) total = 1.0;
+
+        if ((int)chains.size() > maxPts)
+        {
+            std::vector<int> order(chains.size());
+            for (size_t k = 0; k < order.size(); k++) order[k] = (int)k;
+            std::sort(order.begin(), order.end(),
+                      [&](int a, int b) { return weight[a] > weight[b]; });
+            order.resize(maxPts);
+            std::sort(order.begin(), order.end());
+            std::vector<std::vector<int>> keep;
+            std::vector<double> kw;
+            for (int k : order) { keep.push_back(std::move(chains[k])); kw.push_back(weight[k]); }
+            chains.swap(keep);
+            weight.swap(kw);
+        }
+
+        std::vector<int> quota(chains.size());
+        int assigned = 0;
+        for (size_t k = 0; k < chains.size(); k++)
+        {
+            const int len = (int)chains[k].size();
+            quota[k] = std::min(len, std::max(1, (int)std::llround((double)maxPts * weight[k] / total)));
+            assigned += quota[k];
+        }
+        while (assigned > maxPts)
+        {
+            size_t big = 0;
+            for (size_t k = 1; k < chains.size(); k++)
+                if (quota[k] > quota[big]) big = k;
+            if (quota[big] <= 1) break;
+            quota[big]--;
+            assigned--;
+        }
+        // a chain cannot spend more points than it has pixels, so the rest
+        // moves on to the chains that still have room
+        for (int pass = 0; pass < 4 && assigned < maxPts; pass++)
+        {
+            double freeW = 0.0;
+            for (size_t k = 0; k < chains.size(); k++)
+                if (quota[k] < (int)chains[k].size()) freeW += weight[k];
+            if (freeW <= 0.0) break;
+            for (size_t k = 0; k < chains.size() && assigned < maxPts; k++)
+            {
+                const int room = (int)chains[k].size() - quota[k];
+                if (room <= 0) continue;
+                const int rest = maxPts - assigned;
+                const int add = std::min(room, (int)std::llround((double)rest * weight[k] / freeW));
+                quota[k] += add;
+                assigned += add;
+            }
+        }
+
+        out.reserve((size_t)maxPts);
+        for (size_t k = 0; k < chains.size(); k++)
+        {
+            const std::vector<int>& ch = chains[k];
+            for (int j = 0; j < quota[k]; j++)
+            {
+                const size_t t = (size_t)((double)(j + 0.5) * ch.size() / quota[k]);
+                out.push_back(ch[std::min(t, ch.size() - 1)]);
+            }
+        }
+        // strongest first: the scan loop prunes on the first points it sums up
+        std::sort(out.begin(), out.end(), [pm](int a, int b) { return pm[a] > pm[b]; });
+        return out;
+    }
+}
+
 void ShapeMatcher::selectEdgePoints(LevelData& ld, const cv::Mat& grayLevel, int level) const
 {
-    cv::Mat gx, gy, mag;
+    cv::Mat gx, gy, mag, thin, edge;
     cv::Sobel(grayLevel, gx, CV_32F, 1, 0, 3);
     cv::Sobel(grayLevel, gy, CV_32F, 0, 1, 3);
     cv::magnitude(gx, gy, mag);
@@ -229,48 +448,33 @@ void ShapeMatcher::selectEdgePoints(LevelData& ld, const cv::Mat& grayLevel, int
     ld.activePoints = 0;
     if (level == 0) { candCount_ = 0; strongestMag_ = 0; weakestMag_ = 0; }
 
-    std::vector<std::pair<float, int>> cand; // (magnitude, linear index)
-    cand.reserve((size_t)w * h);
-    for (int i = 0; i < h * w; i++)
-        if (pMag[i] >= (float)params_.minContrast)
-            cand.push_back(std::pair<float, int>(pMag[i], i));
+    const float lo = (float)std::max(params_.minContrast, 1.0);
+    const float hi = (float)std::max(params_.contrast, lo * 1.5);
+    thinRidges(mag, gx, gy, thin);
+    growEdges(mag, thin, lo, hi, edge);
 
-    if (cand.empty())
-        return;
+    const std::vector<int> idx = sampleAlongContours(edge, mag, maxPts);
+    const int n = (int)idx.size();
 
-    // The strongest maxPts win.  Two other selection rules were measured on
-    // the scan plane set (199 images) and both were clearly worse, so the
-    // plain "strongest first" order is kept on purpose:
-    //   * non maximum suppression first: the thinned pool is much smaller, so
-    //     the budget ends up filled with weak points (magnitude cut drops from
-    //     ~140 to ~30) -> mean score 0.851 -> 0.484 at maxPoints = 2025
-    //   * grid spreading (a few points per cell of a maxPoints sized grid):
-    //     replaces strong points by weaker ones -> 0.851 -> 0.479
-    // Weak points are what drag the score down, so at a fixed budget nothing
-    // beats taking the strongest ones.  maxPoints itself is the knob to turn.
-    std::sort(cand.begin(), cand.end(),
-              [](const std::pair<float, int>& a, const std::pair<float, int>& b) { return a.first > b.first; });
-
-    int n = std::min((int)cand.size(), maxPts);
     ld.points.resize(n);
     for (int k = 0; k < n; k++)
     {
-        int idx = cand[k].second;
-        int yy = idx / w, xx = idx - yy * w;
+        const int i = idx[k];
+        const int yy = i / w, xx = i - yy * w;
         ModelPoint& mp = ld.points[k];
         mp.x = (float)xx - icx;
         mp.y = (float)yy - icy;
-        mp.gx = pGx[idx];
-        mp.gy = pGy[idx];
-        mp.mag = pMag[idx];
+        mp.gx = pGx[i];
+        mp.gy = pGy[i];
+        mp.mag = pMag[i];
     }
     ld.activePoints = n;
 
-    if (level == 0)
+    if (level == 0 && n > 0)
     {
-        candCount_    = (int)cand.size();
-        strongestMag_ = n > 0 ? cand.front().first : 0.f;
-        weakestMag_   = n > 0 ? cand[n - 1].first   : 0.f;
+        candCount_    = cv::countNonZero(edge);
+        strongestMag_ = pMag[idx.front()];
+        weakestMag_   = pMag[idx.back()];
     }
 }
 

@@ -8,12 +8,12 @@ endif()
 
 
 
-# set(OpenCV_INCLUDE_DIRS "D:/Develop/OpenCV455_32/include")
-# set(OpenCV_LIBS "D:/Develop/OpenCV455_32/opencv_world455.lib")
+set(OpenCV_INCLUDE_DIRS "D:/develop2/OpenCV455/opencv/build/include")
+set(OpenCV_LIBS "D:/develop2/OpenCV455/opencv/build/x64/vc15/lib/opencv_world455.lib")
 
 
-set(OpenCV_INCLUDE_DIRS "C:/Develop/OpenCV455_32/include")
-set(OpenCV_LIBS "C:/Develop/OpenCV455_32/opencv_world455.lib")
+# set(OpenCV_INCLUDE_DIRS "C:/Develop/OpenCV455_32/include")
+# set(OpenCV_LIBS "C:/Develop/OpenCV455_32/opencv_world455.lib")
 
 
 # set(OPENCV_ROOT "D:/develop2/OpenCV455/opencv/build" CACHE PATH "OpenCV build/install root")
