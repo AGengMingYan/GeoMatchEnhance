@@ -86,6 +86,18 @@ add_executable(GeoMatchDemo main.cpp)
 add_executable(Demo1 main1.cpp)
 add_executable(GeoGUIDemo GeoGUIDemo.cpp)
 
+# 命令行分析工具: 拿已有模型跑一批真实图片，打印每张的分数/位姿/耗时
+add_executable(AnalyzeCase AnalyzeCase.cpp)
+target_include_directories(AnalyzeCase PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+if(OpenCV_LIBS)
+    target_link_libraries(AnalyzeCase PRIVATE GeoMatch ${OpenCV_LIBS})
+else()
+    target_link_libraries(AnalyzeCase PRIVATE GeoMatch ${OpenCV_LIBS} ${OpenCV_LIBRARIES})
+endif()
+if(MSVC)
+    target_compile_options(AnalyzeCase PRIVATE /utf-8)
+endif()
+
 target_include_directories(GeoMatchDemo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(GeoMatchDemo PRIVATE GeoMatch)
 target_link_libraries(Demo1 PRIVATE GeoMatch)

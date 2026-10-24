@@ -219,8 +219,18 @@ void ShapeMatcher::selectEdgePoints(LevelData& ld, const cv::Mat& grayLevel, int
     if (level > 0)
         maxPts = std::max(64, params_.maxPoints / (1 << level));
 
+    // origin = centre of the model image, mapped to this pyramid level and
+    // snapped to a full pixel (otherwise the rounding of the offsets and the
+    // rounding of the match position would add up to a one pixel error)
+    const int icx = (modelGray0_.cols / 2) >> level;
+    const int icy = (modelGray0_.rows / 2) >> level;
+    ld.center = cv::Point2f((float)icx, (float)icy);
+    ld.points.clear();
+    ld.activePoints = 0;
+    if (level == 0) { candCount_ = 0; strongestMag_ = 0; weakestMag_ = 0; }
+
     std::vector<std::pair<float, int>> cand; // (magnitude, linear index)
-    cand.reserve(w * h);
+    cand.reserve((size_t)w * h);
     for (int i = 0; i < h * w; i++)
         if (pMag[i] >= (float)params_.minContrast)
             cand.push_back(std::pair<float, int>(pMag[i], i));
@@ -228,37 +238,40 @@ void ShapeMatcher::selectEdgePoints(LevelData& ld, const cv::Mat& grayLevel, int
     if (cand.empty())
         return;
 
+    // The strongest maxPts win.  Two other selection rules were measured on
+    // the scan plane set (199 images) and both were clearly worse, so the
+    // plain "strongest first" order is kept on purpose:
+    //   * non maximum suppression first: the thinned pool is much smaller, so
+    //     the budget ends up filled with weak points (magnitude cut drops from
+    //     ~140 to ~30) -> mean score 0.851 -> 0.484 at maxPoints = 2025
+    //   * grid spreading (a few points per cell of a maxPoints sized grid):
+    //     replaces strong points by weaker ones -> 0.851 -> 0.479
+    // Weak points are what drag the score down, so at a fixed budget nothing
+    // beats taking the strongest ones.  maxPoints itself is the knob to turn.
     std::sort(cand.begin(), cand.end(),
               [](const std::pair<float, int>& a, const std::pair<float, int>& b) { return a.first > b.first; });
 
     int n = std::min((int)cand.size(), maxPts);
     ld.points.resize(n);
-
-    double sx = 0, sy = 0;
     for (int k = 0; k < n; k++)
     {
         int idx = cand[k].second;
         int yy = idx / w, xx = idx - yy * w;
         ModelPoint& mp = ld.points[k];
-        mp.x = (float)xx;
-        mp.y = (float)yy;
+        mp.x = (float)xx - icx;
+        mp.y = (float)yy - icy;
         mp.gx = pGx[idx];
         mp.gy = pGy[idx];
         mp.mag = pMag[idx];
-        sx += mp.x; sy += mp.y;
-    }
-    // origin = centre of the model image, mapped to this pyramid level and
-    // snapped to a full pixel (otherwise the rounding of the offsets and the
-    // rounding of the match position would add up to a one pixel error)
-    int icx = (modelGray0_.cols / 2) >> level;
-    int icy = (modelGray0_.rows / 2) >> level;
-    ld.center = cv::Point2f((float)icx, (float)icy);
-    for (int k = 0; k < n; k++)
-    {
-        ld.points[k].x -= icx;
-        ld.points[k].y -= icy;
     }
     ld.activePoints = n;
+
+    if (level == 0)
+    {
+        candCount_    = (int)cand.size();
+        strongestMag_ = n > 0 ? cand.front().first : 0.f;
+        weakestMag_   = n > 0 ? cand[n - 1].first   : 0.f;
+    }
 }
 
 //=======================================================================
@@ -1628,6 +1641,13 @@ bool ShapeMatcher::deserializeShapeModel(const std::vector<uchar>& data)
     modelLevels_   = levels;
     angleGrid_     = ag;
     scaleGrid_     = sg;
+
+    // the point list is stored strongest first, so the two ends of it give
+    // the same tuning hint as right after createShapeModel().  the number of
+    // candidate pixels is not part of the file, 0 means "unknown".
+    candCount_    = 0;
+    strongestMag_ = levels[0].points.front().mag;
+    weakestMag_   = levels[0].points.back().mag;
     angleStep_     = aStep;
     scaleStep_     = sStep;
     scaleMin_      = sMin;

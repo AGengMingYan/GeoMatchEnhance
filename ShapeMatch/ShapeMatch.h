@@ -102,6 +102,17 @@ public:
     void drawContours(cv::Mat& dst, const MatchResult& m, cv::Scalar color, int thickness = 1) const;
     void drawContours(cv::Mat& dst, cv::Scalar color, int thickness = 1) const;
     int  modelPointCount() const;
+
+    //---- how the point set was built (level 0), for tuning ---------------
+    // candidatePixels() is the number of pixels that passed minContrast.  If
+    // it is far larger than modelPointCount() then minContrast did nothing
+    // and maxPoints alone decided the cut.  weakestMag()/strongestMag() are
+    // the gradient magnitudes of the last and the first kept point: a small
+    // ratio means the tail of the point set is weak, and weak points are the
+    // ones blur and noise destroy first -> lower maxPoints.
+    int   candidatePixels()  const { return candCount_; }
+    float strongestMag()     const { return strongestMag_; }
+    float weakestMag()       const { return weakestMag_; }
     cv::Point2f modelCenter() const;   // centre of gravity of the level-0 model points
 
     // introspection for the demo / visualisation
@@ -137,6 +148,10 @@ private:
 
     bool created_;
     MatchParams params_;
+    // level 0 selection facts, see candidatePixels()/weakestMag()
+    mutable int   candCount_    = 0;
+    mutable float strongestMag_ = 0;
+    mutable float weakestMag_   = 0;
     cv::Mat     modelGray0_;
     std::vector<LevelData> modelLevels_;
     Impl* impl_;
