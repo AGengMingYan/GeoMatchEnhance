@@ -63,6 +63,7 @@ struct Config
     double minContrast  = 12.0;  // low edge threshold (hysteresis link), Halcon MinContrast
     int    maxPoints    = 1200;
     int    numLevels    = 0;      // 0 = auto
+    cv::Mat mask;                 // CV_8U, non-zero = region that may contribute edge points
 
     // ---- search ----
     double minScore     = 0.55;

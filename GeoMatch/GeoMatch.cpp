@@ -41,6 +41,7 @@ MatchParams Config::toMatchParams() const
     p.minContrast  = minContrast;
     p.maxPoints    = maxPoints;
     p.numLevels    = numLevels;
+    p.mask         = mask;
     return p;
 }
 

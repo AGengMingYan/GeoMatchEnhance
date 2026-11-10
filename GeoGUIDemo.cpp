@@ -359,6 +359,16 @@ struct App
     bool     dragging = false;
     ImVec2   dragA, dragB;
 
+    //---- 模板掩码(非零 = 参与建模的区域) ----
+    std::string maskPath;
+    cv::Mat     mask;
+
+    //---- 掩码涂抹 ----
+    bool  paintMask    = false;   // 涂抹模式开关
+    bool  maskPainting = false;   // 正在按住涂抹
+    bool  maskDirty    = false;   // 涂抹结束，需要重建模板
+    float brushRadius  = 6.f;     // 画笔半径(图像像素)
+
     geomatch::Config toConfig() const
     {
         geomatch::Config c;
@@ -370,6 +380,7 @@ struct App
         c.minContrast  = minContrast;
         c.maxPoints    = maxPoints;
         c.numLevels    = numLevels;
+        c.mask         = mask;
         c.minScore     = minScore;
         c.maxMatches   = maxMatches;
         c.minDistance  = minDistance;
@@ -400,6 +411,57 @@ struct App
 };
 
 static App g_app;
+
+//=======================================================================
+//  模板掩码可视化: 把掩码排除区(mask==0)以暗红色叠加到模板源图上
+//=======================================================================
+static cv::Mat overlayMaskOnTpl(const cv::Mat& gray, const cv::Mat& mask)
+{
+    cv::Mat vis;
+    cv::cvtColor(gray, vis, cv::COLOR_GRAY2BGR);
+    if (mask.empty())
+        return vis;
+
+    cv::Mat m1;
+    if (mask.channels() == 3) cv::cvtColor(mask, m1, cv::COLOR_BGR2GRAY);
+    else mask.convertTo(m1, CV_8U);
+    if (m1.size() != gray.size())
+        cv::resize(m1, m1, gray.size(), 0, 0, cv::INTER_NEAREST);
+    cv::threshold(m1, m1, 0, 255, cv::THRESH_BINARY);
+
+    for (int y = 0; y < vis.rows; y++)
+    {
+        cv::Vec3b* row = vis.ptr<cv::Vec3b>(y);
+        const uchar* mrow = m1.ptr<uchar>(y);
+        for (int x = 0; x < vis.cols; x++)
+        {
+            if (mrow[x] == 0)   // 被掩码排除的区域 -> 压暗并偏紫红
+                row[x] = cv::Vec3b(
+                    (uchar)(row[x][0] * 0.35f + 45),
+                    (uchar)(row[x][1] * 0.35f),
+                    (uchar)(row[x][2] * 0.35f + 45));
+        }
+    }
+    return vis;
+}
+
+// 刷新模板源图视图(叠加 mask 覆盖层)
+static void refreshTplView(App& a)
+{
+    if (a.tplGray.empty()) { a.texTplSrc.release(); return; }
+    a.texTplSrc.set(toBGRA(overlayMaskOnTpl(a.tplGray, a.mask)));
+}
+
+// 确保掩码与模板源图同尺寸(默认整幅参与建模)
+static void ensureMask(App& a, int w, int h)
+{
+    if (a.mask.empty() || a.mask.cols != w || a.mask.rows != h ||
+        a.mask.type() != CV_8UC1)
+    {
+        a.mask = cv::Mat(h, w, CV_8U, cv::Scalar(255));
+        a.maskPath.clear();   // 手绘掩码没有文件来源
+    }
+}
 
 //=======================================================================
 //  业务动作
@@ -495,7 +557,7 @@ static void loadTemplateImage(App& a, const std::wstring& path)
     }
     a.tplGray = g;
     a.tplPath = ws2s(path);
-    a.texTplSrc.set(toBGRA(g));
+    refreshTplView(a);
     logf("模板源图: %s (%dx%d)", a.tplPath.c_str(), g.cols, g.rows);
 
     if (a.autoRun)          // 换图后直接把模型和结果刷出来
@@ -605,7 +667,8 @@ static ImVec2 fitSize(int w, int h, const ImVec2& avail, float zoom)
 }
 
 // roiOwner: 0 = 不允许框选，1 = 目标图，2 = 模板源图
-static void drawImageView(const char* id, const char* info, Texture& tex, int roiOwner)
+// maskPaint: 为 true 时在模板源图上支持涂抹掩码(左键=参与/右键=排除)
+static void drawImageView(const char* id, const char* info, Texture& tex, int roiOwner, bool maskPaint = false)
 {
     App& a = g_app;
     if (!tex.valid())
@@ -636,6 +699,50 @@ static void drawImageView(const char* id, const char* info, Texture& tex, int ro
         return ImVec2(origin.x + p.x * disp.x / (float)tex.w,
                       origin.y + p.y * disp.y / (float)tex.h);
     };
+
+    //---- 掩码涂抹模式(模板源图专属，优先于 ROI 框选) ----
+    if (maskPaint && roiOwner == 2)
+    {
+        const bool eraseDown = ImGui::IsMouseDown(ImGuiMouseButton_Left);   // 左键 = 排除(置0)
+        const bool paintDown = ImGui::IsMouseDown(ImGuiMouseButton_Right);  // 右键 = 恢复(置255)
+        const bool anyDown   = paintDown || eraseDown;
+
+        if (ImGui::IsItemHovered() && anyDown)
+        {
+            ImVec2 p = toImg(ImGui::GetMousePos());
+            p.x = clampf(p.x, 0.f, (float)tex.w - 1.f);
+            p.y = clampf(p.y, 0.f, (float)tex.h - 1.f);
+
+            ensureMask(a, tex.w, tex.h);
+            cv::circle(a.mask, cv::Point((int)p.x, (int)p.y),
+                       std::max(1, (int)a.brushRadius),
+                       cv::Scalar(eraseDown ? 0 : 255), -1, cv::LINE_AA);
+            refreshTplView(a);          // 实时预览覆盖层
+            a.maskPainting = true;
+        }
+
+        // 松手 -> 触发一次模板重建
+        if (a.maskPainting && !anyDown)
+        {
+            a.maskPainting = false;
+            a.maskDirty = true;
+        }
+
+        // 画笔光标圆圈
+        if (ImGui::IsItemHovered())
+        {
+            ImVec2 p = toImg(ImGui::GetMousePos());
+            ImVec2 c = toScr(ImVec2(clampf(p.x, 0.f, (float)tex.w - 1.f),
+                                    clampf(p.y, 0.f, (float)tex.h - 1.f)));
+            float r = std::max(1.0f, a.brushRadius * disp.x / (float)tex.w);
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            dl->AddCircle(c, r, eraseDown ? IM_COL32(255, 80, 80, 255)
+                                          : IM_COL32(0, 255, 0, 255), 0, 2.f);
+        }
+
+        ImGui::Text("%s", info);
+        return;
+    }
 
     if (roiOwner != 0)
     {
@@ -711,7 +818,7 @@ static void drawViewPane()
         if (ImGui::BeginTabItem("模板源图"))
         {
             snprintf(info, sizeof(info), "模板源图  %dx%d", a.texTplSrc.w, a.texTplSrc.h);
-            drawImageView("##area_tpl", info, a.texTplSrc, a.texTplSrc.valid() ? 2 : 0);
+            drawImageView("##area_tpl", info, a.texTplSrc, a.texTplSrc.valid() ? 2 : 0, a.paintMask);
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("模板模型"))
@@ -811,7 +918,7 @@ static void drawPanel()
             {
                 a.tplGray = a.tgtGray(r).clone();
                 a.tplPath = a.tgtPath + "  [ROI]";
-                a.texTplSrc.set(toBGRA(a.tplGray));
+                refreshTplView(a);
                 logf("已截取模板: (%d,%d) %dx%d", r.x, r.y, r.width, r.height);
                 a.roiOwner = 0;                 // 截出来的是新图，ROI 不再是目标图上的框
                 a.roiHas   = false;
@@ -847,6 +954,62 @@ static void drawPanel()
     changedModel |= sliderF("最小对比度", &a.minContrast, 0.f, 80.f, "%.0f", commitModel);
     changedModel |= sliderI("最大点数", &a.maxPoints, 100, 4000, commitModel);
     changedModel |= sliderI("金字塔层数(0=自动)", &a.numLevels, 0, 8, commitModel);
+
+    //---- 模板掩码(非零区域参与建模) ----
+    if (a.mask.empty())
+        ImGui::TextDisabled("模板掩码: 未加载(默认整幅模板参与建模)");
+    else
+    {
+        const double total = (double)a.mask.cols * a.mask.rows;
+        const double keep = 100.0 * (total > 0 ? cv::countNonZero(a.mask) / total : 0.0);
+        ImGui::Text("模板掩码: 已加载  %.1f%% 区域参与建模", keep);
+        ImGui::TextWrapped("%s", a.maskPath.c_str());
+    }
+    if (ImGui::Button("加载掩码...", ImVec2(-140, 0)))
+    {
+        std::wstring p = pickImageFile(L"选择掩码图(非零=参与建模)");
+        if (!p.empty())
+        {
+            cv::Mat m;
+            if (!loadGrayImage(p, m)) logf("无法读取掩码图: %s", ws2s(p).c_str());
+            else
+            {
+                a.maskPath = ws2s(p);
+                a.mask     = m;
+                refreshTplView(a);
+                const double total = (double)m.cols * m.rows;
+                logf("掩码已加载: %s (%dx%d) 非零占比 %.1f%%",
+                     a.maskPath.c_str(), m.cols, m.rows,
+                     100.0 * (total > 0 ? cv::countNonZero(m) / total : 0.0));
+                needCreate = true;
+            }
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("清除掩码", ImVec2(-1, 0)))
+    {
+        a.maskPath.clear();
+        a.mask.release();
+        refreshTplView(a);
+        logLine("掩码已清除");
+        needCreate = true;
+    }
+
+    //---- 掩码涂抹 ----
+    if (ImGui::Checkbox("涂抹掩码模式", &a.paintMask))
+    {
+        // 开启时立即初始化掩码(默认全参与)并刷新视图
+        if (a.paintMask && !a.tplGray.empty())
+        {
+            ensureMask(a, a.tplGray.cols, a.tplGray.rows);
+            refreshTplView(a);
+        }
+    }
+    if (a.paintMask)
+    {
+        ImGui::SliderFloat("画笔半径(px)", &a.brushRadius, 1.f, 30.f, "%.0f");
+        ImGui::TextWrapped("在左侧\"模板源图\"标签页: 左键涂抹=排除(红), 右键涂抹=恢复参与(绿)");
+    }
 
     if (ImGui::Button("创建模板", ImVec2(-1, 0))) needCreate = true;
 
@@ -949,11 +1112,13 @@ static void drawPanel()
         const bool live = a.liveUpdate && a.lastOpMs < 150.0;
         if (commitModel  || (changedModel  && live)) needCreate = true;
         if (commitSearch || (changedSearch && live)) needMatch  = true;
-        if (a.roiDirty) { a.roiDirty = false; needCreate = true; }
+        if (a.roiDirty)  { a.roiDirty  = false; needCreate = true; }
+        if (a.maskDirty) { a.maskDirty = false; needCreate = true; }
     }
     else
     {
-        a.roiDirty = false;
+        a.roiDirty  = false;
+        a.maskDirty = false;
     }
 
     if (needCreate || needMatch)
@@ -1081,7 +1246,7 @@ static void autoInit(App& a, const std::string& dir)
     }
 
     a.tplPath = tpl;
-    a.texTplSrc.set(toBGRA(a.tplGray));
+    refreshTplView(a);
     logf("模板源图: %s (%dx%d)", tpl.c_str(), a.tplGray.cols, a.tplGray.rows);
 
     createTemplate(a);

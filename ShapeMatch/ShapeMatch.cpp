@@ -169,6 +169,22 @@ bool ShapeMatcher::createShapeModel(const cv::Mat& gray, const MatchParams& p)
     CV_Assert(!gray.empty() && gray.channels() == 1);
     gray.convertTo(modelGray0_, CV_8U);
 
+    // ---- normalise the mask to the level-0 template ---------------------
+    cv::Mat mask0;
+    if (!params_.mask.empty())
+    {
+        cv::Mat m1;
+        if (params_.mask.channels() == 3)
+            cv::cvtColor(params_.mask, m1, cv::COLOR_BGR2GRAY);
+        else
+            params_.mask.convertTo(m1, CV_8U);
+        if (m1.size() != modelGray0_.size())
+            cv::resize(m1, mask0, modelGray0_.size(), 0, 0, cv::INTER_NEAREST);
+        else
+            m1.copyTo(mask0);
+        cv::threshold(mask0, mask0, 0, 255, cv::THRESH_BINARY);
+    }
+
     // ---- pyramid levels -------------------------------------------------
     int minSide = 24;
     int lv = 0;
@@ -192,7 +208,13 @@ bool ShapeMatcher::createShapeModel(const cv::Mat& gray, const MatchParams& p)
     for (int i = 0; i < nLevels; i++)
     {
         modelLevels_[i].size = cv::Size(pyr[i].cols, pyr[i].rows);
-        selectEdgePoints(modelLevels_[i], pyr[i], i);
+        cv::Mat mlev;
+        if (!mask0.empty())
+        {
+            if (i == 0) mlev = mask0;
+            else cv::resize(mask0, mlev, pyr[i].size(), 0, 0, cv::INTER_NEAREST);
+        }
+        selectEdgePoints(modelLevels_[i], pyr[i], mlev, i);
     }
     if (modelLevels_[0].points.empty())
         return false;
@@ -421,7 +443,7 @@ namespace
     }
 }
 
-void ShapeMatcher::selectEdgePoints(LevelData& ld, const cv::Mat& grayLevel, int level) const
+void ShapeMatcher::selectEdgePoints(LevelData& ld, const cv::Mat& grayLevel, const cv::Mat& mask, int level) const
 {
     cv::Mat gx, gy, mag, thin, edge;
     cv::Sobel(grayLevel, gx, CV_32F, 1, 0, 3);
@@ -452,6 +474,10 @@ void ShapeMatcher::selectEdgePoints(LevelData& ld, const cv::Mat& grayLevel, int
     const float hi = (float)std::max(params_.contrast, lo * 1.5);
     thinRidges(mag, gx, gy, thin);
     growEdges(mag, thin, lo, hi, edge);
+
+    // mask off edges outside the region of interest
+    if (!mask.empty())
+        cv::bitwise_and(edge, mask, edge);
 
     const std::vector<int> idx = sampleAlongContours(edge, mag, maxPts);
     const int n = (int)idx.size();

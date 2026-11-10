@@ -466,7 +466,7 @@ int main(int argc, char** argv)
     if (argc < 3)
     {
         printf("用法: AnalyzeCase <图片目录> <模型文件> [--min-score X] [--limit N] "
-               "[--dump 目录] [--probe N] [--cpu] [--sweep]\n");
+               "[--dump 目录] [--probe N] [--cpu] [--sweep] [--mask 掩码图]\n");
         return 1;
     }
 
@@ -480,6 +480,7 @@ int main(int argc, char** argv)
     bool   useOCL     = true;
     bool   sweep      = false;
     std::string dumpDir;
+    std::string maskFile;
 
     for (int i = 3; i < argc; i++)
     {
@@ -492,6 +493,7 @@ int main(int argc, char** argv)
         else if (a == "--cpu")       useOCL   = false;
         else if (a == "--top")       topN     = atoi(next().c_str());
         else if (a == "--points")    points   = atoi(next().c_str());
+        else if (a == "--mask")      maskFile = next();
         else if (a == "--sweep")     sweep    = true;
     }
 
@@ -523,6 +525,11 @@ int main(int argc, char** argv)
             }
         if (tpl.empty()) { fprintf(stderr, "没找到模板图\n"); return 2; }
         cfg.maxPoints = points;
+        if (!maskFile.empty())
+        {
+            cfg.mask = cv::imread(maskFile, cv::IMREAD_GRAYSCALE);
+            if (cfg.mask.empty()) { fprintf(stderr, "掩码读不出来: %s\n", maskFile.c_str()); return 2; }
+        }
         if (!m.create(tpl, cfg)) { fprintf(stderr, "建模板失败\n"); return 2; }
         printModelInfo(m, std::string("重建: maxPoints=") + std::to_string(points));
     }
