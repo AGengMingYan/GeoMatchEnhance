@@ -58,6 +58,8 @@ struct MatchParams
     double contrast    = 30;   // high threshold: a ridge must reach it to become a seed
     double minContrast = 12;   // low threshold: weaker edges are kept while they touch a seed
     int    maxPoints   = 1200; // model points kept at the finest level
+    cv::Mat mask;              // CV_8U, non-zero = region that may contribute edge points.
+                               // empty = the whole template is used (default behaviour).
     double minScore    = 0.6;
     int    maxMatches  = 20;
     double minDistance = 40;
@@ -168,7 +170,7 @@ private:
     double lastPreprocessTime_, lastSearchTime_;
 
     void buildAngleScaleGrids();
-    void selectEdgePoints(LevelData& ld, const cv::Mat& grayLevel, int level) const;
+    void selectEdgePoints(LevelData& ld, const cv::Mat& grayLevel, const cv::Mat& mask, int level) const;
 
     void  buildXForm(int level, int aIdx, int sIdx, XForm& xf) const;
     void  buildKernel(XForm& xf) const;

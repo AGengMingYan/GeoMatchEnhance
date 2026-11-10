@@ -107,7 +107,19 @@ namespace
         Config cfg;
         cfg.minContrast = gArgD(a, "-contrast", 12.0);
         cfg.contrast    = gArgD(a, "-hi", 30.0);
+        cfg.maxPoints   = (int)gArgD(a, "-points", 1200.0);
         applyModelRange(cfg, a);
+
+        const std::string maskFile = gArg(a, "-mask", "");
+        if (!maskFile.empty())
+        {
+            cfg.mask = cv::imread(maskFile, cv::IMREAD_GRAYSCALE);
+            if (cfg.mask.empty())
+            {
+                std::cerr << "[t1] cannot open mask: " << maskFile << "\n";
+                return -1;
+            }
+        }
 
         cv::Mat tpl = cv::imread(templ, cv::IMREAD_GRAYSCALE);
         if (tpl.empty())
@@ -271,6 +283,7 @@ int main(int argc, char** argv)
     const std::string outDir    = gArg(args, "-o", "case1/out");
     const std::string saveModel = gArg(args, "-save", "");
     const std::string loadModel = gArg(args, "-load", "");
+    const std::string maskFile  = gArg(args, "-mask", "");
 
     cfg.minScore    = gArgD(args, "-minscore", 0.55);
     cfg.maxMatches  = (int)gArgD(args, "-max", 12);
@@ -281,6 +294,16 @@ int main(int argc, char** argv)
 
     const double angleExtentDeg = gArgD(args, "-angle", 360.0);
     applyModelRange(cfg, args);
+
+    if (!maskFile.empty())
+    {
+        cfg.mask = cv::imread(maskFile, cv::IMREAD_GRAYSCALE);
+        if (cfg.mask.empty())
+        {
+            std::cerr << "cannot open mask: " << maskFile << "\n";
+            return -1;
+        }
+    }
 
     const int   loops   = std::max(1, (int)gArgD(args, "-loops", 1));
     const int   gentest = std::max(0, (int)gArgD(args, "-gentest", 0));
