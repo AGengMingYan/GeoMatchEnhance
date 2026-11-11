@@ -60,6 +60,8 @@ struct MatchParams
     int    maxPoints   = 1200; // model points kept at the finest level
     cv::Mat mask;              // CV_8U, non-zero = region that may contribute edge points.
                                // empty = the whole template is used (default behaviour).
+    int    minChainLen = 2;    // drop edge chains shorter than this (pixels); suppresses
+                               // isolated speckle edges while keeping long contours.
     double minScore    = 0.6;
     int    maxMatches  = 20;
     double minDistance = 40;

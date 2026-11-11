@@ -108,6 +108,7 @@ namespace
         cfg.minContrast = gArgD(a, "-contrast", 12.0);
         cfg.contrast    = gArgD(a, "-hi", 30.0);
         cfg.maxPoints   = (int)gArgD(a, "-points", 1200.0);
+        cfg.minChainLen = (int)gArgD(a, "-chain", 2.0);
         applyModelRange(cfg, a);
 
         const std::string maskFile = gArg(a, "-mask", "");

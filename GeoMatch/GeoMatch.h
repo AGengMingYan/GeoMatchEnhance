@@ -64,6 +64,7 @@ struct Config
     int    maxPoints    = 1200;
     int    numLevels    = 0;      // 0 = auto
     cv::Mat mask;                 // CV_8U, non-zero = region that may contribute edge points
+    int    minChainLen = 2;       // drop edge chains shorter than this (pixels)
 
     // ---- search ----
     double minScore     = 0.55;

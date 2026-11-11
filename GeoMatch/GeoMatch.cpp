@@ -42,6 +42,7 @@ MatchParams Config::toMatchParams() const
     p.maxPoints    = maxPoints;
     p.numLevels    = numLevels;
     p.mask         = mask;
+    p.minChainLen  = minChainLen;
     return p;
 }
 

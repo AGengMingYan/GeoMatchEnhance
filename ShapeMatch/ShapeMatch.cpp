@@ -303,7 +303,7 @@ namespace
     // walk the thinned edges into chains and take the points at equal arc
     // length, so the model follows the texture instead of clustering on the
     // few strongest ridges (this is what Halcon's model contours look like)
-    std::vector<int> sampleAlongContours(const cv::Mat& edge, const cv::Mat& mag, int maxPts)
+    std::vector<int> sampleAlongContours(const cv::Mat& edge, const cv::Mat& mag, int maxPts, int minChainLen)
     {
         const int w = edge.cols, h = edge.rows, nPix = w * h;
         const uchar* pe = edge.ptr<uchar>();
@@ -352,7 +352,7 @@ namespace
                 }
                 cur = nxt;
             }
-            if (ch.size() >= 2) chains.push_back(std::move(ch));
+            if ((int)ch.size() >= minChainLen) chains.push_back(std::move(ch));
         };
 
         for (int i = 0; i < nPix; i++)
@@ -479,7 +479,7 @@ void ShapeMatcher::selectEdgePoints(LevelData& ld, const cv::Mat& grayLevel, con
     if (!mask.empty())
         cv::bitwise_and(edge, mask, edge);
 
-    const std::vector<int> idx = sampleAlongContours(edge, mag, maxPts);
+    const std::vector<int> idx = sampleAlongContours(edge, mag, maxPts, params_.minChainLen);
     const int n = (int)idx.size();
 
     ld.points.resize(n);
