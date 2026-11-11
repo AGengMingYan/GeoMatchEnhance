@@ -327,6 +327,7 @@ struct App
     float greediness     = 0.9f;
     bool  subpixel       = true;
     bool  useOpenCL      = true;
+    int   scoreMode      = 1;           // 1 = positive-mean(默认), 0 = mean, 2 = trimmed-mean
     bool  autoRun        = true;       // 参数改完自动重建模板 + 重匹配
     bool  liveUpdate     = true;       // 拖动滑块的过程中就实时刷新
     float zoom           = 1.0f;       // 1 = 适应窗口
@@ -388,6 +389,7 @@ struct App
         c.subpixel     = subpixel ? 1 : 0;
         c.useOpenCL    = useOpenCL;
         c.debug        = 0;
+        c.scoreMode    = scoreMode;
         return c;
     }
 
@@ -407,6 +409,7 @@ struct App
         greediness  = (float)c.greediness;
         subpixel    = c.subpixel != 0;
         useOpenCL   = c.useOpenCL;
+        scoreMode   = c.scoreMode;
     }
 };
 
@@ -1083,6 +1086,14 @@ static void drawPanel()
     changedSearch |= sliderI("最大匹配数", &a.maxMatches, 1, 64, commitSearch);
     changedSearch |= sliderF("最小间距(px)", &a.minDistance, 0.f, 300.f, "%.0f", commitSearch);
     changedSearch |= sliderF("贪婪度", &a.greediness, 0.3f, 1.f, "%.2f", commitSearch);
+    {
+        const char* items[] = { "mean(原始)", "positive-mean(方向一致点比例)", "trimmed-mean(去尾10%)" };
+        if (ImGui::Combo("评分方式", &a.scoreMode, items, 3))
+        {
+            changedSearch = true;
+            commitSearch  = true;
+        }
+    }
     if (ImGui::Checkbox("亚像素", &a.subpixel)) { changedSearch = true; commitSearch = true; }
     ImGui::SameLine();
     if (ImGui::Checkbox("OpenCL", &a.useOpenCL))

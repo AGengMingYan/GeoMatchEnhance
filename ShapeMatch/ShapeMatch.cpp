@@ -998,6 +998,69 @@ namespace
         }
         return sum / n;
     }
+
+    // robust re-scoring of the final matches.  search/refine use mean (scorePos);
+    // this only re-aggregates the per-point dot products at the found pose so a
+    // few flipped points do not drag the reported confidence down.
+    inline float scorePosMode(const cv::Mat& sx, const cv::Mat& sy, const XForm& xf,
+                              int ay, int ax, int mode)
+    {
+        const int n = xf.n;
+        const int16_t* pox = xf.ox.data();
+        const int16_t* poy = xf.oy.data();
+        const float* pnx = xf.nx.data();
+        const float* pny = xf.ny.data();
+
+        if (mode == 0)   // mean (identical to scorePos without early-exit)
+        {
+            float sum = 0.f;
+            for (int k = 0; k < n; k++)
+            {
+                const uint16_t* rx = sx.ptr<uint16_t>(ay + poy[k]);
+                const uint16_t* ry = sy.ptr<uint16_t>(ay + poy[k]);
+                sum += pnx[k] * f16ToF32(rx[ax + pox[k]]) +
+                       pny[k] * f16ToF32(ry[ax + pox[k]]);
+            }
+            return sum / n;
+        }
+
+        if (mode == 1)   // positive-mean: drop points whose direction flipped
+        {
+            float sum = 0.f;
+            int cnt = 0;
+            for (int k = 0; k < n; k++)
+            {
+                const uint16_t* rx = sx.ptr<uint16_t>(ay + poy[k]);
+                const uint16_t* ry = sy.ptr<uint16_t>(ay + poy[k]);
+                float d = pnx[k] * f16ToF32(rx[ax + pox[k]]) +
+                          pny[k] * f16ToF32(ry[ax + pox[k]]);
+                if (d > 0.f) { sum += d; cnt++; }
+            }
+            return cnt > 0 ? sum / cnt : 0.f;
+        }
+
+        // mode 2: trimmed-mean, drop the worst 10% of points
+        std::vector<float> dots;
+        dots.reserve(n);
+        for (int k = 0; k < n; k++)
+        {
+            const uint16_t* rx = sx.ptr<uint16_t>(ay + poy[k]);
+            const uint16_t* ry = sy.ptr<uint16_t>(ay + poy[k]);
+            dots.push_back(pnx[k] * f16ToF32(rx[ax + pox[k]]) +
+                           pny[k] * f16ToF32(ry[ax + pox[k]]));
+        }
+        const int trim = n / 10;
+        if (trim <= 0 || n - 2 * trim <= 0)
+        {
+            float s = 0.f;
+            for (float d : dots) s += d;
+            return s / n;
+        }
+        std::sort(dots.begin(), dots.end());
+        float s = 0.f;
+        for (int i = trim; i < n - trim; i++) s += dots[i];
+        return s / (n - 2 * trim);
+    }
 }
 
 //=======================================================================
@@ -1571,6 +1634,38 @@ std::vector<MatchResult> ShapeMatcher::findShapeModel(const cv::Mat& gray, const
             m.score = c.score;
             results.push_back(m);
         }
+    }
+
+    //---- optional robust re-scoring of the final matches ------------------
+    // the search / refine used mean (scorePos); if a different score mode is
+    // requested, re-aggregate the per-point dot products at the found pose.
+    // this only changes the reported confidence, never the pose.
+    if (fp.scoreMode != 0 && !results.empty())
+    {
+        for (MatchResult& r : results)
+        {
+            int ai = 0, si = 0;
+            double best = 1e9;
+            for (int i = 0; i < (int)angleGrid_.size(); i++)
+            {
+                double d = std::abs(angleGrid_[i] - (double)r.angle);
+                if (d < best) { best = d; ai = i; }
+            }
+            best = 1e9;
+            for (int i = 0; i < (int)scaleGrid_.size(); i++)
+            {
+                double d = std::abs(scaleGrid_[i] - (double)r.scale);
+                if (d < best) { best = d; si = i; }
+            }
+            XForm& xf = getXForm(0, ai, si);
+            int ax = cvRound(r.pos.x), ay = cvRound(r.pos.y);
+            ax = std::min(std::max(ax, xf.R), srcGx_[0].cols - 1 - xf.R);
+            ay = std::min(std::max(ay, xf.R), srcGx_[0].rows - 1 - xf.R);
+            r.score = scorePosMode(srcGx_[0], srcGy_[0], xf, ay, ax, fp.scoreMode);
+        }
+        std::sort(results.begin(), results.end(),
+                  [](const MatchResult& a, const MatchResult& b)
+                  { return a.score > b.score; });
     }
 
     int64 t2 = cv::getTickCount();

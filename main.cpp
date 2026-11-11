@@ -214,6 +214,7 @@ namespace
         cfg.maxMatches = (int)gArgD(a, "-max", 12);
         cfg.useOpenCL  = (int)gArgD(a, "-ocl", 1) != 0;
         cfg.debug      = (int)gArgD(a, "-debug", 0);
+        cfg.scoreMode  = (int)gArgD(a, "-score-mode", 1);
         m.setConfig(cfg);
 
         Timing tm;
@@ -292,6 +293,7 @@ int main(int argc, char** argv)
     cfg.contrast    = gArgD(args, "-hi", 30.0);
     cfg.useOpenCL   = (int)gArgD(args, "-ocl", 1) != 0;
     cfg.debug       = (int)gArgD(args, "-debug", 0);
+    cfg.scoreMode   = (int)gArgD(args, "-score-mode", 1);
 
     const double angleExtentDeg = gArgD(args, "-angle", 360.0);
     applyModelRange(cfg, args);

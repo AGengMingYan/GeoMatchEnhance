@@ -56,6 +56,7 @@ FindParams Config::toFindParams() const
     p.subpixel   = subpixel;
     p.useOpenCL  = useOpenCL;
     p.debug      = debug;
+    p.scoreMode  = scoreMode;
     return p;
 }
 

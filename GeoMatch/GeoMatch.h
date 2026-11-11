@@ -74,6 +74,8 @@ struct Config
     int    subpixel     = 1;
     bool   useOpenCL    = true;
     int    debug        = 0;
+    int    scoreMode    = 1;    // final score aggregation: 1 = positive-mean (default),
+                                // 0 = mean, 2 = trimmed-mean(10%).
 
     // build the corresponding low level parameter structs
     MatchParams toMatchParams() const;

@@ -466,13 +466,15 @@ int main(int argc, char** argv)
     if (argc < 3)
     {
         printf("用法: AnalyzeCase <图片目录> <模型文件> [--min-score X] [--limit N] "
-               "[--dump 目录] [--probe N] [--cpu] [--sweep] [--mask 掩码图]\n");
+               "[--dump 目录] [--probe N] [--cpu] [--sweep] [--mask 掩码图] [--min-dist X] [--score-mode N]\n");
         return 1;
     }
 
     std::string dir   = argv[1];
     std::string model = argv[2];
     double minScore   = 0.5;
+    double minDist    = 0.0;     // 0 = 用模型默认值
+    int    scoreMode  = 1;       // 1 = positive-mean(默认), 0 = mean, 2 = trimmed-mean
     int    limit      = 0;
     int    probeN     = 0;
     int    topN       = 0;
@@ -487,6 +489,8 @@ int main(int argc, char** argv)
         const std::string a = argv[i];
         auto next = [&]() { return (i + 1 < argc) ? std::string(argv[++i]) : std::string(); };
         if      (a == "--min-score") minScore = atof(next().c_str());
+        else if (a == "--min-dist")  minDist  = atof(next().c_str());
+        else if (a == "--score-mode") scoreMode = atoi(next().c_str());
         else if (a == "--limit")     limit    = atoi(next().c_str());
         else if (a == "--probe")     probeN   = atoi(next().c_str());
         else if (a == "--dump")      dumpDir  = next();
@@ -511,6 +515,8 @@ int main(int argc, char** argv)
     geomatch::Config cfg   = m.config();
     cfg.minScore  = minScore;
     cfg.useOpenCL = useOCL;
+    if (minDist > 0) cfg.minDistance = minDist;
+    cfg.scoreMode = scoreMode;
 
     // >0: 丢掉文件里的模型, 用模板图按指定点数重建
     if (points > 0)
