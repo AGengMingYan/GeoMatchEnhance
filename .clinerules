@@ -154,6 +154,57 @@ ren surface_compare.png surface_compare.png.txt
 - 不要用其它方式"伪造"解密（如 PowerShell 的 `Get-Content`/`cat` 别名/`>`），二进制会被破坏；只用
   **cmd 下的 `cat.exe` 重定向** 或 **`cmd /c "copy /b"`**。
 
+---
+
+## 3. Git 提交信息：必须用中文总结（强制）
+
+### 硬性要求
+- **所有 git commit message 一律用简体中文**：既包括我（Cline）手写的 `git commit -m`，
+  也包括 Cline「Source Control → ✨ 生成提交信息（Generate Commit Message）」生成的提交信息。
+- 标题（subject）必须是中文；正文（body）、分条（bullets）、脚注（footer）也必须是中文。
+- 允许保持英文的只有这几类：类型前缀 `feat`/`fix`/`refactor`/`perf`/`docs`/`test`/`build`/`chore`、
+  代码标识符与函数名、文件路径、命令、以及专有名词（OpenCV、SSE、AVX2、SIMD、OpenCL、Dear ImGui 等）。
+- 禁止输出纯英文标题，如 `Updated GeoGUIDemo.cpp`、`fix bug`、`improve layout and add timing`；
+  也不要输出无信息量的标题，如 `更新代码`、`修复问题`。
+
+### 标准格式（Conventional Commits + 中文）
+```
+<类型>(<范围>): <一句话中文总结，50-72 字符内，不加句号>
+
+<为什么改：原问题/现象>
+<具体改动，一行一条，以「-」开头>
+
+<验证方式：构建/运行/实测结果>
+```
+
+常用类型：`feat` 新功能、`fix` 修缺陷、`refactor` 重构（不改行为）、`perf` 性能、
+`docs` 文档/注释、`test` 测试、`build` 构建脚本、`chore` 杂项。
+范围（scope）用模块名，如 `gui`、`match`、`cli`、`build`。
+
+### 正例 / 反例
+```
+# 正例
+fix(gui): 修复窄窗口下右侧面板标签被裁切，并显示搜索总耗时
+
+- 右侧面板宽度改为自适应（300~390px），窗口最小尺寸限制 640x560
+- 滑块/下拉按标签宽度收窄控件，同行控件放不下时自动换行
+- 长提示与日志开启自动折行；结果区新增「搜索总耗时 X ms (N 次)」
+
+验证: Release 构建通过；656px 窄窗截图确认无裁切；CLI det 平均 30.84 ms/张
+
+# 反例（不允许）
+fix: improve right panel layout and add total search time
+更新代码
+```
+
+### 写提交信息前的自检
+1. 先跑 `git --no-pager diff --stat` 和 `git --no-pager status --porcelain`，总结里要点明改了哪些文件/模块。
+2. 提交信息只描述「真正被暂存的改动」，不要把无关的临时文件、调试脚本、截图写进提交。
+3. **未经用户明确要求，不要自动执行 `git commit` / `git push`**；只负责给出中文提交信息文本。
+4. 在 PowerShell 里写多行提交信息时，不要用 `git commit -m "第一行`n第二行"`（会被
+   GBK/引号转义破坏），改用 `git commit -F <临时文件>`（文件存 UTF-8 无 BOM）或
+   `git -c i18n.commitEncoding=utf-8 commit -F msg.txt`。
+
 
 ## 3. Git 提交信息语言（Cline 生成时）
 使用 Cline 的「生成提交信息」功能（git 提交信息输入框上的 Cline 图标）时，

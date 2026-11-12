@@ -8,7 +8,9 @@
 //    右侧  操作面板: 1. 选择模板图片 + 模板参数 + 创建模板(+保存/加载模型)
 //                    2. 选择匹配目标
 //                    3. 搜索参数
-//                    4. 执行匹配 + 结果列表 + 耗时 + 日志
+//                    4. 执行匹配 + 结果列表 + 耗时(含搜索总耗时) + 日志
+//          面板宽度随窗口自适应(窗口变窄时收缩)，所有"控件+右侧标签"的行都按标签宽度
+//          收窄控件，长提示/日志自动折行，避免右边被裁掉显示不全。
 //
 //  用法:  GeoGUIDemo [目录]        目录默认为 case1
 //         启动时会自动尝试 <目录>/temp.jpg 建模板，并拿目录里第一张
@@ -356,6 +358,11 @@ struct App
     bool  roiDirty       = false;      // ROI 刚改完，需要重建模板
     double lastOpMs      = 0;          // 上一次"重建 + 匹配"的总耗时，用来自动降频
 
+    //---- 本次搜索结果里的耗时统计(点"重复 20 次计时"时是累计值) ----
+    double searchTotalMs = 0;          // 搜索总耗时 = 每次搜索 × 重复次数
+    double benchWallMs   = 0;          // 整次 detect 调用的墙钟耗时(含预处理/重复)
+    int    searchLoops   = 0;          // 这次搜索重复了几次
+
     //---- 数据 ----
     geomatch::Matcher matcher;
     bool    modelReady = false;
@@ -555,21 +562,35 @@ static void runMatch(App& a, int loops)
 
     a.matcher.setConfig(a.toConfig());
 
+    const int loopsUsed = std::max(1, loops);
+
     geomatch::Timing tm;
+    const int64 t0 = cv::getTickCount();
     std::vector<geomatch::Detection> dets =
-        loops > 1 ? a.matcher.detectTimed(a.tgtGray, loops, &tm)
-                  : a.matcher.detect(a.tgtGray, &tm);
+        loopsUsed > 1 ? a.matcher.detectTimed(a.tgtGray, loopsUsed, &tm)
+                      : a.matcher.detect(a.tgtGray, &tm);
+    const double wallMs = (cv::getTickCount() - t0) * 1000.0 / cv::getTickFrequency();
 
     a.dets   = dets;
     a.timing = tm;
 
-    const int64 t0 = cv::getTickCount();
+    // 搜索结果区要显示的耗时: detectTimed 只保留最后一轮，累计值按 每轮 × 轮数 折算，
+    // 另外记一份真实墙钟耗时(含预处理/循环开销)，重复计时时用来看总账。
+    a.searchLoops   = loopsUsed;
+    a.searchTotalMs = tm.searchMs * loopsUsed;
+    a.benchWallMs   = wallMs;
+
+    const int64 tDraw = cv::getTickCount();
     a.resultVis = a.matcher.drawResult(a.tgtGray, dets);
-    const double drawMs = (cv::getTickCount() - t0) * 1000.0 / cv::getTickFrequency();
+    const double drawMs = (cv::getTickCount() - tDraw) * 1000.0 / cv::getTickFrequency();
     a.texResult.set(toBGRA(a.resultVis));
 
-    logf("匹配: %d 个结果  预处理 %.2f ms  搜索 %.2f ms  合计 %.2f ms  绘图 %.1f ms",
-         (int)dets.size(), tm.preprocessMs, tm.searchMs, tm.recognitionMs(), drawMs);
+    logf("匹配: %d 个结果  预处理 %.2f ms  搜索 %.2f ms  搜索总耗时 %.2f ms (%d 次)  合计 %.2f ms  绘图 %.1f ms",
+         (int)dets.size(), tm.preprocessMs, tm.searchMs, a.searchTotalMs, loopsUsed,
+         tm.recognitionMs(), drawMs);
+    if (loopsUsed > 1)
+        logf("  重复 %d 次: 墙钟总耗时 %.1f ms  平均 %.2f ms/次",
+             loopsUsed, wallMs, wallMs / loopsUsed);
 }
 
 static void loadTemplateImage(App& a, const std::wstring& path)
@@ -898,8 +919,48 @@ static void drawThumbBar()
 //=======================================================================
 //  右侧: 操作面板
 //=======================================================================
+// 控件后面还跟着标签时，把控件宽度收窄到"可用宽度 - 标签宽度"，
+// 这样窗口/面板再窄，右侧标签也不会被右边界裁掉。
+static void itemWidthForLabel(const char* label)
+{
+    const ImGuiStyle& st = ImGui::GetStyle();
+    const float labelW = ImGui::CalcTextSize(label, nullptr, true).x;
+    float w = ImGui::GetContentRegionAvail().x - labelW - st.ItemInnerSpacing.x;
+    const float wMin = 60.f * g_scale;
+    if (w < wMin) w = wMin;                 // 再窄也留一条能拖动的最小宽度
+    ImGui::SetNextItemWidth(w);
+}
+
+// 同一行剩余宽度够不够放下下一个控件(不够就不 SameLine，直接换行，免得被右边裁掉)
+static bool fitsOnLine(float needW)
+{
+    return ImGui::GetContentRegionAvail().x >= needW;
+}
+
+static float checkWidth(const char* label)      // Checkbox 占宽 = 方框 + 间距 + 文字
+{
+    const ImGuiStyle& st = ImGui::GetStyle();
+    return ImGui::GetFrameHeight() + st.ItemInnerSpacing.x +
+           ImGui::CalcTextSize(label, nullptr, true).x;
+}
+
+static float buttonWidth(const char* label)     // Button 占宽 = 文字 + 两侧内边距
+{
+    const ImGuiStyle& st = ImGui::GetStyle();
+    return ImGui::CalcTextSize(label, nullptr, true).x + st.FramePadding.x * 2.f;
+}
+
+// 暗色 + 自动换行，长提示不会被右边界裁掉
+static void textDimWrapped(const char* s)
+{
+    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+    ImGui::TextWrapped("%s", s);
+    ImGui::PopStyleColor();
+}
+
 static bool sliderF(const char* label, float* v, float lo, float hi, const char* fmt, bool& commit)
 {
+    itemWidthForLabel(label);
     const bool c = ImGui::SliderFloat(label, v, lo, hi, fmt);
     if (ImGui::IsItemDeactivatedAfterEdit()) commit = true;   // 拖动结束后才触发重跑
     return c;
@@ -907,6 +968,7 @@ static bool sliderF(const char* label, float* v, float lo, float hi, const char*
 
 static bool sliderI(const char* label, int* v, int lo, int hi, bool& commit)
 {
+    itemWidthForLabel(label);
     const bool c = ImGui::SliderInt(label, v, lo, hi);
     if (ImGui::IsItemDeactivatedAfterEdit()) commit = true;
     return c;
@@ -955,7 +1017,7 @@ static void drawPanel()
     if (a.roiHas)
     {
         ImGui::Text("ROI: (%d,%d) %dx%d", a.roi.x, a.roi.y, a.roi.width, a.roi.height);
-        ImGui::SameLine();
+        if (fitsOnLine(buttonWidth("清除"))) ImGui::SameLine();
         if (ImGui::SmallButton("清除"))
         {
             a.roiHas   = false;
@@ -965,7 +1027,7 @@ static void drawPanel()
     }
     else
     {
-        ImGui::TextDisabled("ROI: 整幅图 (在左侧图上拖动可框选)");
+        textDimWrapped("ROI: 整幅图 (在左侧图上拖动可框选)");
     }
 
     ImGui::SeparatorText("模板参数");
@@ -982,7 +1044,7 @@ static void drawPanel()
 
     //---- 模板掩码(非零区域参与建模) ----
     if (a.mask.empty())
-        ImGui::TextDisabled("模板掩码: 未加载(默认整幅模板参与建模)");
+        textDimWrapped("模板掩码: 未加载(默认整幅模板参与建模)");
     else
     {
         const double total = (double)a.mask.cols * a.mask.rows;
@@ -1032,6 +1094,7 @@ static void drawPanel()
     }
     if (a.paintMask)
     {
+        itemWidthForLabel("画笔半径(px)");
         ImGui::SliderFloat("画笔半径(px)", &a.brushRadius, 1.f, 30.f, "%.0f");
         ImGui::TextWrapped("在左侧\"模板源图\"标签页: 左键涂抹=排除(红), 右键涂抹=恢复参与(绿)");
     }
@@ -1110,6 +1173,7 @@ static void drawPanel()
     changedSearch |= sliderF("贪婪度", &a.greediness, 0.3f, 1.f, "%.2f", commitSearch);
     {
         const char* items[] = { "mean(原始)", "positive-mean(方向一致点比例)", "trimmed-mean(去尾10%)" };
+        itemWidthForLabel("评分方式");
         if (ImGui::Combo("评分方式", &a.scoreMode, items, 3))
         {
             changedSearch = true;
@@ -1117,7 +1181,7 @@ static void drawPanel()
         }
     }
     if (ImGui::Checkbox("亚像素", &a.subpixel)) { changedSearch = true; commitSearch = true; }
-    ImGui::SameLine();
+    if (fitsOnLine(checkWidth("OpenCL"))) ImGui::SameLine();
     if (ImGui::Checkbox("OpenCL", &a.useOpenCL))
     {
         changedSearch = true;
@@ -1126,9 +1190,9 @@ static void drawPanel()
     }
 
     ImGui::Checkbox("参数改动后自动刷新", &a.autoRun);
-    ImGui::SameLine();
+    if (fitsOnLine(checkWidth("拖动时实时刷新"))) ImGui::SameLine();
     ImGui::Checkbox("拖动时实时刷新", &a.liveUpdate);
-    ImGui::SetNextItemWidth(-1);
+    itemWidthForLabel("显示缩放");
     ImGui::SliderFloat("显示缩放", &a.zoom, 0.2f, 4.f, "%.2f");
 
     //---------------- 4. 执行 ----------------
@@ -1169,9 +1233,16 @@ static void drawPanel()
         a.lastOpMs = (cv::getTickCount() - t0) * 1000.0 / cv::getTickFrequency();
     }
 
-    ImGui::Text("耗时: 预处理 %.2f ms | 搜索 %.2f ms | 合计 %.2f ms | 刷新 %.1f ms",
-                a.timing.preprocessMs, a.timing.searchMs, a.timing.recognitionMs(),
-                a.lastOpMs);
+    //---- 结果区耗时: 每轮明细 + 搜索总耗时(重复计时时是 N 次的累计) ----
+    const int nLoops = a.searchLoops > 0 ? a.searchLoops : 1;
+    ImGui::TextWrapped("耗时: 预处理 %.2f ms | 搜索 %.2f ms | 合计 %.2f ms | 刷新 %.1f ms",
+                       a.timing.preprocessMs, a.timing.searchMs,
+                       a.timing.recognitionMs(), a.lastOpMs);
+    if (nLoops > 1)
+        ImGui::TextWrapped("搜索总耗时 %.2f ms (%d 次, 平均 %.2f ms/次) | 墙钟总耗时 %.1f ms",
+                           a.searchTotalMs, nLoops, a.searchTotalMs / nLoops, a.benchWallMs);
+    else
+        ImGui::TextWrapped("搜索总耗时 %.2f ms (%d 次)", a.searchTotalMs, nLoops);
 
     if (ImGui::BeginTable("##dets", 5,
                           ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY,
@@ -1215,8 +1286,10 @@ static void drawPanel()
     // 填满面板剩下的高度；面板内容超高时可滚动，日志最少保留 100px
     const float logH = std::max(100.f, ImGui::GetContentRegionAvail().y);
     ImGui::BeginChild("##log", ImVec2(-1, logH), ImGuiChildFlags_Borders);
+    ImGui::PushTextWrapPos(0.0f);          // 长行自动折行，避免被面板右边界裁掉
     for (size_t i = 0; i < g_log.size(); i++)
         ImGui::TextUnformatted(g_log[i].c_str());
+    ImGui::PopTextWrapPos();
     if (g_logDirty)
     {
         ImGui::SetScrollHereY(1.0f);
@@ -1238,9 +1311,15 @@ static void drawUI()
                  ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
                  ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoSavedSettings);
 
-    const float panelW  = 390.f * g_scale;
-    const float gap     = ImGui::GetStyle().ItemSpacing.x;
-    const float thumbH  = 150.f * g_scale;      // 底部图片预览列表的高度
+    const float panelW0   = 390.f * g_scale;    // 面板理想宽度
+    const float panelMinW = 300.f * g_scale;    // 面板允许的最窄宽度
+    const float minLeftW  = 240.f * g_scale;    // 左侧视图至少留这么宽
+    const float gap       = ImGui::GetStyle().ItemSpacing.x;
+    const float thumbH    = 150.f * g_scale;    // 底部图片预览列表的高度
+
+    // 窗口变窄时收缩右侧面板，保证面板整个落在窗口内(否则标签/面板右边框会被窗口右边界裁掉)
+    const float availW = ImGui::GetContentRegionAvail().x;
+    float panelW = std::min(panelW0, std::max(panelMinW, availW - minLeftW - gap));
 
     //---------------- 左列: 上=图像视图, 下=图片列表 ----------------
     ImGui::BeginChild("##left", ImVec2(-panelW - gap, -1), ImGuiChildFlags_Borders);
@@ -1501,6 +1580,16 @@ static LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
     case WM_SYSCOMMAND:
         if ((wParam & 0xfff0) == SC_KEYMENU) return 0;   // 屏蔽 ALT 菜单
         break;
+    case WM_GETMINMAXINFO:
+    {
+        // 窗口再小右侧面板就会被右边界裁掉(标签显示不全)，这里限制一个最小尺寸
+        MINMAXINFO* mmi = reinterpret_cast<MINMAXINFO*>(lParam);
+        RECT r = { 0, 0, (LONG)(640 * g_scale), (LONG)(560 * g_scale) };
+        ::AdjustWindowRectEx(&r, WS_OVERLAPPEDWINDOW, FALSE, 0);
+        mmi->ptMinTrackSize.x = r.right - r.left;
+        mmi->ptMinTrackSize.y = r.bottom - r.top;
+        return 0;
+    }
     case WM_DESTROY:
         ::PostQuitMessage(0);
         return 0;

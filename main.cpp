@@ -18,7 +18,7 @@
 //                 [-load model.shm]            read a model, skip -t
 //                 [-gentest N]                 synthetic angle/scale test
 //                 [-selftest 1]                pose round trip check
-//                 [-loops N] [-nodraw] [-show] [-debug 1]
+//                 [-loops N] [-nodraw] [-show] [-debug 1]  (2 = phase timing)
 //***********************************************************************
 #define _CRT_SECURE_NO_WARNINGS
 #include <iostream>

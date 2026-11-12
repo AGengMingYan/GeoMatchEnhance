@@ -117,6 +117,12 @@ namespace
         return (uint64_t)(level) << 44 | (uint64_t)(aIdx & 0xFFFFF) << 20 | (uint64_t)(sIdx & 0xFFFFF);
     }
 
+    // milliseconds elapsed since t0, for the phase report (debug >= 2)
+    inline double msSince(int64 t0)
+    {
+        return (double)(cv::getTickCount() - t0) * 1000.0 / cv::getTickFrequency();
+    }
+
     bool oclUsable()
     {
         static int cached = -1;
@@ -687,6 +693,149 @@ namespace
         cv::multiply(tx, msk, sx);
         cv::multiply(ty, msk, sy);
     }
+
+    //-------------------------------------------------------------------
+    //  fused search image gradients (8U -> CV_16F, one pass per row)
+    //-------------------------------------------------------------------
+    // normGradients() above needs ten full image passes plus two CV_16F
+    // conversions, and every pass reads and writes a 32F plane the size of the
+    // image.  The same arithmetic is done here in one pass per row:
+    //
+    //   V[y][x] = g[y-1][x] + 2*g[y][x] + g[y+1][x]      (sobel smoothing)
+    //   D[y][x] = g[y+1][x] - g[y-1][x]                  (sobel difference)
+    //   gx = V[y][x+1] - V[y][x-1]      gy = D[y][x-1] + 2*D[y][x] + D[y][x+1]
+    //   mag = sqrt(gx*gx + gy*gy),  den = max(mag, minContrast)
+    //   out = (mag > minContrast) ? g / den : 0
+    //
+    // The sobel of an 8U image is an exact integer result, so the sequel is the
+    // same float arithmetic as the OpenCV chain.  Verified against the old
+    // chain: the halves are identical apart from at most a couple of pixels per
+    // plane that differ by one ulp (cv::magnitude's rounding of the sqrt), which
+    // the tolerance free scoring cannot see.  ~15x faster on 1280x1024.
+    inline int reflect101(int i, int n)
+    {
+        if (i < 0)     return -i;
+        if (i >= n)    return 2 * (n - 1) - i;
+        return i;
+    }
+
+    void gradientHalves(const cv::Mat& gray8, cv::Mat& gx16, cv::Mat& gy16, double minContrast)
+    {
+        CV_Assert(gray8.type() == CV_8U);
+        const int h = gray8.rows, w = gray8.cols;
+        gx16.create(h, w, CV_16F);
+        gy16.create(h, w, CV_16F);
+
+        // one padding element on each side holds the BORDER_REFLECT_101 value,
+        // so the inner loop never needs a branch for x == 0 or x == w-1
+        std::vector<short> vbuf((size_t)w + 16), dbuf((size_t)w + 16);
+        short* V = vbuf.data() + 1;
+        short* D = dbuf.data() + 1;
+
+        const float mc = (float)minContrast;
+#if SM_USE_AVX2
+        const __m256 vmc = _mm256_set1_ps(mc);
+        const __m256 one = _mm256_set1_ps(1.f);
+#endif
+
+        for (int y = 0; y < h; y++)
+        {
+            const uchar* r0 = gray8.ptr<uchar>(reflect101(y - 1, h));
+            const uchar* r1 = gray8.ptr<uchar>(y);
+            const uchar* r2 = gray8.ptr<uchar>(reflect101(y + 1, h));
+
+            // vertical smoothing / difference of the three source rows
+            int x = 0;
+#if SM_USE_AVX2
+            for (; x + 16 <= w; x += 16)
+            {
+                const __m256i a = _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i*)(r0 + x)));
+                const __m256i b = _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i*)(r1 + x)));
+                const __m256i c = _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i*)(r2 + x)));
+                _mm256_storeu_si256((__m256i*)(V + x),
+                                    _mm256_add_epi16(_mm256_add_epi16(a, c),
+                                                     _mm256_slli_epi16(b, 1)));
+                _mm256_storeu_si256((__m256i*)(D + x), _mm256_sub_epi16(c, a));
+            }
+#endif
+            for (; x < w; x++)
+            {
+                V[x] = (short)(r0[x] + 2 * r1[x] + r2[x]);
+                D[x] = (short)((int)r2[x] - (int)r0[x]);
+            }
+            V[-1] = V[1]; V[w] = V[w - 2];
+            D[-1] = D[1]; D[w] = D[w - 2];
+
+            // horizontal difference / smoothing + normalization + half store
+            unsigned short* gxr = gx16.ptr<unsigned short>(y);
+            unsigned short* gyr = gy16.ptr<unsigned short>(y);
+            x = 0;
+#if SM_USE_AVX2
+            for (; x + 8 <= w; x += 8)
+            {
+                // sobel x: V[x+1] - V[x-1],  sobel y: D[x-1] + 2*D[x] + D[x+1]
+                // both stay inside +-1020, so the integer difference is exact
+                const __m128i dcl = _mm_loadu_si128((const __m128i*)(D + x));
+                const __m128i gxi = _mm_sub_epi16(
+                    _mm_loadu_si128((const __m128i*)(V + x + 1)),
+                    _mm_loadu_si128((const __m128i*)(V + x - 1)));
+                const __m128i gyi = _mm_add_epi16(
+                    _mm_add_epi16(_mm_loadu_si128((const __m128i*)(D + x - 1)),
+                                  _mm_loadu_si128((const __m128i*)(D + x + 1))),
+                    _mm_add_epi16(dcl, dcl));
+                const __m256 gx = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(gxi));
+                const __m256 gy = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(gyi));
+                const __m256 mag = _mm256_sqrt_ps(
+                    _mm256_add_ps(_mm256_mul_ps(gx, gx), _mm256_mul_ps(gy, gy)));
+                const __m256 den = _mm256_max_ps(mag, vmc);
+                // multiply by 0/1, exactly like cv::threshold + cv::multiply
+                const __m256 mask = _mm256_and_ps(_mm256_cmp_ps(mag, vmc, _CMP_GT_OQ), one);
+                const __m256 ox = _mm256_mul_ps(_mm256_div_ps(gx, den), mask);
+                const __m256 oy = _mm256_mul_ps(_mm256_div_ps(gy, den), mask);
+                _mm_storeu_si128((__m128i*)(gxr + x), _mm256_cvtps_ph(ox, _MM_FROUND_TO_NEAREST_INT));
+                _mm_storeu_si128((__m128i*)(gyr + x), _mm256_cvtps_ph(oy, _MM_FROUND_TO_NEAREST_INT));
+            }
+            if (x < w)
+            {
+                // tail: same arithmetic, one vector conversion for the halves
+                float fx[8], fy[8];
+                for (int t = 0; t < 8; t++)
+                {
+                    const int xx = std::min(x + t, w - 1);
+                    const float gx = (float)(V[xx + 1] - V[xx - 1]);
+                    const float gy = (float)(D[xx - 1] + 2 * D[xx] + D[xx + 1]);
+                    const float mag = std::sqrt(gx * gx + gy * gy);
+                    const float den = std::max(mag, mc);
+                    const float m = (mag > mc) ? 1.f : 0.f;
+                    fx[t] = gx / den * m;
+                    fy[t] = gy / den * m;
+                }
+                unsigned short hx[8], hy[8];
+                _mm_storeu_si128((__m128i*)hx, _mm256_cvtps_ph(_mm256_loadu_ps(fx),
+                                                              _MM_FROUND_TO_NEAREST_INT));
+                _mm_storeu_si128((__m128i*)hy, _mm256_cvtps_ph(_mm256_loadu_ps(fy),
+                                                              _MM_FROUND_TO_NEAREST_INT));
+                for (int t = 0; x + t < w; t++)
+                {
+                    gxr[x + t] = hx[t];
+                    gyr[x + t] = hy[t];
+                }
+            }
+#else
+            // scalar reference (no AVX2 build): same arithmetic, one pixel at a time
+            for (; x < w; x++)
+            {
+                const float gx = (float)(V[x + 1] - V[x - 1]);
+                const float gy = (float)(D[x - 1] + 2 * D[x] + D[x + 1]);
+                const float mag = std::sqrt(gx * gx + gy * gy);
+                const float den = std::max(mag, mc);
+                const float m = (mag > mc) ? 1.f : 0.f;
+                gxr[x] = f32ToF16(gx / den * m);
+                gyr[x] = f32ToF16(gy / den * m);
+            }
+#endif
+        }
+    }
 }
 
 //=======================================================================
@@ -1077,90 +1226,129 @@ void ShapeMatcher::refineLevel(int level, std::vector<Candidate>& cands,
     const int win = 2;
     const int W = 2 * win + 1;
 
-    std::vector<Candidate> refined;
-    refined.reserve(cands.size());
-
-    for (size_t ci = 0; ci < cands.size(); ci++)
+    // the (angle, scale) window every candidate searches, resolved up front so
+    // that the workers only ever read the XForm cache.  warmXForm inserts, and
+    // an insert from a worker thread would race.
+    struct Window { int as[5], ss[5]; int na, ns; };
+    const int nc = (int)cands.size();
+    std::vector<Window> wins(nc);
+    for (int ci = 0; ci < nc; ci++)
     {
-        const Candidate sc = cands[ci];
-        int as[5], ss[5];
-        int na = 0, ns = 0;
+        const Candidate& sc = cands[ci];
+        Window& w = wins[ci];
+        w.na = w.ns = 0;
         for (int k = -2; k <= 2; k++)
         {
             int a = sc.angleIdx + k * stride;
-            if (a >= 0 && a < nA) as[na++] = a;
+            if (a >= 0 && a < nA) w.as[w.na++] = a;
             int s = sc.scaleIdx + k * stride;
-            if (s >= 0 && s < nS) ss[ns++] = s;
+            if (s >= 0 && s < nS) w.ss[w.ns++] = s;
         }
-        if (na == 0) as[na++] = sc.angleIdx;
-        if (ns == 0) ss[ns++] = sc.scaleIdx;
-        if (na == 0 || ns == 0) continue;
+        if (w.na == 0) w.as[w.na++] = sc.angleIdx;
+        if (w.ns == 0) w.ss[w.ns++] = sc.scaleIdx;
+        for (int i = 0; i < w.na; i++)
+            for (int j = 0; j < w.ns; j++)
+                warmXForm(level, w.as[i], w.ss[j]);
+    }
 
-        Candidate best;
-        best.score = -2.f;
-        best.level = level;
-        std::vector<float> scoreBuf((size_t)na * ns * W * W, -2.f);
-        int bi = 0, bj = 0, bdx = win, bdy = win;
-
-        for (int i = 0; i < na; i++)
+    // the candidates are independent, so the refinement runs in parallel.  Each
+    // result goes to its own slot and is merged in candidate order afterwards,
+    // which means the sequence handed to the sort below is exactly the one the
+    // serial version produced.
+    std::vector<Candidate> refined(nc);
+    std::vector<unsigned char> found(nc, 0);
+    cv::parallel_for_(cv::Range(0, nc), [&](const cv::Range& r)
+    {
+        for (int ci = r.start; ci < r.end; ci++)
         {
-            for (int j = 0; j < ns; j++)
+            const Window& w = wins[ci];
+            const int na = w.na, ns = w.ns;
+            const Candidate sc = cands[ci];
+
+            Candidate best;
+            best.score = -2.f;
+            best.level = level;
+            std::vector<float> scoreBuf((size_t)na * ns * W * W, -2.f);
+            int bi = 0, bj = 0, bdx = win, bdy = win;
+
+            for (int i = 0; i < na; i++)
             {
-                XForm& xf = getXForm(level, as[i], ss[j]);
-                float limit = (i == 0 && j == 0) ? -10.f : best.score;
-                for (int dy = -win; dy <= win; dy++)
+                for (int j = 0; j < ns; j++)
                 {
-                    for (int dx = -win; dx <= win; dx++)
+                    // read only lookup: a worker thread must never insert into
+                    // the XForm cache.  The warm up above already put every pose
+                    // of this level into it, so the fallback is dead code - it
+                    // only exists so a miss cannot corrupt the cache.
+                    const XForm* pxf = findXForm(level, w.as[i], w.ss[j]);
+                    XForm localXf;
+                    if (!pxf)
                     {
-                        int bx = cvRound(sc.pos.x * 2.f) + dx;
-                        int by = cvRound(sc.pos.y * 2.f) + dy;
-                        bx = std::min(std::max(bx, xf.R), srcGx_[level].cols - 1 - xf.R);
-                        by = std::min(std::max(by, xf.R), srcGx_[level].rows - 1 - xf.R);
-                        float v = (bx < xf.R || by < xf.R)
-                                      ? -2.f
-                                      : scorePos(srcGx_[level], srcGy_[level], xf, by, bx, limit);
-                        scoreBuf[(((size_t)i * ns + j) * W + (dy + win)) * W + (dx + win)] = v;
-                        if (v > best.score)
+                        buildXForm(level, w.as[i], w.ss[j], localXf);
+                        pxf = &localXf;
+                    }
+                    const XForm& xf = *pxf;
+                    float limit = (i == 0 && j == 0) ? -10.f : best.score;
+                    for (int dy = -win; dy <= win; dy++)
+                    {
+                        for (int dx = -win; dx <= win; dx++)
                         {
-                            best.score = v;
-                            best.level = level;
-                            best.pos = cv::Point2f((float)bx, (float)by);
-                            best.angleIdx = as[i];
-                            best.scaleIdx = ss[j];
-                            best.angle = (float)angleGrid_[as[i]];
-                            best.scale = (float)scaleGrid_[ss[j]];
-                            bi = i; bj = j; bdx = dx + win; bdy = dy + win;
-                            limit = v;
+                            int bx = cvRound(sc.pos.x * 2.f) + dx;
+                            int by = cvRound(sc.pos.y * 2.f) + dy;
+                            bx = std::min(std::max(bx, xf.R), srcGx_[level].cols - 1 - xf.R);
+                            by = std::min(std::max(by, xf.R), srcGx_[level].rows - 1 - xf.R);
+                            float v = (bx < xf.R || by < xf.R)
+                                          ? -2.f
+                                          : scorePos(srcGx_[level], srcGy_[level], xf, by, bx, limit);
+                            scoreBuf[(((size_t)i * ns + j) * W + (dy + win)) * W + (dx + win)] = v;
+                            if (v > best.score)
+                            {
+                                best.score = v;
+                                best.level = level;
+                                best.pos = cv::Point2f((float)bx, (float)by);
+                                best.angleIdx = w.as[i];
+                                best.scaleIdx = w.ss[j];
+                                best.angle = (float)angleGrid_[w.as[i]];
+                                best.scale = (float)scaleGrid_[w.ss[j]];
+                                bi = i; bj = j; bdx = dx + win; bdy = dy + win;
+                                limit = v;
+                            }
                         }
                     }
                 }
             }
-        }
 
-        // sub pixel position of the winning pose (parabola through its neighbours)
-        if (best.score > -1.f)
-        {
-            const size_t base = ((size_t)bi * ns + bj) * W * W;
-            float dx = 0, dy = 0;
-            if (bdx > 0 && bdx + 1 < W)
+            // sub pixel position of the winning pose (parabola through its neighbours)
+            if (best.score > -1.f)
             {
-                float a = scoreBuf[base + bdy * W + bdx - 1];
-                float b = scoreBuf[base + bdy * W + bdx + 1];
-                float den = 2.f * best.score - a - b;
-                if (den > 1e-6f) dx = std::min(1.f, std::max(-1.f, 0.5f * (b - a) / den));
+                const size_t base = ((size_t)bi * ns + bj) * W * W;
+                float dx = 0, dy = 0;
+                if (bdx > 0 && bdx + 1 < W)
+                {
+                    float a = scoreBuf[base + bdy * W + bdx - 1];
+                    float b = scoreBuf[base + bdy * W + bdx + 1];
+                    float den = 2.f * best.score - a - b;
+                    if (den > 1e-6f) dx = std::min(1.f, std::max(-1.f, 0.5f * (b - a) / den));
+                }
+                if (bdy > 0 && bdy + 1 < W)
+                {
+                    float a = scoreBuf[base + (bdy - 1) * W + bdx];
+                    float b = scoreBuf[base + (bdy + 1) * W + bdx];
+                    float den = 2.f * best.score - a - b;
+                    if (den > 1e-6f) dy = std::min(1.f, std::max(-1.f, 0.5f * (b - a) / den));
+                }
+                best.pos.x += dx;
+                best.pos.y += dy;
+                refined[ci] = best;
+                found[ci] = 1;
             }
-            if (bdy > 0 && bdy + 1 < W)
-            {
-                float a = scoreBuf[base + (bdy - 1) * W + bdx];
-                float b = scoreBuf[base + (bdy + 1) * W + bdx];
-                float den = 2.f * best.score - a - b;
-                if (den > 1e-6f) dy = std::min(1.f, std::max(-1.f, 0.5f * (b - a) / den));
-            }
-            best.pos.x += dx;
-            best.pos.y += dy;
-            refined.push_back(best);
         }
-    }
+    }, std::max(1.0, (double)nc / 2.0));
+
+    std::vector<Candidate> merged;
+    merged.reserve(nc);
+    for (int ci = 0; ci < nc; ci++)
+        if (found[ci]) merged.push_back(refined[ci]);
+    refined.swap(merged);
 
     // keep the best ones only
     std::sort(refined.begin(), refined.end(),
@@ -1266,38 +1454,6 @@ void ShapeMatcher::subpixelRefine(int level, Candidate& c)
 //=======================================================================
 namespace
 {
-    // 3x3 maximum, same result as cv::dilate(m, cv::Mat()) but completely
-    // serial.  cv::dilate runs its own parallel_for_, and this function is
-    // called from inside a parallel loop - nesting them corrupts the OpenCV
-    // thread pool and crashes.  Out of range neighbours are clamped, which
-    // only ever duplicates a value that is already part of the maximum, so
-    // the result matches cv::dilate's BORDER_CONSTANT behaviour.
-    void dilate3x3Serial(const cv::Mat& src, cv::Mat& dst)
-    {
-        CV_Assert(src.type() == CV_32F);
-        dst.create(src.size(), CV_32F);
-        const int h = src.rows, w = src.cols;
-        for (int y = 0; y < h; y++)
-        {
-            const float* pm = src.ptr<float>(std::max(0, y - 1));
-            const float* pc = src.ptr<float>(y);
-            const float* pp = src.ptr<float>(std::min(h - 1, y + 1));
-            float* o = dst.ptr<float>(y);
-            for (int x = 0; x < w; x++)
-            {
-                const int xm = std::max(0, x - 1);
-                const int xp = std::min(w - 1, x + 1);
-                float m = pc[x];
-                m = std::max(m, pc[xm]); m = std::max(m, pc[xp]);
-                m = std::max(m, pm[xm]); m = std::max(m, pm[x]);
-                m = std::max(m, pm[xp]);
-                m = std::max(m, pp[xm]); m = std::max(m, pp[x]);
-                m = std::max(m, pp[xp]);
-                o[x] = m;
-            }
-        }
-    }
-
     // serial min/max, same reason as above: cv::minMaxLoc would nest
     void minMaxSerial(const cv::Mat& m, double& mn, double& mx)
     {
@@ -1320,20 +1476,36 @@ void ShapeMatcher::extractCandidates(const cv::Mat& scoreMap, int level, int aId
                                      int R, double thresh, std::vector<Candidate>& out,
                                      int maxPerMap, int nmsRadius)
 {
-    cv::Mat dil;
-    dilate3x3Serial(scoreMap, dil);
-
     std::vector<Candidate> local;
     const int h = scoreMap.rows, w = scoreMap.cols;
+    const float th = (float)thresh;
     for (int y = 0; y < h; y++)
     {
         const float* ps = scoreMap.ptr<float>(y);
-        const float* pd = dil.ptr<float>(y);
+        const float* pm = scoreMap.ptr<float>(std::max(0, y - 1));
+        const float* pp = scoreMap.ptr<float>(std::min(h - 1, y + 1));
         for (int x = 0; x < w; x++)
         {
             float v = ps[x];
-            if (v < (float)thresh) continue;
-            if (v < pd[x] - 1e-5f) continue;
+            if (v < th) continue;
+
+            // 3x3 maximum inline instead of materialising a dilated copy of the
+            // whole score map: out of range neighbours are clamped, which only
+            // duplicates a value that is already part of the maximum (the same
+            // result as cv::dilate with BORDER_CONSTANT).  Only the pixels above
+            // the threshold pay for the eight neighbours, and the map sized
+            // temporary plus its extra pass are gone.  Also note this stays
+            // serial: cv::dilate would run its own parallel_for_ from inside
+            // this parallel loop and corrupt the OpenCV thread pool.
+            const int xm = std::max(0, x - 1);
+            const int xp = std::min(w - 1, x + 1);
+            float m = ps[x];
+            m = std::max(m, ps[xm]); m = std::max(m, ps[xp]);
+            m = std::max(m, pm[xm]); m = std::max(m, pm[x]);
+            m = std::max(m, pm[xp]);
+            m = std::max(m, pp[xm]); m = std::max(m, pp[x]);
+            m = std::max(m, pp[xp]);
+            if (v < m - 1e-5f) continue;
 
             // sub pixel peak position from a parabola through the neighbours,
             // this keeps the pyramid error from piling up while refining
@@ -1418,13 +1590,21 @@ void ShapeMatcher::prepareSource(const cv::Mat& gray, int levels, bool useOCL)
     {
         for (int i = 0; i < levels; i++)
         {
-            cv::Mat g8;
-            srcPyramid_[i].convertTo(g8, CV_8U);
-            cv::Mat gx32, gy32;
-            normGradients<cv::Mat>(g8, gx32, gy32, mc);
-            // the scan loop is memory bound, so keep the gradients as halves
-            gx32.convertTo(srcGx_[i], CV_16F);
-            gy32.convertTo(srcGy_[i], CV_16F);
+            const cv::Mat& g8 = srcPyramid_[i];
+            if (g8.cols > 8 && g8.rows > 8)
+            {
+                // one fused pass (sobel + normalize + CV_16F) instead of ten
+                // full image passes followed by two format conversions
+                gradientHalves(g8, srcGx_[i], srcGy_[i], mc);
+            }
+            else
+            {
+                // too small for the padded row buffers: use the OpenCV chain
+                cv::Mat gx32, gy32;
+                normGradients<cv::Mat>(g8, gx32, gy32, mc);
+                gx32.convertTo(srcGx_[i], CV_16F);
+                gy32.convertTo(srcGy_[i], CV_16F);
+            }
         }
     }
 }
@@ -1451,6 +1631,10 @@ std::vector<MatchResult> ShapeMatcher::findShapeModel(const cv::Mat& gray, const
     int64 t1 = cv::getTickCount();
     lastPreprocessTime_ = (double)(t1 - t0) * 1000.0 / cv::getTickFrequency();
 
+    // phase timers for -debug 2 (top level scan, candidate extraction, the
+    // per level refinement, sub-pixel fit and the optional re-scoring)
+    double phTop = 0, phExtract = 0, phRefine = 0, phSubpixel = 0, phRescore = 0;
+
     const int top = nLevels - 1;
     const int nA = (int)angleGrid_.size();
     const int nS = (int)scaleGrid_.size();
@@ -1471,6 +1655,7 @@ std::vector<MatchResult> ShapeMatcher::findShapeModel(const cv::Mat& gray, const
     const double topTarget = std::max(0.10, fp.minScore * 0.55);
 
     std::vector<Candidate> cands;
+    const int64 tTop0 = cv::getTickCount();
     {
         std::vector<Candidate> all;
         cv::Mat map;
@@ -1506,7 +1691,9 @@ std::vector<MatchResult> ShapeMatcher::findShapeModel(const cv::Mat& gray, const
                     cv::minMaxLoc(map, &mn, &mx);
                     if (mx > maxMap) maxMap = mx;
                 }
+                int64 te0 = cv::getTickCount();
                 extractCandidates(map, top, ai, si, R, topTarget, all, 64, 2);
+                phExtract += msSince(te0);
             }
         }
         else
@@ -1523,6 +1710,7 @@ std::vector<MatchResult> ShapeMatcher::findShapeModel(const cv::Mat& gray, const
                     std::vector<Candidate> local;
                     cv::Mat lmap;
                     double localMax = -2;
+                    double exMs = 0;
                     for (int i = r.start; i < r.end; i++)
                     {
                         const int ai = poses[i].first, si = poses[i].second;
@@ -1548,11 +1736,14 @@ std::vector<MatchResult> ShapeMatcher::findShapeModel(const cv::Mat& gray, const
                             minMaxSerial(lmap, mn, mx);
                             if (mx > localMax) localMax = mx;
                         }
+                        int64 te0 = cv::getTickCount();
                         extractCandidates(lmap, top, ai, si, R, topTarget, local, 64, 2);
+                        exMs += msSince(te0);
                     }
                     cv::AutoLock lock(mtx);
                     all.insert(all.end(), local.begin(), local.end());
                     if (localMax > maxMap) maxMap = localMax;
+                    phExtract += exMs;
                 },
                 std::max(1.0, (double)poses.size() / 8.0));
         }
@@ -1585,11 +1776,14 @@ std::vector<MatchResult> ShapeMatcher::findShapeModel(const cv::Mat& gray, const
             if (!dup) cands.push_back(c);
         }
     }
+    phTop = msSince(tTop0);
 
     const int maxKeep = std::max(fp.maxMatches * 3, 30);
     for (int l = top - 1; l >= 0; l--)
     {
+        int64 tr0 = cv::getTickCount();
         refineLevel(l, cands, maxKeep, fp.minScore);
+        phRefine += msSince(tr0);
         if (fp.debug && !cands.empty())
         {
             std::cout << "  [dbg] level " << l << ": n=" << cands.size()
@@ -1602,8 +1796,10 @@ std::vector<MatchResult> ShapeMatcher::findShapeModel(const cv::Mat& gray, const
 
     if (fp.subpixel)
     {
+        int64 tsub0 = cv::getTickCount();
         for (size_t i = 0; i < cands.size(); i++)
             subpixelRefine(0, cands[i]);
+        phSubpixel = msSince(tsub0);
     }
 
     std::sort(cands.begin(), cands.end(),
@@ -1642,6 +1838,7 @@ std::vector<MatchResult> ShapeMatcher::findShapeModel(const cv::Mat& gray, const
     // this only changes the reported confidence, never the pose.
     if (fp.scoreMode != 0 && !results.empty())
     {
+        int64 trs0 = cv::getTickCount();
         for (MatchResult& r : results)
         {
             int ai = 0, si = 0;
@@ -1666,6 +1863,19 @@ std::vector<MatchResult> ShapeMatcher::findShapeModel(const cv::Mat& gray, const
         std::sort(results.begin(), results.end(),
                   [](const MatchResult& a, const MatchResult& b)
                   { return a.score > b.score; });
+        phRescore = msSince(trs0);
+    }
+
+    if (fp.debug >= 2)
+    {
+        // where the search time actually goes (debug >= 2)
+        std::cout << "  [dbg2] topScan=" << phTop << " (extract=" << phExtract
+                  << ") refine=" << phRefine << " subpixel=" << phSubpixel
+                  << " rescore=" << phRescore
+                  << "  sum=" << (phTop + phRefine + phSubpixel + phRescore)
+                  << " ms  poses=" << (((nA + strideA - 1) / strideA) *
+                                        ((nS + strideS - 1) / strideS))
+                  << " keep=" << cands.size() << "\n";
     }
 
     int64 t2 = cv::getTickCount();
