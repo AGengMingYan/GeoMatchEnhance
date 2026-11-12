@@ -242,6 +242,14 @@ struct Texture
 
     bool valid() const { return srv != nullptr; }
 
+    // 待销毁队列：帧渲染过程中被 releaseDeferred() 移入这里的纹理，
+    // 等本帧 Present 之后再统一 Release，避免 draw list 还引用着就被销毁。
+    static std::vector<Texture>& pending()
+    {
+        static std::vector<Texture> v;
+        return v;
+    }
+
     void release()
     {
         if (srv) { srv->Release(); srv = nullptr; }
@@ -249,10 +257,17 @@ struct Texture
         w = h = 0;
     }
 
+    // 延迟释放：把资源转移进待销毁队列，稍后统一 Release
+    void releaseDeferred()
+    {
+        if (!tex && !srv) return;
+        pending().push_back(std::move(*this));
+    }
+
     // bgra 必须是 CV_8UC4
     bool set(const cv::Mat& bgra)
     {
-        if (bgra.empty() || bgra.type() != CV_8UC4) { release(); return false; }
+        if (bgra.empty() || bgra.type() != CV_8UC4) { releaseDeferred(); return false; }
 
         const int iw = bgra.cols, ih = bgra.rows;
         // D3D11 的行距按 16 字节对齐最稳妥
@@ -261,7 +276,7 @@ struct Texture
         for (int y = 0; y < ih; y++)
             memcpy(&buf[(size_t)y * pitch], bgra.ptr(y), (size_t)iw * 4);
 
-        if (tex && (w != iw || h != ih)) release();
+        if (tex && (w != iw || h != ih)) releaseDeferred();
 
         if (!tex)
         {
@@ -295,6 +310,13 @@ struct Texture
         return true;
     }
 };
+
+// 帧渲染完成后统一释放被延迟销毁的纹理
+static void flushPendingTextures()
+{
+    for (Texture& t : Texture::pending()) t.release();
+    Texture::pending().clear();
+}
 
 //=======================================================================
 //  图片列表里的一项: 只有缩略图纹理，点中时才读原图
@@ -451,7 +473,7 @@ static cv::Mat overlayMaskOnTpl(const cv::Mat& gray, const cv::Mat& mask)
 // 刷新模板源图视图(叠加 mask 覆盖层)
 static void refreshTplView(App& a)
 {
-    if (a.tplGray.empty()) { a.texTplSrc.release(); return; }
+    if (a.tplGray.empty()) { a.texTplSrc.releaseDeferred(); return; }
     a.texTplSrc.set(toBGRA(overlayMaskOnTpl(a.tplGray, a.mask)));
 }
 
@@ -606,7 +628,7 @@ static void selectThumb(App& a, int idx)
 // 读一个目录: 列出全部图片 + 生成缩略图，然后自动选中第一张
 static void loadTargetDir(App& a, const std::wstring& dir)
 {
-    for (Thumb& t : a.thumbs) t.tex.release();
+    for (Thumb& t : a.thumbs) t.tex.releaseDeferred();
     a.thumbs.clear();
     a.thumbSel = -1;
     a.dirPath  = ws2s(dir);
@@ -1378,9 +1400,13 @@ int main(int argc, char** argv)
 
         HRESULT hr = g_swap->Present(1, 0);
         g_occluded = (hr == DXGI_STATUS_OCCLUDED);
+
+        // 上一帧 draw list 已经提交，现在可以安全释放延迟销毁的纹理
+        flushPendingTextures();
     }
 
     //---------------- 收尾 ----------------
+    flushPendingTextures();
     g_app.texTarget.release();
     g_app.texResult.release();
     g_app.texTplSrc.release();

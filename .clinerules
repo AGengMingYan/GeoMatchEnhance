@@ -155,3 +155,10 @@ ren surface_compare.png surface_compare.png.txt
   **cmd 下的 `cat.exe` 重定向** 或 **`cmd /c "copy /b"`**。
 
 
+## 3. Git 提交信息语言（Cline 生成时）
+使用 Cline 的「生成提交信息」功能（git 提交信息输入框上的 Cline 图标）时，
+生成的提交信息必须使用简体中文。
+- 标题（subject）用中文，格式建议：`<类型>: <中文描述>`，类型用英文（如 `fix`、`feat`、`refactor`、`docs`）。
+- 正文（body）和脚注（footer）也用中文说明"改了什么、为什么改"。
+- 不要因为仓库历史是英文就切换成英文，除非用户明确要求。
+
