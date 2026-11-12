@@ -84,6 +84,16 @@ struct Config
                                 // positions that appear when minScore is lowered
                                 // on repetitive patterns.
 
+    // ---- visualisation ------------------------------------------------
+    // how drawResult() marks a found instance
+    //   0 = fixed axis-aligned box, size = template size x scale (default).
+    //       Always a level rectangle, so a row of matches reads like a grid
+    //       and the box does not wobble with the reported angle.
+    //   1 = rotated box: same size, tilted by the match angle (shows the pose)
+    //   2 = convex hull of the model points (old behaviour: an irregular
+    //       polygon that only looks tidy when the model covers 4 corners)
+    int    boxMode      = 0;
+
     // build the corresponding low level parameter structs
     MatchParams toMatchParams() const;
     FindParams  toFindParams() const;
@@ -208,7 +218,11 @@ public:
     // panel: only the enlarged model image, the model points (red), their
     // gradient directions (green) and the model centre (blue).
     // scaleFactor <= 0 means "no enlargement" (1:1 pixel size).
-    cv::Mat drawModelFeatures(double scaleFactor = 3.0) const;
+    // drawModelFeatures: template with the model drawn on it.
+    // The contour polylines are the model (Halcon's get_shape_model_contours);
+    // the gradient arrows are an annotation and are off by default because a
+    // 1 px contour disappears under a field of 9 px arrows.
+    cv::Mat drawModelFeatures(double scaleFactor = 3.0, bool showGradients = false) const;
 
     // search image with the template texture overlaid at each match pose,
     // the model points, their gradients and the outline
@@ -250,6 +264,16 @@ public:
     cv::Point2f modelCenter()     const;
     cv::Size    modelSize()       const;
     Config      config()          const { return cfg_; }
+
+    //---- how the point set was built (level 0), for tuning --------------
+    // candidatePixels() = pixels that survived the hysteresis thresholds.
+    // When it is far larger than modelPointCount() the thresholds did nothing
+    // and maxPoints alone decided the cut; when it is smaller the thresholds
+    // are the active limit.  0 means "unknown" (model read from an older
+    // file, where the value is not stored).
+    int   candidatePixels() const;
+    float strongestMag()    const;   // |g| of the strongest kept point
+    float weakestMag()      const;   // |g| of the weakest kept point
 
     // replace the search settings of an already loaded model.
     // read a model first, then adjust only what the search needs:

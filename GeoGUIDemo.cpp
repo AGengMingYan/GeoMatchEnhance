@@ -336,13 +336,22 @@ struct Thumb
 //=======================================================================
 struct App
 {
+    //---- 参数单位说明 ----
+    // 界面上的对比度用"灰度差"(0~255)表示，和 Halcon 的 Contrast 可直接对比；
+    // 库内部的阈值是 Sobel(3x3) 的梯度幅值，一个理想硬台阶的幅值 = 4 x 灰度差，
+    // 所以进出 Config 时乘/除这个系数。真实边缘因模糊会更小(σ=1 时约 2.6x)，
+    // 因此界面值和 Halcon 只能"可比"，不能严格相等。
+    static constexpr float kSobelPerGray = 4.0f;
+
     //---- 界面上的参数(度/百分比等单位) ----
     float angleStartDeg  = -180.f;
     float angleExtentDeg = 360.f;
     float angleStepDeg   = 0.f;        // 0 = 自动
     float scaleMin       = 1.f;
     float scaleMax       = 1.f;
-    float minContrast    = 12.f;
+    float minContrast    = 3.f;        // 灰度差 (= 库里的 12)
+    float contrast       = 5.5f;       // 灰度差 (= 库里的 22)，滞后高阈值
+    bool  autoHi         = true;       // 高阈值跟随低阈值(见 hiFor())
     int   maxPoints      = 1200;
     int   numLevels      = 0;          // 0 = 自动
     float minScore       = 0.55f;
@@ -355,6 +364,7 @@ struct App
                                         // 3 = clipped-mean(只算正向但不缩分母, 部分匹配不上高分)
     float minCoverage    = 0.f;         // 0 = 关闭。 模型点里"梯度方向一致"的最低占比,
                                         // 用来剔除调低最小分数后冒出来的相似位置
+    int   boxMode        = 0;           // 结果框样式: 0 = 固定方框(默认), 1 = 旋转框, 2 = 模型凸包
     bool  autoRun        = true;       // 参数改完自动重建模板 + 重匹配
     bool  liveUpdate     = true;       // 拖动滑块的过程中就实时刷新
     float zoom           = 1.0f;       // 1 = 适应窗口
@@ -402,6 +412,19 @@ struct App
     bool  maskDirty    = false;   // 涂抹结束，需要重建模板
     float brushRadius  = 6.f;     // 画笔半径(图像像素)
 
+    // 高阈值的推荐值(灰度差)。滞后阈值必须有分离度才会"沿着弱边生长"，
+    // 分离度太小就退化成纯阈值、线会被切碎；太大又会长出噪声。
+    //
+    // 分离度必须很小：种子阈值一旦超过模板里最强的那条边，种子数为 0，
+    // 模型点会瞬间全灭(本机 case1 模板 Sobel 峰值只有 152 ≈ 灰度差 38，
+    // 之前按 2.5x 跟随，最小对比度拖到 20 就已经全没了)。15% + 2 的余量
+    // 能让整个 0~38 灰度差区间连续"腐蚀"，到顶才消失。
+    static float hiFor(float lo)
+    {
+        const float hi = lo * 1.15f + 2.f;
+        return std::min(hi, 255.f);
+    }
+
     geomatch::Config toConfig() const
     {
         geomatch::Config c;
@@ -410,7 +433,9 @@ struct App
         c.angleStep    = angleStepDeg   * (float)CV_PI / 180.f;
         c.scaleMin     = std::min(scaleMin, scaleMax);
         c.scaleMax     = std::max(scaleMin, scaleMax);
-        c.minContrast  = minContrast;
+        // 灰度差 -> Sobel 幅值(库内部单位)
+        c.minContrast  = minContrast * kSobelPerGray;
+        c.contrast     = contrast    * kSobelPerGray;
         c.maxPoints    = maxPoints;
         c.numLevels    = numLevels;
         c.mask         = mask;
@@ -423,6 +448,7 @@ struct App
         c.debug        = 0;
         c.scoreMode    = scoreMode;
         c.minCoverage  = minCoverage;
+        c.boxMode      = boxMode;
         return c;
     }
 
@@ -433,7 +459,9 @@ struct App
         angleStepDeg   = (float)(c.angleStep   * 180.0 / CV_PI);
         scaleMin    = (float)c.scaleMin;
         scaleMax    = (float)c.scaleMax;
-        minContrast = (float)c.minContrast;
+        // Sobel 幅值 -> 灰度差(界面单位)
+        minContrast = (float)(c.minContrast / kSobelPerGray);
+        contrast    = (float)(c.contrast    / kSobelPerGray);
         maxPoints   = c.maxPoints;
         numLevels   = c.numLevels;
         minScore    = (float)c.minScore;
@@ -444,6 +472,8 @@ struct App
         useOpenCL   = c.useOpenCL;
         scoreMode   = c.scoreMode;
         minCoverage = c.minCoverage;
+        // boxMode 只影响画出来的样子，不写进模型文件；加载模型时保留界面上
+        // 当前的选择，不要被 Matcher::load() 重置出来的默认值覆盖。
     }
 };
 
@@ -550,6 +580,24 @@ static void createTemplate(App& a)
     logf("模板已创建: %dx%d  点数=%d  层数=%d  用时 %.1f ms",
          patch.cols, patch.rows, a.matcher.modelPointCount(),
          a.matcher.numLevels(), ms);
+
+    // 阈值到底有没有生效：候选像素远多于点数时，实际是"最大点数"在截断，
+    // 此时拖动最小对比度不会改变点数(只是换了抽样对象)，很容易让人以为
+    // 滑块坏了。候选像素更少时才是阈值在起作用。
+    const int cand = a.matcher.candidatePixels();
+    const int np   = a.matcher.modelPointCount();
+    if (cand > 0)
+    {
+        if (cand > np * 2)
+            logf("提示: 过阈值像素 %d 个 > 点数 %d 的两倍，当前是「最大点数」在截断，"
+                 "调最小对比度只会改变取点位置", cand, np);
+        else
+            logf("过阈值像素 %d 个，点数 %d（阈值在起作用）", cand, np);
+    }
+    const float sm = a.matcher.strongestMag(), wm = a.matcher.weakestMag();
+    if (sm > 1e-6f && wm / sm < 0.5f)
+        logf("提示: 最弱点的梯度只有最强点的 %.0f%%，模糊/噪声会先打掉它们，"
+             "可适当减小「最大点数」", 100.0f * wm / sm);
 }
 
 static void runMatch(App& a, int loops)
@@ -874,7 +922,7 @@ static void drawViewPane()
         }
         if (ImGui::BeginTabItem("模板模型"))
         {
-            snprintf(info, sizeof(info), "模板模型(特征点/梯度)  %dx%d",
+            snprintf(info, sizeof(info), "模板模型(绿=轮廓 红=采样点 蓝=中心)  %dx%d",
                      a.texModel.w, a.texModel.h);
             drawImageView("##area_model", info, a.texModel, 0);
             ImGui::EndTabItem();
@@ -984,6 +1032,22 @@ static void drawPanel()
     App& a = g_app;
     bool needCreate = false, needMatch = false;
 
+    // 这两组标志要跨"折叠分组"使用，所以提到函数顶部声明
+    bool changedModel = false, commitModel = false;
+    bool changedSearch = false, commitSearch = false;
+
+    // 分组折叠头: 展开时缩进内容。endGroup 只在 if 成立(已展开)的分支里调用，
+    // 所以它无条件取消缩进是对的。
+    auto group = [](const char* id, bool defaultOpen) -> bool
+    {
+        ImGuiTreeNodeFlags fl = ImGuiTreeNodeFlags_SpanAvailWidth;
+        if (defaultOpen) fl |= ImGuiTreeNodeFlags_DefaultOpen;
+        const bool open = ImGui::CollapsingHeader(id, fl);
+        if (open) ImGui::Indent(10.f * g_scale);
+        return open;
+    };
+    auto endGroup = []() { ImGui::Unindent(10.f * g_scale); };
+
     //---------------- 1. 模板 ----------------
     ImGui::SeparatorText("1. 模板图像");
 
@@ -1035,76 +1099,50 @@ static void drawPanel()
         textDimWrapped("ROI: 整幅图 (在左侧图上拖动可框选)");
     }
 
-    ImGui::SeparatorText("模板参数");
-    bool changedModel = false, commitModel = false;
-    changedModel |= sliderF("起始角(度)",  &a.angleStartDeg,  -180.f, 180.f, "%.0f", commitModel);
-    changedModel |= sliderF("角度范围(度)", &a.angleExtentDeg,   0.f, 360.f, "%.0f", commitModel);
-    changedModel |= sliderF("角度步长(度, 0=自动)", &a.angleStepDeg, 0.f, 5.f, "%.2f", commitModel);
-    changedModel |= sliderF("最小缩放", &a.scaleMin, 0.2f, 2.f, "%.2f", commitModel);
-    changedModel |= sliderF("最大缩放", &a.scaleMax, 0.2f, 2.f, "%.2f", commitModel);
-    if (a.scaleMax < a.scaleMin) a.scaleMax = a.scaleMin;
-    changedModel |= sliderF("最小对比度", &a.minContrast, 0.f, 80.f, "%.0f", commitModel);
-    changedModel |= sliderI("最大点数", &a.maxPoints, 100, 4000, commitModel);
-    changedModel |= sliderI("金字塔层数(0=自动)", &a.numLevels, 0, 8, commitModel);
-
-    //---- 模板掩码(非零区域参与建模) ----
-    if (a.mask.empty())
-        textDimWrapped("模板掩码: 未加载(默认整幅模板参与建模)");
-    else
+    //---- 模板参数(分组折叠，避免一屏塞满) ----
+    if (group("模板参数: 旋转与缩放", true))
     {
-        const double total = (double)a.mask.cols * a.mask.rows;
-        const double keep = 100.0 * (total > 0 ? cv::countNonZero(a.mask) / total : 0.0);
-        ImGui::Text("模板掩码: 已加载  %.1f%% 区域参与建模", keep);
-        ImGui::TextWrapped("%s", a.maskPath.c_str());
+        changedModel |= sliderF("起始角(度)",  &a.angleStartDeg,  -180.f, 180.f, "%.0f", commitModel);
+        changedModel |= sliderF("角度范围(度)", &a.angleExtentDeg,   0.f, 360.f, "%.0f", commitModel);
+        changedModel |= sliderF("角度步长(度, 0=自动)", &a.angleStepDeg, 0.f, 5.f, "%.2f", commitModel);
+        changedModel |= sliderF("最小缩放", &a.scaleMin, 0.2f, 2.f, "%.2f", commitModel);
+        changedModel |= sliderF("最大缩放", &a.scaleMax, 0.2f, 2.f, "%.2f", commitModel);
+        if (a.scaleMax < a.scaleMin) a.scaleMax = a.scaleMin;
+        textDimWrapped("无旋转/缩放需求时把范围收到 1.0 和 0 度，搜索最快、假峰最少。");
+        endGroup();
     }
-    if (ImGui::Button("加载掩码...", ImVec2(-140, 0)))
+
+    if (group("模板参数: 特征提取", false))
     {
-        std::wstring p = pickImageFile(L"选择掩码图(非零=参与建模)");
-        if (!p.empty())
+        // 对比度用"灰度差"显示(和 Halcon 的 Contrast 可比)，上限到 255 = 满量程，
+        // 拉到底时模型点会全部消失，等价于 Halcon 把 Contrast 拉到 255 的效果。
+        changedModel |= sliderF("最小对比度(灰度差)", &a.minContrast, 0.f, 255.f, "%.1f", commitModel);
+
+        // 高阈值(滞后种子)跟随低阈值: 保证两者始终有分离度，这样拖低阈值就是
+        // 连续的"沿弱边腐蚀"，而不是忽有忽无。
+        if (a.autoHi)
         {
-            cv::Mat m;
-            if (!loadGrayImage(p, m)) logf("无法读取掩码图: %s", ws2s(p).c_str());
-            else
-            {
-                a.maskPath = ws2s(p);
-                a.mask     = m;
-                refreshTplView(a);
-                const double total = (double)m.cols * m.rows;
-                logf("掩码已加载: %s (%dx%d) 非零占比 %.1f%%",
-                     a.maskPath.c_str(), m.cols, m.rows,
-                     100.0 * (total > 0 ? cv::countNonZero(m) / total : 0.0));
-                needCreate = true;
-            }
+            const float want = App::hiFor(a.minContrast);
+            if (std::fabs(want - a.contrast) > 1e-4f) { a.contrast = want; changedModel = true; }
         }
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("清除掩码", ImVec2(-1, 0)))
-    {
-        a.maskPath.clear();
-        a.mask.release();
-        refreshTplView(a);
-        logLine("掩码已清除");
-        needCreate = true;
-    }
-
-    //---- 掩码涂抹 ----
-    if (ImGui::Checkbox("涂抹掩码模式", &a.paintMask))
-    {
-        // 开启时立即初始化掩码(默认全参与)并刷新视图
-        if (a.paintMask && !a.tplGray.empty())
+        if (a.autoHi) ImGui::BeginDisabled();
+        changedModel |= sliderF("高阈值(灰度差)", &a.contrast, 0.f, 255.f, "%.1f", commitModel);
+        if (a.autoHi) ImGui::EndDisabled();
+        if (ImGui::Checkbox("高阈值自动跟随 (推荐)", &a.autoHi))
         {
-            ensureMask(a, a.tplGray.cols, a.tplGray.rows);
-            refreshTplView(a);
+            changedModel = true;
+            commitModel  = true;
         }
-    }
-    if (a.paintMask)
-    {
-        itemWidthForLabel("画笔半径(px)");
-        ImGui::SliderFloat("画笔半径(px)", &a.brushRadius, 1.f, 30.f, "%.0f");
-        ImGui::TextWrapped("在左侧\"模板源图\"标签页: 左键涂抹=排除(红), 右键涂抹=恢复参与(绿)");
+
+        changedModel |= sliderI("最大点数", &a.maxPoints, 100, 4000, commitModel);
+        changedModel |= sliderI("金字塔层数(0=自动)", &a.numLevels, 0, 8, commitModel);
+        textDimWrapped("低阈值决定\"哪些边弱到可以放弃\"，高阈值是滞后起点，两者之间相连的弱边会被保住。"
+                       "低阈值拉大 = 从弱边开始逐圈啃掉特征(类似腐蚀)；拉到 255 特征全消失。");
+        endGroup();
     }
 
-    if (ImGui::Button("创建模板", ImVec2(-1, 0))) needCreate = true;
+    // 参数调完再建模板(点击即重建，并按需自动重匹配)
+    if (ImGui::Button("创建模板 / 应用参数", ImVec2(-1, 0))) needCreate = true;
 
     if (a.modelReady)
     {
@@ -1116,29 +1154,96 @@ static void drawPanel()
         ImGui::TextDisabled("模型: 未创建");
     }
 
-    static char modelPath[260] = "case1/model.shm";
-    ImGui::SetNextItemWidth(-1);
-    ImGui::InputText("##modelpath", modelPath, sizeof(modelPath));
-    if (ImGui::Button("保存模型", ImVec2(-120, 0)))
+    //---- 模板掩码(非零区域参与建模) ----
+    if (group("模板掩码 (排除重复/不稳定区域)", false))
     {
-        if (!a.modelReady) logLine("没有模型可保存");
-        else if (a.matcher.save(modelPath)) logf("模型已保存: %s", modelPath);
-        else logf("保存失败: %s", modelPath);
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("加载模型", ImVec2(-1, 0)))
-    {
-        if (a.matcher.load(modelPath))
+        if (a.mask.empty())
+            textDimWrapped("未加载 - 默认整幅模板参与建模。"
+                           "若模板里有全图重复的圆角/直线/阵列，建议涂掉，只留唯一结构。");
+        else
         {
-            a.modelReady = true;
-            a.buildMs    = 0;
-            a.syncFromConfig(a.matcher.config());
-            a.modelVis = a.matcher.drawModelFeatures(2.0);
-            a.texModel.set(toBGRA(a.modelVis));
-            logf("模型已加载: %s  (%d 点 / %d 层)", modelPath,
-                 a.matcher.modelPointCount(), a.matcher.numLevels());
+            const double total = (double)a.mask.cols * a.mask.rows;
+            const double keep = 100.0 * (total > 0 ? cv::countNonZero(a.mask) / total : 0.0);
+            ImGui::Text("已加载: %.1f%% 区域参与建模", keep);
+            ImGui::TextWrapped("%s", a.maskPath.c_str());
         }
-        else logf("加载失败: %s", modelPath);
+        if (ImGui::Button("加载掩码...", ImVec2(-140, 0)))
+        {
+            std::wstring p = pickImageFile(L"选择掩码图(非零=参与建模)");
+            if (!p.empty())
+            {
+                cv::Mat m;
+                if (!loadGrayImage(p, m)) logf("无法读取掩码图: %s", ws2s(p).c_str());
+                else
+                {
+                    a.maskPath = ws2s(p);
+                    a.mask     = m;
+                    refreshTplView(a);
+                    const double total = (double)m.cols * m.rows;
+                    logf("掩码已加载: %s (%dx%d) 非零占比 %.1f%%",
+                         a.maskPath.c_str(), m.cols, m.rows,
+                         100.0 * (total > 0 ? cv::countNonZero(m) / total : 0.0));
+                    needCreate = true;
+                }
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("清除掩码", ImVec2(-1, 0)))
+        {
+            a.maskPath.clear();
+            a.mask.release();
+            refreshTplView(a);
+            logLine("掩码已清除");
+            needCreate = true;
+        }
+
+        //---- 掩码涂抹 ----
+        if (ImGui::Checkbox("涂抹掩码模式", &a.paintMask))
+        {
+            // 开启时立即初始化掩码(默认全参与)并刷新视图
+            if (a.paintMask && !a.tplGray.empty())
+            {
+                ensureMask(a, a.tplGray.cols, a.tplGray.rows);
+                refreshTplView(a);
+            }
+        }
+        if (a.paintMask)
+        {
+            itemWidthForLabel("画笔半径(px)");
+            ImGui::SliderFloat("画笔半径(px)", &a.brushRadius, 1.f, 30.f, "%.0f");
+            ImGui::TextWrapped("在左侧\"模板源图\"标签页: 左键涂抹=排除(红), 右键涂抹=恢复参与(绿)");
+        }
+        endGroup();
+    }
+
+    //---- 模型文件 ----
+    if (group("模型文件 (保存 / 加载)", false))
+    {
+        static char modelPath[260] = "case1/model.shm";
+        ImGui::SetNextItemWidth(-1);
+        ImGui::InputText("##modelpath", modelPath, sizeof(modelPath));
+        if (ImGui::Button("保存模型", ImVec2(-120, 0)))
+        {
+            if (!a.modelReady) logLine("没有模型可保存");
+            else if (a.matcher.save(modelPath)) logf("模型已保存: %s", modelPath);
+            else logf("保存失败: %s", modelPath);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("加载模型", ImVec2(-1, 0)))
+        {
+            if (a.matcher.load(modelPath))
+            {
+                a.modelReady = true;
+                a.buildMs    = 0;
+                a.syncFromConfig(a.matcher.config());
+                a.modelVis = a.matcher.drawModelFeatures(2.0);
+                a.texModel.set(toBGRA(a.modelVis));
+                logf("模型已加载: %s  (%d 点 / %d 层)", modelPath,
+                     a.matcher.modelPointCount(), a.matcher.numLevels());
+            }
+            else logf("加载失败: %s", modelPath);
+        }
+        endGroup();
     }
 
     //---------------- 2. 匹配目标 ----------------
@@ -1171,40 +1276,78 @@ static void drawPanel()
 
     //---------------- 3. 搜索参数 ----------------
     ImGui::SeparatorText("3. 搜索参数");
-    bool changedSearch = false, commitSearch = false;
-    changedSearch |= sliderF("最小分数", &a.minScore, 0.05f, 1.f, "%.2f", commitSearch);
-    changedSearch |= sliderI("最大匹配数", &a.maxMatches, 1, 64, commitSearch);
-    changedSearch |= sliderF("最小间距(px)", &a.minDistance, 0.f, 300.f, "%.0f", commitSearch);
-    changedSearch |= sliderF("贪婪度", &a.greediness, 0.3f, 1.f, "%.2f", commitSearch);
+
+    //---- 匹配判据: 最常调，默认展开 ----
+    if (group("匹配判据 (分数 / 覆盖率)", true))
     {
-        const char* items[] = { "mean(原始)", "positive-mean(方向一致点比例)",
-                                "trimmed-mean(去尾10%)", "clipped-mean(正向但不缩分母)" };
-        itemWidthForLabel("评分方式");
-        if (ImGui::Combo("评分方式", &a.scoreMode, items, 4))
+        changedSearch |= sliderF("最小分数", &a.minScore, 0.05f, 1.f, "%.2f", commitSearch);
+        {
+            const char* items[] = { "mean(原始)",
+                                    "positive-mean(方向一致点比例)",
+                                    "trimmed-mean(去尾10%)",
+                                    "clipped-mean(正向但不缩分母)" };
+            itemWidthForLabel("评分方式");
+            if (ImGui::Combo("评分方式", &a.scoreMode, items, 4))
+            {
+                changedSearch = true;
+                commitSearch  = true;
+            }
+        }
+        changedSearch |= sliderF("最小覆盖率", &a.minCoverage, 0.f, 1.f, "%.2f", commitSearch);
+        if (a.minCoverage > 0.f)
+            textDimWrapped("0 = 关闭。覆盖率 = 模型点里梯度方向一致的占比，结果表\"覆盖\"列就是它。"
+                           "调低最小分数后冒出来的相似结构通常能拿高分，但只对上模型的一部分，覆盖率明显偏低。"
+                           "实测参考: case1 真值 0.99 / 误检 0.62(取 0.80)；case3 真值 0.81 / 误检 0.75(取 0.78)。");
+        endGroup();
+    }
+
+    //---- 结果筛选 ----
+    if (group("结果筛选 (实例数 / 去重 / 框样式)", true))
+    {
+        changedSearch |= sliderI("最大匹配数", &a.maxMatches, 1, 64, commitSearch);
+        changedSearch |= sliderF("最小间距(px)", &a.minDistance, 0.f, 300.f, "%.0f", commitSearch);
+        {
+            // 结果框样式只影响画出来的样子，不影响匹配结果
+            const char* items[] = { "固定方框(水平，尺寸=模板x缩放)",
+                                    "旋转框(跟角度倾斜)",
+                                    "模型凸包(旧版不规则多边形)" };
+            itemWidthForLabel("结果框样式");
+            if (ImGui::Combo("结果框样式", &a.boxMode, items, 3))
+            {
+                changedSearch = true;
+                commitSearch  = true;
+            }
+        }
+        textDimWrapped("多实例场景把最大匹配数调大；最小间距用来抑制相邻周期的重复检测。"
+                       "固定方框尺寸恒定、不随角度摇摆，多帧之间位置更好对比。");
+        endGroup();
+    }
+
+    //---- 性能与加速 ----
+    if (group("性能与加速", false))
+    {
+        changedSearch |= sliderF("贪婪度", &a.greediness, 0.3f, 1.f, "%.2f", commitSearch);
+        textDimWrapped("越大越快，但可能漏检。");
+        if (ImGui::Checkbox("亚像素", &a.subpixel)) { changedSearch = true; commitSearch = true; }
+        if (fitsOnLine(checkWidth("OpenCL"))) ImGui::SameLine();
+        if (ImGui::Checkbox("OpenCL", &a.useOpenCL))
         {
             changedSearch = true;
             commitSearch  = true;
+            if (!geomatch::enableOpenCL(a.useOpenCL)) logLine("OpenCL 不可用，已回退到 CPU");
         }
-    }
-    changedSearch |= sliderF("最小覆盖率", &a.minCoverage, 0.f, 1.f, "%.2f", commitSearch);
-    if (a.minCoverage > 0.f)
-        textDimWrapped("0 = 关闭。覆盖率 = 模型点里梯度方向一致的占比，结果表新增的\"覆盖\"列就是它。"
-                       "调低最小分数后冒出来的相似结构通常能拿高分，但只对上模型的一部分，覆盖率明显偏低。"
-                       "本机 case1(十字)实测：真实位置 0.99，相似位置 0.62~0.63，建议 0.75~0.90。");
-    if (ImGui::Checkbox("亚像素", &a.subpixel)) { changedSearch = true; commitSearch = true; }
-    if (fitsOnLine(checkWidth("OpenCL"))) ImGui::SameLine();
-    if (ImGui::Checkbox("OpenCL", &a.useOpenCL))
-    {
-        changedSearch = true;
-        commitSearch  = true;
-        if (!geomatch::enableOpenCL(a.useOpenCL)) logLine("OpenCL 不可用，已回退到 CPU");
+        endGroup();
     }
 
-    ImGui::Checkbox("参数改动后自动刷新", &a.autoRun);
-    if (fitsOnLine(checkWidth("拖动时实时刷新"))) ImGui::SameLine();
-    ImGui::Checkbox("拖动时实时刷新", &a.liveUpdate);
-    itemWidthForLabel("显示缩放");
-    ImGui::SliderFloat("显示缩放", &a.zoom, 0.2f, 4.f, "%.2f");
+    //---- 界面选项 ----
+    if (group("界面选项", false))
+    {
+        ImGui::Checkbox("参数改动后自动刷新", &a.autoRun);
+        ImGui::Checkbox("拖动时实时刷新", &a.liveUpdate);
+        itemWidthForLabel("显示缩放");
+        ImGui::SliderFloat("显示缩放", &a.zoom, 0.2f, 4.f, "%.2f");
+        endGroup();
+    }
 
     //---------------- 4. 执行 ----------------
     ImGui::SeparatorText("4. 执行匹配");
@@ -1326,9 +1469,11 @@ static void drawUI()
                  ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
                  ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoSavedSettings);
 
-    const float panelW0   = 390.f * g_scale;    // 面板理想宽度
-    const float panelMinW = 300.f * g_scale;    // 面板允许的最窄宽度
-    const float minLeftW  = 240.f * g_scale;    // 左侧视图至少留这么宽
+    // 右侧参数面板宽度。参数较多，面板给宽一点，滑块才能拉得动；
+    // 窗口变窄时按 panelMinW 收缩，保证整个面板仍在窗口内。
+    const float panelW0   = 560.f * g_scale;    // 面板理想宽度
+    const float panelMinW = 420.f * g_scale;    // 面板允许的最窄宽度
+    const float minLeftW  = 260.f * g_scale;    // 左侧视图至少留这么宽
     const float gap       = ImGui::GetStyle().ItemSpacing.x;
     const float thumbH    = 150.f * g_scale;    // 底部图片预览列表的高度
 
@@ -1597,9 +1742,10 @@ static LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
         break;
     case WM_GETMINMAXINFO:
     {
-        // 窗口再小右侧面板就会被右边界裁掉(标签显示不全)，这里限制一个最小尺寸
+        // 窗口再小右侧面板就会被右边界裁掉(标签显示不全)，这里限制一个最小尺寸。
+        // 最小宽度跟着面板走: panelMinW(420) + minLeftW(260) + 间距和边框余量。
         MINMAXINFO* mmi = reinterpret_cast<MINMAXINFO*>(lParam);
-        RECT r = { 0, 0, (LONG)(640 * g_scale), (LONG)(560 * g_scale) };
+        RECT r = { 0, 0, (LONG)(800 * g_scale), (LONG)(600 * g_scale) };
         ::AdjustWindowRectEx(&r, WS_OVERLAPPEDWINDOW, FALSE, 0);
         mmi->ptMinTrackSize.x = r.right - r.left;
         mmi->ptMinTrackSize.y = r.bottom - r.top;

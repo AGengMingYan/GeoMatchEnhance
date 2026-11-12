@@ -226,6 +226,7 @@ namespace
         cfg.debug      = (int)gArgD(a, "-debug", 0);
         cfg.scoreMode  = (int)gArgD(a, "-score-mode", 1);
         cfg.minCoverage = (float)gArgD(a, "-min-cover", 0.0);
+        cfg.boxMode    = (int)gArgD(a, "-box", 0);
         m.setConfig(cfg);
 
         Timing tm;
@@ -308,6 +309,7 @@ int main(int argc, char** argv)
     cfg.debug       = (int)gArgD(args, "-debug", 0);
     cfg.scoreMode   = (int)gArgD(args, "-score-mode", 1);
     cfg.minCoverage = (float)gArgD(args, "-min-cover", 0.0);
+    cfg.boxMode     = (int)gArgD(args, "-box", 0);
 
     const double angleExtentDeg = gArgD(args, "-angle", 360.0);
     applyModelRange(cfg, args);
@@ -385,6 +387,7 @@ int main(int argc, char** argv)
         merged.debug       = cfg.debug;
         merged.scoreMode   = cfg.scoreMode;
         merged.minCoverage = cfg.minCoverage;
+        merged.boxMode     = cfg.boxMode;
         // the search range is only overridden when it was asked for explicitly
         if (gHas(args, "-angle"))
         {

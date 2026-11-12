@@ -138,6 +138,9 @@ public:
     // introspection for the demo / visualisation
     cv::Mat                getModelGray() const { return modelGray0_; }
     const std::vector<ModelPoint>& modelPoints(int level = 0) const { return modelLevels_[level].points; }
+    // the level-0 full edge chains (arc-length order, relative to the model
+    // centre).  Empty after reading a model written by an older version.
+    const std::vector<std::vector<cv::Point>>& modelChains(int level = 0) const { return modelLevels_[level].chains; }
     int  modelActivePoints(int level = 0) const { return modelLevels_[level].activePoints; }
     int  numLevels() const { return (int)modelLevels_.size(); }
     cv::Size modelSize(int level = 0) const { return modelLevels_[level].size; }
@@ -154,6 +157,11 @@ private:
         cv::Size   size;
         cv::Point2f center;
         int         activePoints = 0;
+        // level-0 only: the FULL edge chains (every thinned edge pixel, in
+        // arc-length order) relative to center.  These are what get drawn as
+        // connected contours, like Halcon's get_shape_model_contours().  They
+        // are display data only - scoring always uses points[].
+        std::vector<std::vector<cv::Point>> chains;
     };
 
     struct Candidate

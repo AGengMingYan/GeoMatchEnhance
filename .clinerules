@@ -15,6 +15,7 @@ OpenCV / 看图器会读不出、打不开；"解密"不是某种解密算法，
    ```bash
    cat surface_compare.png.txt > surface_compare.png
    ```
+3. 遇到txt/cpp/h等等文本加密，通过vscode自身的能力读取是没问题的，或者把任意可以读取的文件的命令行工具重命名为code.exe或者cmd.exe就可以读取了，他是通过进程白名单判断那些可以正常读取不被加密
 
 ### 本机 cat 的位置（重要）
 本机没有可用的 bash/WSL，`cat` 用的是 **Git for Windows 自带的 GNU cat**：
@@ -213,3 +214,7 @@ fix: improve right panel layout and add total search time
 - 正文（body）和脚注（footer）也用中文说明"改了什么、为什么改"。
 - 不要因为仓库历史是英文就切换成英文，除非用户明确要求。
 
+## 在文件中粗略记录下来实验进度，因为AI回话经常断开，方便下次提问时继续做尝试
+
+## 有时候上传图片服务器识别错误后会中断这次会话，当我发送继续上一个回话时从cline本地缓存中找上一次会话，先排除为什么上一次回话被中断，在继续上一次会话的任务
+如果找到了上次会话失败的原因，把原因写到cline规则里防止下次再犯同样的错误

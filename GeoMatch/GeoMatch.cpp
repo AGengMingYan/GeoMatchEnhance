@@ -26,6 +26,66 @@ static double tickMs(int64 t0)
     return (double)(cv::getTickCount() - t0) * 1000.0 / cv::getTickFrequency();
 }
 
+namespace
+{
+    // Model drawing shared by drawModelInfo() (CLI) and drawModelFeatures()
+    // (GUI), so both show the same thing:
+    //   green polyline  - the model contour (Halcon's get_shape_model_contours)
+    //   red dot         - a sampled scoring point (a subset of the contour)
+    //   orange arrow    - gradient direction (optional, annotation only)
+    //   blue dot        - model centre
+    // The canvas must already be enlarged by sf; every coordinate here is in
+    // model-centre-relative pixels.
+    void drawModelOverlay(cv::Mat& bgr,
+                          const std::vector<std::vector<cv::Point>>& chains,
+                          const std::vector<ModelPoint>& pts,
+                          const cv::Point2f& ctr,
+                          double sf,
+                          bool showGradients)
+    {
+        const float cx = ctr.x * (float)sf, cy = ctr.y * (float)sf;
+
+        // NMS leaves the edges 1 px wide, so the stroke has to grow with the
+        // enlargement; otherwise it disappears between the point dots.
+        const int stroke = (sf >= 3.0) ? 3 : ((sf >= 2.0) ? 2 : 1);
+        for (size_t c = 0; c < chains.size(); c++)
+        {
+            const std::vector<cv::Point>& ch = chains[c];
+            if (ch.size() < 2) continue;
+            std::vector<cv::Point> poly;
+            poly.reserve(ch.size());
+            for (size_t k = 0; k < ch.size(); k++)
+                poly.push_back(cv::Point(cvRound(cx + ch[k].x * (float)sf),
+                                         cvRound(cy + ch[k].y * (float)sf)));
+            cv::polylines(bgr, poly, false, cv::Scalar(60, 255, 60), stroke, cv::LINE_AA);
+        }
+
+        // the sampled scoring points, kept small so they do not hide the line
+        for (size_t k = 0; k < pts.size(); k++)
+        {
+            const cv::Point2f pp(cx + pts[k].x * (float)sf, cy + pts[k].y * (float)sf);
+            cv::circle(bgr, pp, 1, cv::Scalar(40, 40, 255), -1, cv::LINE_AA);
+        }
+
+        if (showGradients)
+        {
+            const float dirLen = 4.f;
+            for (size_t k = 0; k < pts.size(); k++)
+            {
+                const ModelPoint& p = pts[k];
+                const float gn = std::sqrt(p.gx * p.gx + p.gy * p.gy);
+                if (gn <= 1e-3f) continue;
+                const cv::Point2f pp(cx + p.x * (float)sf, cy + p.y * (float)sf);
+                const cv::Point2f dir(p.gx / gn * dirLen, p.gy / gn * dirLen);
+                cv::line(bgr, pp, pp + dir, cv::Scalar(255, 180, 0), 1, cv::LINE_AA);
+            }
+        }
+
+        cv::circle(bgr, cv::Point(cvRound(cx), cvRound(cy)), 4,
+                   cv::Scalar(255, 0, 0), -1, cv::LINE_AA);
+    }
+}
+
 //=======================================================================
 //  Config
 //=======================================================================
@@ -92,6 +152,9 @@ int         Matcher::modelPointCount() const { return ready() ? core_->modelPoin
 int         Matcher::numLevels()       const { return ready() ? core_->numLevels() : 0; }
 cv::Point2f Matcher::modelCenter()     const { return ready() ? core_->modelCenter() : cv::Point2f(); }
 cv::Size    Matcher::modelSize()       const { return ready() ? core_->modelSize(0) : cv::Size(); }
+int         Matcher::candidatePixels() const { return ready() ? core_->candidatePixels() : 0; }
+float       Matcher::strongestMag()    const { return ready() ? core_->strongestMag() : 0.f; }
+float       Matcher::weakestMag()      const { return ready() ? core_->weakestMag() : 0.f; }
 
 bool Matcher::create(const cv::Mat& gray, const Config& cfg)
 {
@@ -113,8 +176,10 @@ bool Matcher::load(const std::string& file)
     cfg_.scaleMin    = p.scaleMin;
     cfg_.scaleMax    = p.scaleMax;
     cfg_.minContrast = p.minContrast;
+    cfg_.contrast    = p.contrast;      // lo/hi both come from the model
     cfg_.maxPoints   = p.maxPoints;
     cfg_.numLevels   = p.numLevels;
+    cfg_.minChainLen = p.minChainLen;
     modelLabel_ = file;
     return true;
 }
@@ -178,21 +243,9 @@ cv::Mat Matcher::drawModelInfo(const std::string& title) const
     cv::resize(modelColor, modelColor, cv::Size(), sf, sf, cv::INTER_NEAREST);
 
     const auto& pts = core_->modelPoints(0);
+    const auto& chains = core_->modelChains(0);
     const cv::Point2f ctr = core_->modelCenter();
-    for (int k = 0; k < (int)pts.size(); k++)
-    {
-        const ModelPoint& p = pts[k];
-        cv::Point2f pp((ctr.x + p.x) * (float)sf, (ctr.y + p.y) * (float)sf);
-        cv::circle(modelColor, pp, 2, cv::Scalar(0, 0, 255), -1, cv::LINE_AA);
-        float gnorm = std::sqrt(p.gx * p.gx + p.gy * p.gy);
-        if (gnorm > 1e-3f)
-        {
-            cv::Point2f dir(p.gx / gnorm * 9.f, p.gy / gnorm * 9.f);
-            cv::line(modelColor, pp, pp + dir, cv::Scalar(0, 255, 0), 1, cv::LINE_AA);
-        }
-    }
-    cv::circle(modelColor, cv::Point(cvRound(ctr.x * sf), cvRound(ctr.y * sf)),
-               4, cv::Scalar(255, 0, 0), -1, cv::LINE_AA);
+    drawModelOverlay(modelColor, chains, pts, ctr, sf, false);
 
     const MatchParams& P = core_->params();
     const int panelW = 380;
@@ -214,8 +267,9 @@ cv::Mat Matcher::drawModelInfo(const std::string& title) const
     add("levels   : " + std::to_string(core_->numLevels()));
     add("points   : " + std::to_string(core_->modelPointCount()),
         cv::Scalar(0, 255, 0));
-    add("contrast : hi " + std::to_string((int)P.contrast) +
-        " / lo " + std::to_string((int)P.minContrast));
+    add("contrast : lo " + std::to_string((int)P.minContrast) +
+        " / hi " + std::to_string((int)P.contrast));
+    add("           (Sobel |g|; gray step = /4)", cv::Scalar(150, 150, 150), 0.4);
     add("Search Space", cv::Scalar(0, 255, 255), 0.7, sectionGap);
     add("angle    : " + std::to_string((int)(P.angleStart * 180 / CV_PI)) + " .. " +
         std::to_string((int)((P.angleStart + P.angleExtent) * 180 / CV_PI)) + " deg");
@@ -224,9 +278,9 @@ cv::Mat Matcher::drawModelInfo(const std::string& title) const
     add("minScore : " + std::to_string(cfg_.minScore));
     add("maxMatch : " + std::to_string(cfg_.maxMatches));
     add("Legend", cv::Scalar(0, 255, 255), 0.7, sectionGap);
-    add("red dot   : model point");
-    add("green ln  : gradient direction");
-    add("blue dot  : model centre");
+    add("green ln  : model contour", cv::Scalar(60, 255, 60));
+    add("red dot   : scoring point");
+    add("blue dot  : model centre", cv::Scalar(255, 0, 0));
 
     auto lineSpacing = [&](const Line& ln)
     {
@@ -261,7 +315,7 @@ cv::Mat Matcher::drawModelInfo(const std::string& title) const
 //=======================================================================
 //  model visualisation without the info panel: template + points + dirs
 //=======================================================================
-cv::Mat Matcher::drawModelFeatures(double scaleFactor) const
+cv::Mat Matcher::drawModelFeatures(double scaleFactor, bool showGradients) const
 {
     if (!ready()) return cv::Mat();
 
@@ -274,21 +328,13 @@ cv::Mat Matcher::drawModelFeatures(double scaleFactor) const
         cv::resize(modelColor, modelColor, cv::Size(), sf, sf, cv::INTER_NEAREST);
 
     const std::vector<ModelPoint>& pts = core_->modelPoints(0);
+    const std::vector<std::vector<cv::Point>>& chains = core_->modelChains(0);
     const cv::Point2f ctr = core_->modelCenter();
-    for (size_t k = 0; k < pts.size(); k++)
-    {
-        const ModelPoint& p = pts[k];
-        cv::Point2f pp((ctr.x + p.x) * (float)sf, (ctr.y + p.y) * (float)sf);
-        cv::circle(modelColor, pp, 2, cv::Scalar(0, 0, 255), -1, cv::LINE_AA);
-        float gnorm = std::sqrt(p.gx * p.gx + p.gy * p.gy);
-        if (gnorm > 1e-3f)
-        {
-            cv::Point2f dir(p.gx / gnorm * 9.f, p.gy / gnorm * 9.f);
-            cv::line(modelColor, pp, pp + dir, cv::Scalar(0, 255, 0), 1, cv::LINE_AA);
-        }
-    }
-    cv::circle(modelColor, cv::Point(cvRound(ctr.x * sf), cvRound(ctr.y * sf)),
-               4, cv::Scalar(255, 0, 0), -1, cv::LINE_AA);
+
+    // contour polylines first: these are what make the model read as a shape.
+    // The gradient arrows are off by default - a 1 px contour disappears under
+    // a field of arrows.
+    drawModelOverlay(modelColor, chains, pts, ctr, sf, showGradients);
 
     return modelColor;
 }
@@ -355,12 +401,52 @@ cv::Mat Matcher::drawResult(const cv::Mat& gray, const std::vector<Detection>& d
             }
         }
 
-        //---- 3) outline -------------------------------------------------
-        MatchResult mr;
-        mr.pos = d.pos; mr.angle = d.angle; mr.scale = d.scale; mr.score = d.score;
-        core_->drawContours(vis, mr, col, 2);
+        //---- 3) the outline -------------------------------------------
+        // The box is the template rectangle at the reported pose.  Mode 0 keeps
+        // it level and sized template x scale, so consecutive matches line up
+        // and the box does not breathe with tiny angle changes.
+        const cv::Size tsz = core_->modelSize(0);
+        const float bw = (float)tsz.width  * s;
+        const float bh = (float)tsz.height * s;
+        const float bx = d.pos.x - tplCtr.x * s;      // level box, top-left
+        const float by = d.pos.y - tplCtr.y * s;
+        cv::Rect box;                                 // used by the caption
 
-        //---- 4) caption below the matched box ---------------------------
+        if (cfg_.boxMode == 2)
+        {
+            // old behaviour: convex hull of the model points
+            MatchResult mr;
+            mr.pos = d.pos; mr.angle = d.angle; mr.scale = d.scale; mr.score = d.score;
+            core_->drawContours(vis, mr, col, 2);
+            box = cv::Rect(cvRound(bx), cvRound(by), cvRound(bw), cvRound(bh));
+        }
+        else if (cfg_.boxMode == 1)
+        {
+            // same size, tilted by the match angle.  The pose maps the model by
+            // [ca sa; -sa ca], i.e. a rotation of -angle; in the image (y down)
+            // RotatedRect counts the angle the other way round, hence -angle.
+            const cv::Point2f lc(bw * 0.5f - tplCtr.x * s, bh * 0.5f - tplCtr.y * s);
+            const cv::Point2f ctr(d.pos.x + (lc.x * ca + lc.y * sa),
+                                  d.pos.y + (-lc.x * sa + lc.y * ca));
+            cv::RotatedRect rr(ctr, cv::Size2f(bw, bh), -(double)d.angle * 180.0 / CV_PI);
+            cv::Point2f q[4];
+            rr.points(q);
+            std::vector<cv::Point> poly;
+            poly.reserve(4);
+            for (int i = 0; i < 4; i++)
+                poly.push_back(cv::Point(cvRound(q[i].x), cvRound(q[i].y)));
+            cv::polylines(vis, poly, true, col, 2, cv::LINE_AA);
+            box = cv::boundingRect(poly);
+        }
+        else
+        {
+            box = cv::Rect(cvRound(bx), cvRound(by), cvRound(bw), cvRound(bh));
+            cv::rectangle(vis, box, col, 2, cv::LINE_AA);
+        }
+        // the localisation point, always drawn on top of the box
+        cv::circle(vis, cv::Point(cvRound(d.pos.x), cvRound(d.pos.y)), 2, col, -1, cv::LINE_AA);
+
+        //---- 4) caption under the box ----------------------------------
         std::ostringstream cap;
         cap << "#" << k << "  s=" << std::fixed << std::setprecision(3) << d.score;
         if (d.coverage > 0.f)                       // only when the caller computed it
@@ -369,8 +455,8 @@ cv::Mat Matcher::drawResult(const cv::Mat& gray, const std::vector<Detection>& d
             << "  k=" << std::setprecision(3) << d.scale;
         std::string txt = cap.str();
         cv::Size ts = cv::getTextSize(txt, cv::FONT_HERSHEY_SIMPLEX, 0.5, 1, nullptr);
-        int torgX = (int)(d.pos.x - tplCtr.x * s);
-        int torgY = (int)(d.pos.y + tplCtr.y * s) + ts.height + 8;
+        int torgX = box.x;
+        int torgY = box.y + box.height + ts.height + 6;
         torgX = std::min(std::max(torgX, 2), std::max(2, vis.cols - ts.width - 4));
         torgY = std::min(std::max(torgY, ts.height + 4), vis.rows - 4);
         cv::Point torg(torgX, torgY);
@@ -380,10 +466,12 @@ cv::Mat Matcher::drawResult(const cv::Mat& gray, const std::vector<Detection>& d
         cv::putText(vis, txt, torg, cv::FONT_HERSHEY_SIMPLEX, 0.5, col, 1, cv::LINE_AA);
     }
 
+    const char* boxName = (cfg_.boxMode == 1) ? "rotated"
+                        : (cfg_.boxMode == 2) ? "hull" : "fixed";
     std::ostringstream hdr;
     hdr << "matches=" << dets.size()
-        << "   |  overlay: template texture"
-        << "   red = model point   yellow = gradient   green = outline";
+        << "   |  box(" << boxName << ")  green=#0 orange=others"
+        << "   red = scoring point   yellow = gradient";
     cv::rectangle(vis, cv::Rect(0, 0, vis.cols, 24), cv::Scalar(0, 0, 0), -1);
     cv::putText(vis, hdr.str(), cv::Point(6, 17),
                 cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 255), 1, cv::LINE_AA);

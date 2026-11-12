@@ -320,9 +320,14 @@ namespace
 
     // walk the thinned edges into chains and take the points at equal arc
     // length, so the model follows the texture instead of clustering on the
-    // few strongest ridges (this is what Halcon's model contours look like)
-    std::vector<int> sampleAlongContours(const cv::Mat& edge, const cv::Mat& mag, int maxPts, int minChainLen)
+    // few strongest ridges (this is what Halcon's model contours look like).
+    // fullChains, when not null, receives every kept chain's pixels in
+    // arc-length order - that is the contour the model is drawn with.
+    std::vector<int> sampleAlongContours(const cv::Mat& edge, const cv::Mat& mag, int maxPts,
+                                         int minChainLen,
+                                         std::vector<std::vector<int>>* fullChains = nullptr)
     {
+        if (fullChains) fullChains->clear();
         const int w = edge.cols, h = edge.rows, nPix = w * h;
         const uchar* pe = edge.ptr<uchar>();
         const float* pm = mag.ptr<float>();
@@ -455,8 +460,19 @@ namespace
                 out.push_back(ch[std::min(t, ch.size() - 1)]);
             }
         }
+
+        // hand the full chains over before the point list is reordered; the
+        // contours are pure display data and independent of that order
+        if (fullChains)
+        {
+            fullChains->reserve(chains.size());
+            for (size_t k = 0; k < chains.size(); k++)
+                if ((int)chains[k].size() >= minChainLen && (int)chains[k].size() >= 2)
+                    fullChains->push_back(chains[k]);
+        }
+
         // strongest first: the scan loop prunes on the first points it sums up
-        std::sort(out.begin(), out.end(), [pm](int a, int b) { return pm[a] > pm[b]; });
+        std::stable_sort(out.begin(), out.end(), [pm](int a, int b) { return pm[a] > pm[b]; });
         return out;
     }
 }
@@ -488,8 +504,15 @@ void ShapeMatcher::selectEdgePoints(LevelData& ld, const cv::Mat& grayLevel, con
     ld.activePoints = 0;
     if (level == 0) { candCount_ = 0; strongestMag_ = 0; weakestMag_ = 0; }
 
+    // Hysteresis only needs hi >= lo; the old "lo * 1.5" floor silently raised
+    // the caller's high threshold.  That made the high threshold impossible to
+    // lower below 1.5 x lo, and made a large lo find no seed at all (this
+    // template's strongest Sobel response is 152, so hi >= 180 -> 0 points).
+    // Keep the caller's value, but not below lo, otherwise growEdges has no
+    // seed.  hi == lo degenerates to a plain threshold, which is exactly what
+    // Halcon does when Contrast is given as a single value.
     const float lo = (float)std::max(params_.minContrast, 1.0);
-    const float hi = (float)std::max(params_.contrast, lo * 1.5);
+    const float hi = (float)std::max(params_.contrast, (double)lo);
     thinRidges(mag, gx, gy, thin);
     growEdges(mag, thin, lo, hi, edge);
 
@@ -497,7 +520,9 @@ void ShapeMatcher::selectEdgePoints(LevelData& ld, const cv::Mat& grayLevel, con
     if (!mask.empty())
         cv::bitwise_and(edge, mask, edge);
 
-    const std::vector<int> idx = sampleAlongContours(edge, mag, maxPts, params_.minChainLen);
+    std::vector<std::vector<int>> fullChains;
+    const std::vector<int> idx = sampleAlongContours(edge, mag, maxPts, params_.minChainLen,
+                                                    &fullChains);
     const int n = (int)idx.size();
 
     ld.points.resize(n);
@@ -513,6 +538,22 @@ void ShapeMatcher::selectEdgePoints(LevelData& ld, const cv::Mat& grayLevel, con
         mp.mag = pMag[i];
     }
     ld.activePoints = n;
+
+    // contours for display: full chains converted to centre-relative pixels
+    ld.chains.clear();
+    ld.chains.reserve(fullChains.size());
+    for (size_t c = 0; c < fullChains.size(); c++)
+    {
+        std::vector<cv::Point> poly;
+        poly.reserve(fullChains[c].size());
+        for (size_t k = 0; k < fullChains[c].size(); k++)
+        {
+            const int i = fullChains[c][k];
+            const int yy = i / w, xx = i - yy * w;
+            poly.push_back(cv::Point(xx - icx, yy - icy));
+        }
+        ld.chains.push_back(std::move(poly));
+    }
 
     if (level == 0 && n > 0)
     {
@@ -2072,11 +2113,17 @@ int ShapeMatcher::modelPointCount() const
 //    grids    : angleGrid_ | scaleGrid_ | angleStep_ scaleStep_ scaleMin_
 //               levelAngleStep_ levelScaleStep_
 //               levelAngleCount_ levelScaleCount_
+//    chains   : (version >= 3) uint32 nChains, then per chain
+//                 uint32 len | len x (int16 x, int16 y) relative to centre
+//               Only level 0 has chains; they are display-only contours (the
+//               full edge polylines, Halcon's get_shape_model_contours).
+//               Version 1 (no chains) and 2 are still readable.
 //=======================================================================
 namespace
 {
     const uint32_t SM_MAGIC   = 0x314D4853;   // 'SHM1'
-    const uint32_t SM_VERSION = 1;
+    const uint32_t SM_VERSION = 3;
+    const uint32_t SM_VERSION_MIN = 1;        // oldest layout we can read
 
     struct ByteWriter
     {
@@ -2088,6 +2135,7 @@ namespace
         }
         void u32(uint32_t v) { raw(&v, 4); }
         void i32(int32_t  v) { raw(&v, 4); }
+        void i16(int16_t  v) { raw(&v, 2); }
         void f32(float    v) { raw(&v, 4); }
         void f64(double   v) { raw(&v, 8); }
     };
@@ -2108,6 +2156,7 @@ namespace
         }
         bool u32(uint32_t& v) { return raw(&v, 4); }
         bool i32(int32_t&  v) { return raw(&v, 4); }
+        bool i16(int16_t&  v) { return raw(&v, 2); }
         bool f32(float&    v) { return raw(&v, 4); }
         bool f64(double&   v) { return raw(&v, 8); }
         bool done() const { return ok; }
@@ -2180,6 +2229,21 @@ std::vector<uchar> ShapeMatcher::serializeShapeModel() const
     for (size_t i = 0; i < levelAngleCount_.size(); i++) w.i32(levelAngleCount_[i]);
     for (size_t i = 0; i < levelScaleCount_.size(); i++) w.i32(levelScaleCount_[i]);
 
+    // ---- chains (level 0 only), version 3: contour polylines ----
+    const std::vector<std::vector<cv::Point>> noChains;
+    const size_t nLev = modelLevels_.size();
+    const std::vector<std::vector<cv::Point>>& ch0 = nLev > 0 ? modelLevels_[0].chains : noChains;
+    w.u32((uint32_t)ch0.size());
+    for (size_t c = 0; c < ch0.size(); c++)
+    {
+        w.u32((uint32_t)ch0[c].size());
+        for (size_t k = 0; k < ch0[c].size(); k++)
+        {
+            w.i16((int16_t)ch0[c][k].x);
+            w.i16((int16_t)ch0[c][k].y);
+        }
+    }
+
     return w.b;
 }
 
@@ -2191,7 +2255,7 @@ bool ShapeMatcher::deserializeShapeModel(const std::vector<uchar>& data)
 
     uint32_t magic = 0, version = 0;
     r.u32(magic); r.u32(version);
-    if (magic != SM_MAGIC || version != SM_VERSION)
+    if (magic != SM_MAGIC || version < SM_VERSION_MIN || version > SM_VERSION)
         return false;
 
     MatchParams p;
@@ -2255,6 +2319,31 @@ bool ShapeMatcher::deserializeShapeModel(const std::vector<uchar>& data)
     // sanity: the per level tables must match the level count
     if (!r.done() || ng != nLevels || levels[0].points.empty())
         return false;
+
+    // ---- chains (version >= 3, level 0 only) ----
+    if (version >= 3)
+    {
+        uint32_t nc = 0;
+        if (r.u32(nc) && nc < 2000000u)          // sanity against a corrupt count
+        {
+            levels[0].chains.resize(nc);
+            bool bad = false;
+            for (uint32_t c = 0; c < nc && r.done(); c++)
+            {
+                uint32_t len = 0;
+                if (!r.u32(len) || len > 4000000u) { bad = true; break; }
+                levels[0].chains[c].resize(len);
+                for (uint32_t k = 0; k < len; k++)
+                {
+                    int16_t x = 0, y = 0;
+                    if (!r.i16(x) || !r.i16(y)) { bad = true; break; }
+                    levels[0].chains[c][k] = cv::Point(x, y);
+                }
+                if (bad) break;
+            }
+            if (bad) levels[0].chains.clear();     // contours are optional: drop them
+        }
+    }
 
     // ---- commit ----
     params_        = p;

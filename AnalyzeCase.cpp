@@ -132,8 +132,9 @@ void printModelInfo(const geomatch::Matcher& m, const std::string& file)
            (c.angleStart + c.angleExtent) * 180.0 / CV_PI,
            c.angleExtent * 180.0 / CV_PI);
     printf("缩放        : %.3f .. %.3f\n", c.scaleMin, c.scaleMax);
-    printf("建模板参数  : minContrast=%.0f  maxPoints=%d  numLevels=%d\n",
-           c.minContrast, c.maxPoints, c.numLevels);
+    printf("建模板参数  : minContrast(lo)=%.0f  contrast(hi)=%.0f  maxPoints=%d  numLevels=%d\n",
+           c.minContrast, c.contrast, c.maxPoints, c.numLevels);
+    printf("            (Sobel |g| 单位; 灰度差 = 值 / 4; 两者相等 = 纯阈值)\n");
     printf("搜索参数    : minScore=%.2f  maxMatches=%d  minDist=%.0f  greedy=%.2f  subpixel=%d\n",
            c.minScore, c.maxMatches, c.minDistance, c.greediness, c.subpixel);
     printf("评分/过滤   : scoreMode=%d  minCoverage=%.2f\n", c.scoreMode, c.minCoverage);
