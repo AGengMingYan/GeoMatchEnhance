@@ -218,3 +218,73 @@ fix: improve right panel layout and add total search time
 
 ## 有时候上传图片服务器识别错误后会中断这次会话，当我发送继续上一个回话时从cline本地缓存中找上一次会话，先排除为什么上一次回话被中断，在继续上一次会话的任务
 如果找到了上次会话失败的原因，把原因写到cline规则里防止下次再犯同样的错误
+
+## 当发现通用性的问题结论时，防止下次遇到类似问题，把这些总结写到这个规则文件里
+
+### 实测结论：加密是由「写文件的进程」决定的（2026-11-12 验证）
+
+同一台机器上，写同样一段文本，**换个进程写结果就完全不同**：
+
+| 写入方式 | 落盘结果 | 判定 |
+|---|---|---|
+| PowerShell `[System.IO.File]::WriteAllText(...)` | `66 65 61 74` = "feat" **明文** | ✅ 可用 |
+| `cmd /c "echo xxx > file.txt"` | `E0 A8 91 E7` **密文** | ❌ 不可用 |
+| 用 editor 工具新建文件 | `E0 A8 91 E7` **密文** | ❌ 需解密 |
+| python `zipfile.extractall()` 解压出的文件 | `E0 A8 91 E7` **密文** | ❌ 需解密 |
+| `cmd /c "cat.exe a.png.txt > a.png"` | `89 50 4E 47` **明文** | ✅ 可用（已验证多次） |
+
+**结论：白名单认得是 `powershell.exe` 的 .NET 文件 API 和 `cat.exe` 这类外部工具，
+不认 cmd.exe 的内建命令（echo），也不认 python / editor。**
+
+因此：
+
+1. **要生成文本文件（提交信息、tag 说明、README）→ 用 PowerShell 的
+   `[System.IO.File]::WriteAllText/WriteAllLines`**，配 `New-Object System.Text.UTF8Encoding($false)` 写无 BOM UTF-8。
+   这比"先写再解密"稳，一次就成。
+2. **要生成图片/二进制 → 用 `cat.exe` 重定向**（cmd 只是打开文件句柄，实际写入进程算 cat.exe）。
+3. **解压压缩包后里面的文件会被重新加密**（因为解压进程不在白名单）。所以
+   "解压后 GUI 读不到图" 不等于包坏了，要**直接读 zip 内部字节**来验证：
+   ```python
+   import zipfile
+   z = zipfile.ZipFile('pkg.zip')
+   for n in z.namelist():
+       print(n, z.getinfo(n).file_size, ' '.join('%02X' % c for c in z.read(n)[:4]))
+   # exe/dll 应为 4D 5A 90 00 (MZ)，jpg 为 FF D8 FF，png 为 89 50 4E 47
+   ```
+4. 验证 zip 完整性用 python 的 `zipfile.ZipFile(p).testzip()`（返回 `None` = 全部 CRC 通过），
+   **不要用 .NET `ZipFile::OpenRead`**——本机加密环境会让它报"找不到中央目录结尾记录"，
+   即使 zip 本身是好的（EOCD `50 4B 05 06` 都在）。`Compress-Archive` 也可能被干扰而产出截断包，
+   改用 `[System.IO.Compression.ZipFile]::CreateFromDirectory(...)` 更稳。
+
+## 发布流程：用 git tag + Gitee 发行版附件
+
+**git 本身不能"发布程序"**，它只能打 tag 和推文件。二进制不进仓库，走发行版附件：
+
+```powershell
+# 1. 提交（发布相关文件精确暂存，排除 imgui.zip / *.txt 备份 / *.7z1 / obj / 密钥）
+git add -- <文件清单>
+git -c i18n.commitEncoding=utf-8 commit -F 提交信息.txt
+
+# 2. 打 tag（跟随仓库既有约定：1.0.0 / 1.0.1 是「无 v 前缀」）
+git tag -a 1.0.2 -F tag说明.txt
+
+# 3. 先 dry-run 预检，确认是 fast-forward 而不是被迫强推
+git push --dry-run origin master 1.0.2
+
+# 4. 推送
+git push origin master 1.0.2
+```
+
+**打包发布 zip 的注意事项（本机实测）：**
+
+| 事项 | 做法 |
+|---|---|
+| 生成 zip | `[System.IO.Compression.ZipFile]::CreateFromDirectory($dir, $zip, [CompressionLevel]::Fastest, $true)`（第 4 个参数 true = 带顶层目录） |
+| 不要用 | `Compress-Archive`：本机被干扰时产出截断包（1.4s 压 63MB 且缺 EOCD） |
+| 验证内容 | `zipfile.ZipFile(p).testzip()` 返回 `None` |
+| 验证明文 | 直接读 zip 内部字节，看 `4D 5A` / `FF D8` / `89 50 4E 47` |
+| 排除项 | 测试集（case3 57MB）、`.7z1`、截图、`*.obj`，只带 exe + 依赖 dll + 示例数据 + README |
+| 部署校验 | `Get-FileHash -Algorithm SHA256` 比对 `build_x64` 与发布目录是否同一个文件 |
+
+**`.gitignore` 已忽略** `release_GeoGUIDemo_x64`、`build_x64`、`_ai_tmp`、`HalconDemo`，
+所以 zip 放在 `release_GeoGUIDemo_x64/` 里不会被误提交（可用 `git check-ignore -v <path>` 确认）。
