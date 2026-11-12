@@ -288,3 +288,9 @@ git push origin master 1.0.2
 
 **`.gitignore` 已忽略** `release_GeoGUIDemo_x64`、`build_x64`、`_ai_tmp`、`HalconDemo`，
 所以 zip 放在 `release_GeoGUIDemo_x64/` 里不会被误提交（可用 `git check-ignore -v <path>` 确认）。
+
+
+## 加密软件是参照进程和扩展名来加密的
+例如 a.txt 对应的正常读取进程是cat.exe/cmd.exe/notepad.exe/code.exe...
+a.zip/7z 对应的正常读取进程是7z.exe zip.exe这些
+可以用进程伪装成7z.exe读取a.zip/7z明文，之后输出成a.zip1 a.7z1，这样就是明文没有被加密，仅仅是扩展名变了

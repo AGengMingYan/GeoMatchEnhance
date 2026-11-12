@@ -227,6 +227,9 @@ namespace
         cfg.scoreMode  = (int)gArgD(a, "-score-mode", 1);
         cfg.minCoverage = (float)gArgD(a, "-min-cover", 0.0);
         cfg.boxMode    = (int)gArgD(a, "-box", 0);
+        cfg.showContour   = !gFlag(a, "-no-contour");
+        cfg.showPoints    = gFlag(a, "-show-points");
+        cfg.showGradients = gFlag(a, "-show-grads");
         m.setConfig(cfg);
 
         Timing tm;
@@ -310,6 +313,9 @@ int main(int argc, char** argv)
     cfg.scoreMode   = (int)gArgD(args, "-score-mode", 1);
     cfg.minCoverage = (float)gArgD(args, "-min-cover", 0.0);
     cfg.boxMode     = (int)gArgD(args, "-box", 0);
+    cfg.showContour   = !gFlag(args, "-no-contour");
+    cfg.showPoints    = gFlag(args, "-show-points");
+    cfg.showGradients = gFlag(args, "-show-grads");
 
     const double angleExtentDeg = gArgD(args, "-angle", 360.0);
     applyModelRange(cfg, args);
@@ -388,6 +394,9 @@ int main(int argc, char** argv)
         merged.scoreMode   = cfg.scoreMode;
         merged.minCoverage = cfg.minCoverage;
         merged.boxMode     = cfg.boxMode;
+        merged.showContour   = cfg.showContour;
+        merged.showPoints    = cfg.showPoints;
+        merged.showGradients = cfg.showGradients;
         // the search range is only overridden when it was asked for explicitly
         if (gHas(args, "-angle"))
         {

@@ -365,6 +365,9 @@ struct App
     float minCoverage    = 0.f;         // 0 = 关闭。 模型点里"梯度方向一致"的最低占比,
                                         // 用来剔除调低最小分数后冒出来的相似位置
     int   boxMode        = 0;           // 结果框样式: 0 = 固定方框(默认), 1 = 旋转框, 2 = 模型凸包
+    bool  showContour    = true;        // 画模型轮廓折线(Halcon 风格, 默认开)
+    bool  showPoints     = false;       // 画采样点(红点)
+    bool  showGradients  = false;       // 画梯度箭头(黄)
     bool  autoRun        = true;       // 参数改完自动重建模板 + 重匹配
     bool  liveUpdate     = true;       // 拖动滑块的过程中就实时刷新
     float zoom           = 1.0f;       // 1 = 适应窗口
@@ -449,6 +452,9 @@ struct App
         c.scoreMode    = scoreMode;
         c.minCoverage  = minCoverage;
         c.boxMode      = boxMode;
+        c.showContour    = showContour;
+        c.showPoints     = showPoints;
+        c.showGradients  = showGradients;
         return c;
     }
 
@@ -1011,6 +1017,14 @@ static void textDimWrapped(const char* s)
     ImGui::PopStyleColor();
 }
 
+// 橙色警告 + 自动换行，用于"这么调会明显变慢/变差"的提示
+static void textWarnWrapped(const char* s)
+{
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.70f, 0.25f, 1.0f));
+    ImGui::TextWrapped("%s", s);
+    ImGui::PopStyleColor();
+}
+
 static bool sliderF(const char* label, float* v, float lo, float hi, const char* fmt, bool& commit)
 {
     itemWidthForLabel(label);
@@ -1136,6 +1150,13 @@ static void drawPanel()
 
         changedModel |= sliderI("最大点数", &a.maxPoints, 100, 4000, commitModel);
         changedModel |= sliderI("金字塔层数(0=自动)", &a.numLevels, 0, 8, commitModel);
+        if (a.numLevels == 1)
+        {
+            // 1 层 = 放弃由粗到精，粗扫描直接跑在全分辨率上(实测慢 130 倍)，
+            // 而最终位姿和分数本来就在 level 0 上重算，精度一点都不会提高。
+            textWarnWrapped("层数 = 1 会退化成全分辨率暴力搜索，比 3 层慢约 130 倍，"
+                            "而且匹配结果完全相同(最终精度始终在 level 0 上算)。建议改回 0(自动)。");
+        }
         textDimWrapped("低阈值决定\"哪些边弱到可以放弃\"，高阈值是滞后起点，两者之间相连的弱边会被保住。"
                        "低阈值拉大 = 从弱边开始逐圈啃掉特征(类似腐蚀)；拉到 255 特征全消失。");
         endGroup();
@@ -1340,8 +1361,26 @@ static void drawPanel()
     }
 
     //---- 界面选项 ----
-    if (group("界面选项", false))
+    if (group("界面选项", true))
     {
+        // 结果图里画什么，只影响显示，不影响匹配
+        if (ImGui::Checkbox("显示模型轮廓(折线)", &a.showContour))
+        {
+            changedSearch = true;
+            commitSearch  = true;
+        }
+        if (fitsOnLine(checkWidth("显示采样点"))) ImGui::SameLine();
+        if (ImGui::Checkbox("显示采样点", &a.showPoints))
+        {
+            changedSearch = true;
+            commitSearch  = true;
+        }
+        if (ImGui::Checkbox("显示梯度箭头", &a.showGradients))
+        {
+            changedSearch = true;
+            commitSearch  = true;
+        }
+        textDimWrapped("默认只画模型轮廓（Halcon 风格）。采样点和梯度箭头会盖住 1 像素宽的轮廓，按需开启。");
         ImGui::Checkbox("参数改动后自动刷新", &a.autoRun);
         ImGui::Checkbox("拖动时实时刷新", &a.liveUpdate);
         itemWidthForLabel("显示缩放");

@@ -359,6 +359,7 @@ cv::Mat Matcher::drawResult(const cv::Mat& gray, const std::vector<Detection>& d
     cv::Mat tplMask(core_->getModelGray().size(), CV_8U, cv::Scalar(255));
     const cv::Point2f tplCtr = core_->modelCenter();
     const std::vector<ModelPoint>& modelPts = core_->modelPoints(0);
+    const std::vector<std::vector<cv::Point>>& modelChains = core_->modelChains(0);
 
     for (size_t k = 0; k < dets.size(); k++)
     {
@@ -383,18 +384,57 @@ cv::Mat Matcher::drawResult(const cv::Mat& gray, const std::vector<Detection>& d
         cv::addWeighted(vis, 0.55, warped, 0.45, 0, blended);
         blended.copyTo(vis, wmask);
 
-        //---- 2) model edge points and their gradient arrows -------------
-        for (const ModelPoint& mp : modelPts)
+        //---- 2) the model, drawn as contours like Halcon ------------------
+        // Same pose mapping the points use: searchPos = pos + s*R*p.
+        // A model written by an old version has no chains; fall back to the
+        // dots in that case so the result is never left unmarked.
+        const bool haveChains = !modelChains.empty();
+        if (cfg_.showContour && haveChains)
         {
-            const float x = s * (mp.x * ca + mp.y * sa) + d.pos.x;
-            const float y = s * (-mp.x * sa + mp.y * ca) + d.pos.y;
-            cv::circle(vis, cv::Point(cvRound(x), cvRound(y)), 1,
-                       cv::Scalar(0, 0, 255), -1, cv::LINE_AA);
-            const float gx = mp.gx * ca + mp.gy * sa;
-            const float gy = -mp.gx * sa + mp.gy * ca;
-            const float gn = std::sqrt(gx * gx + gy * gy);
-            if (gn > 1e-3f)
+            // Halcon draws the contour 1 px wide; keep it thin so the model
+            // reads as an outline instead of a filled blob.
+            const int thick = (s >= 2.0f) ? 2 : 1;
+            std::vector<cv::Point> poly;
+            for (size_t c = 0; c < modelChains.size(); c++)
             {
+                const std::vector<cv::Point>& ch = modelChains[c];
+                if (ch.size() < 2) continue;
+                poly.clear();
+                poly.reserve(ch.size());
+                for (size_t i = 0; i < ch.size(); i++)
+                {
+                    const float px = (float)ch[i].x, py = (float)ch[i].y;
+                    poly.push_back(cv::Point(
+                        cvRound(s * (px * ca + py * sa) + d.pos.x),
+                        cvRound(s * (-px * sa + py * ca) + d.pos.y)));
+                }
+                cv::polylines(vis, poly, false, col, thick, cv::LINE_AA);
+            }
+        }
+
+        //---- 2b) sampled scoring points (opt-in) --------------------------
+        if (cfg_.showPoints || (cfg_.showContour && !haveChains))
+        {
+            for (const ModelPoint& mp : modelPts)
+            {
+                const float x = s * (mp.x * ca + mp.y * sa) + d.pos.x;
+                const float y = s * (-mp.x * sa + mp.y * ca) + d.pos.y;
+                cv::circle(vis, cv::Point(cvRound(x), cvRound(y)), 1,
+                           cv::Scalar(0, 0, 255), -1, cv::LINE_AA);
+            }
+        }
+
+        //---- 2c) gradient arrows (opt-in, annotation only) ----------------
+        if (cfg_.showGradients)
+        {
+            for (const ModelPoint& mp : modelPts)
+            {
+                const float x = s * (mp.x * ca + mp.y * sa) + d.pos.x;
+                const float y = s * (-mp.x * sa + mp.y * ca) + d.pos.y;
+                const float gx = mp.gx * ca + mp.gy * sa;
+                const float gy = -mp.gx * sa + mp.gy * ca;
+                const float gn = std::sqrt(gx * gx + gy * gy);
+                if (gn <= 1e-3f) continue;
                 const cv::Point2f dir(gx / gn * 5.f, gy / gn * 5.f);
                 cv::line(vis, cv::Point2f(x, y), cv::Point2f(x, y) + dir,
                          cv::Scalar(0, 255, 255), 1, cv::LINE_AA);
@@ -470,8 +510,10 @@ cv::Mat Matcher::drawResult(const cv::Mat& gray, const std::vector<Detection>& d
                         : (cfg_.boxMode == 2) ? "hull" : "fixed";
     std::ostringstream hdr;
     hdr << "matches=" << dets.size()
-        << "   |  box(" << boxName << ")  green=#0 orange=others"
-        << "   red = scoring point   yellow = gradient";
+        << "   |  box(" << boxName << ")  green=#0 orange=others";
+    if (cfg_.showContour) hdr << "   contour=model";
+    if (cfg_.showPoints)  hdr << "   red=points";
+    if (cfg_.showGradients) hdr << "   yellow=gradient";
     cv::rectangle(vis, cv::Rect(0, 0, vis.cols, 24), cv::Scalar(0, 0, 0), -1);
     cv::putText(vis, hdr.str(), cv::Point(6, 17),
                 cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 255), 1, cv::LINE_AA);

@@ -94,6 +94,14 @@ struct Config
     //       polygon that only looks tidy when the model covers 4 corners)
     int    boxMode      = 0;
 
+    // what is drawn inside the box.  Defaults reproduce Halcon's
+    // dev_display_shape_matching_results(): the model contour as a polyline,
+    // nothing else.  The arrows and the dots are opt-in because a 1 px
+    // contour disappears under them.
+    bool   showContour  = true;   // model contour polylines at the pose
+    bool   showPoints   = false;  // the sampled scoring points (red dots)
+    bool   showGradients = false; // gradient arrows (yellow)
+
     // build the corresponding low level parameter structs
     MatchParams toMatchParams() const;
     FindParams  toFindParams() const;
