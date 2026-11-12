@@ -46,6 +46,18 @@
 #endif
 
 //-----------------------------------------------------------------------
+//  两个角度的最短角差（归一化到 [0, PI]），处理 ±180° 环绕。
+//  +180° 和 -180° 其实是同一个位姿，直接相减会得到约 2*PI（约 6.28 rad），
+//  去重时会误判成两个不同的结果；这里折叠到 [0, PI] 后约等于 0。
+//-----------------------------------------------------------------------
+static inline double angleDiffWrapped(double a, double b)
+{
+    double d = std::abs(a - b);
+    while (d > CV_PI) d -= 2.0 * CV_PI;
+    return d;
+}
+
+//-----------------------------------------------------------------------
 //  IEEE-754 half (FP16) helpers.
 //  The normalised gradients of the search image are stored as halves so the
 //  scan loop, which is memory bound, moves only half the bytes.
@@ -1188,6 +1200,22 @@ namespace
             return cnt > 0 ? sum / cnt : 0.f;
         }
 
+        if (mode == 3)   // clipped-mean: same sum as mode 1, but n stays in the
+                         // denominator, so a pose that only covers half of the
+                         // model cannot reach a high score the way mode 1 can
+        {
+            float sum = 0.f;
+            for (int k = 0; k < n; k++)
+            {
+                const uint16_t* rx = sx.ptr<uint16_t>(ay + poy[k]);
+                const uint16_t* ry = sy.ptr<uint16_t>(ay + poy[k]);
+                float d = pnx[k] * f16ToF32(rx[ax + pox[k]]) +
+                          pny[k] * f16ToF32(ry[ax + pox[k]]);
+                if (d > 0.f) sum += d;
+            }
+            return sum / n;
+        }
+
         // mode 2: trimmed-mean, drop the worst 10% of points
         std::vector<float> dots;
         dots.reserve(n);
@@ -1209,6 +1237,38 @@ namespace
         float s = 0.f;
         for (int i = trim; i < n - trim; i++) s += dots[i];
         return s / (n - 2 * trim);
+    }
+
+    // one pass over the model points, returning everything the final
+    // verification needs:
+    //   mean     - the plain score the search used (n in the denominator)
+    //   clipped  - sum of the positive terms / n  (mode 3)
+    //   coverage - fraction of points with dot > 0
+    // mode 1 (positive-mean) is clipped/coverage; it is kept as a separate
+    // function because the search and the refine path compare against it.
+    struct PoseScore { float mean, clipped, coverage; };
+
+    inline PoseScore scorePoseDetail(const cv::Mat& sx, const cv::Mat& sy, const XForm& xf,
+                                     int ay, int ax)
+    {
+        const int n = xf.n;
+        float sum = 0.f, posSum = 0.f;
+        int   cnt = 0;
+        for (int k = 0; k < n; k++)
+        {
+            const uint16_t* rx = sx.ptr<uint16_t>(ay + xf.oy[k]);
+            const uint16_t* ry = sy.ptr<uint16_t>(ay + xf.oy[k]);
+            const float d = xf.nx[k] * f16ToF32(rx[ax + xf.ox[k]]) +
+                            xf.ny[k] * f16ToF32(ry[ax + xf.ox[k]]);
+            sum += d;
+            if (d > 0.f) { posSum += d; cnt++; }
+        }
+        PoseScore ps;
+        const float inv = n > 0 ? 1.f / (float)n : 0.f;
+        ps.mean     = sum * inv;
+        ps.clipped  = posSum * inv;
+        ps.coverage = (float)cnt * inv;
+        return ps;
     }
 }
 
@@ -1364,7 +1424,7 @@ void ShapeMatcher::refineLevel(int level, std::vector<Candidate>& cands,
         {
             const Candidate& o = cands[j];
             if (std::abs(c.pos.x - o.pos.x) <= 3.f && std::abs(c.pos.y - o.pos.y) <= 3.f &&
-                std::abs(c.angle - o.angle) <= 1e-4f + (float)levelAngleStep_[level] &&
+                angleDiffWrapped(c.angle, o.angle) <= 1e-4f + (float)levelAngleStep_[level] &&
                 std::abs(c.scale - o.scale) <= 1e-4f + (float)levelScaleStep_[level] * 0.5f)
             {
                 dup = true; break;
@@ -1767,7 +1827,7 @@ std::vector<MatchResult> ShapeMatcher::findShapeModel(const cv::Mat& gray, const
             {
                 const Candidate& o = cands[j];
                 if (std::abs(c.pos.x - o.pos.x) <= 3.f && std::abs(c.pos.y - o.pos.y) <= 3.f &&
-                    std::abs(c.angle - o.angle) <= 1e-4f + (float)levelAngleStep_[top] &&
+                    angleDiffWrapped(c.angle, o.angle) <= 1e-4f + (float)levelAngleStep_[top] &&
                     std::abs(c.scale - o.scale) <= 1e-4f + (float)levelScaleStep_[top] * 0.5f)
                 {
                     dup = true; break;
@@ -1815,7 +1875,7 @@ std::vector<MatchResult> ShapeMatcher::findShapeModel(const cv::Mat& gray, const
         {
             const MatchResult& o = results[j];
             if (cv::norm(c.pos - o.pos) < minD &&
-                std::abs(c.angle - o.angle) < 0.35 &&
+                angleDiffWrapped(c.angle, o.angle) < 0.35 &&
                 std::abs(c.scale - o.scale) < 0.12)
             {
                 dup = true; break;
@@ -1836,7 +1896,10 @@ std::vector<MatchResult> ShapeMatcher::findShapeModel(const cv::Mat& gray, const
     // the search / refine used mean (scorePos); if a different score mode is
     // requested, re-aggregate the per-point dot products at the found pose.
     // this only changes the reported confidence, never the pose.
-    if (fp.scoreMode != 0 && !results.empty())
+    // minCoverage rides along: the same pass also yields the fraction of
+    // model points that agree, which is what separates a real instance from a
+    // look-alike spot on a repetitive pattern.
+    if ((fp.scoreMode != 0 || fp.minCoverage > 0.f) && !results.empty())
     {
         int64 trs0 = cv::getTickCount();
         for (MatchResult& r : results)
@@ -1858,11 +1921,34 @@ std::vector<MatchResult> ShapeMatcher::findShapeModel(const cv::Mat& gray, const
             int ax = cvRound(r.pos.x), ay = cvRound(r.pos.y);
             ax = std::min(std::max(ax, xf.R), srcGx_[0].cols - 1 - xf.R);
             ay = std::min(std::max(ay, xf.R), srcGx_[0].rows - 1 - xf.R);
-            r.score = scorePosMode(srcGx_[0], srcGy_[0], xf, ay, ax, fp.scoreMode);
+
+            const PoseScore ps = scorePoseDetail(srcGx_[0], srcGy_[0], xf, ay, ax);
+            r.coverage = ps.coverage;
+            if (fp.scoreMode == 2)          // trimmed-mean needs the sorted dots
+                r.score = scorePosMode(srcGx_[0], srcGy_[0], xf, ay, ax, 2);
+            else if (fp.scoreMode == 0)     // mean: identical to the search score
+                r.score = ps.mean;
+            else if (fp.scoreMode == 1)     // positive-mean
+                r.score = ps.coverage > 0.f ? ps.clipped / ps.coverage : 0.f;
+            else                            // any other mode, i.e. 3 = clipped-mean
+                r.score = ps.clipped;
         }
         std::sort(results.begin(), results.end(),
                   [](const MatchResult& a, const MatchResult& b)
                   { return a.score > b.score; });
+
+        // drop the matches that only cover part of the model.  Runs after the
+        // sort so the survivors stay ordered; a match that fails here is not
+        // replaced by a lower-ranked one, so results can be fewer than
+        // maxMatches - which is the whole point of the filter.
+        if (fp.minCoverage > 0.f)
+        {
+            std::vector<MatchResult> keep;
+            keep.reserve(results.size());
+            for (const MatchResult& r : results)
+                if (r.coverage >= fp.minCoverage) keep.push_back(r);
+            results.swap(keep);
+        }
         phRescore = msSince(trs0);
     }
 

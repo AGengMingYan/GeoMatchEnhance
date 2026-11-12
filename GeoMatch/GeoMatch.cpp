@@ -57,6 +57,7 @@ FindParams Config::toFindParams() const
     p.useOpenCL  = useOpenCL;
     p.debug      = debug;
     p.scoreMode  = scoreMode;
+    p.minCoverage = minCoverage;
     return p;
 }
 
@@ -361,8 +362,10 @@ cv::Mat Matcher::drawResult(const cv::Mat& gray, const std::vector<Detection>& d
 
         //---- 4) caption below the matched box ---------------------------
         std::ostringstream cap;
-        cap << "#" << k << "  s=" << std::fixed << std::setprecision(3) << d.score
-            << "  a=" << std::setprecision(1) << (d.angle * 180.0 / CV_PI) << "deg"
+        cap << "#" << k << "  s=" << std::fixed << std::setprecision(3) << d.score;
+        if (d.coverage > 0.f)                       // only when the caller computed it
+            cap << "  c=" << std::setprecision(2) << d.coverage;
+        cap << "  a=" << std::setprecision(1) << (d.angle * 180.0 / CV_PI) << "deg"
             << "  k=" << std::setprecision(3) << d.scale;
         std::string txt = cap.str();
         cv::Size ts = cv::getTextSize(txt, cv::FONT_HERSHEY_SIMPLEX, 0.5, 1, nullptr);

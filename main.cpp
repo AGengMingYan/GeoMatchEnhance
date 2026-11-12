@@ -72,6 +72,16 @@ namespace
         return def;
     }
 
+    // true when the switch is present at all, with or without a value.
+    // used to tell "the user asked for this" from "the default was used",
+    // which matters for -load: the model carries its own angle/scale range.
+    bool gHas(const std::vector<std::string>& a, const std::string& key)
+    {
+        for (size_t i = 0; i < a.size(); i++)
+            if (a[i] == key) return true;
+        return false;
+    }
+
     void printStats(const char* name, const Stats& s)
     {
         std::cout << "  " << std::left << std::setw(11) << name
@@ -215,6 +225,7 @@ namespace
         cfg.useOpenCL  = (int)gArgD(a, "-ocl", 1) != 0;
         cfg.debug      = (int)gArgD(a, "-debug", 0);
         cfg.scoreMode  = (int)gArgD(a, "-score-mode", 1);
+        cfg.minCoverage = (float)gArgD(a, "-min-cover", 0.0);
         m.setConfig(cfg);
 
         Timing tm;
@@ -235,8 +246,10 @@ namespace
         {
             const Detection& d = dets[k];
             std::cout << "        #" << k
-                      << "  score=" << std::setprecision(3) << d.score
-                      << "  pos=(" << (int)d.pos.x << ";" << (int)d.pos.y << ")"
+                      << "  score=" << std::setprecision(3) << d.score;
+            if (d.coverage > 0.f)
+                std::cout << "  cover=" << std::setprecision(2) << d.coverage;
+            std::cout << "  pos=(" << (int)d.pos.x << ";" << (int)d.pos.y << ")"
                       << "  angle=" << std::setprecision(1) << (d.angle * 180.0 / CV_PI)
                       << "deg  scale=" << std::setprecision(3) << d.scale << "\n";
         }
@@ -294,6 +307,7 @@ int main(int argc, char** argv)
     cfg.useOpenCL   = (int)gArgD(args, "-ocl", 1) != 0;
     cfg.debug       = (int)gArgD(args, "-debug", 0);
     cfg.scoreMode   = (int)gArgD(args, "-score-mode", 1);
+    cfg.minCoverage = (float)gArgD(args, "-min-cover", 0.0);
 
     const double angleExtentDeg = gArgD(args, "-angle", 360.0);
     applyModelRange(cfg, args);
@@ -357,6 +371,29 @@ int main(int argc, char** argv)
                   << "  levels = " << matcher.numLevels()
                   << "  time = " << std::fixed << std::setprecision(1)
                   << (cv::getTickCount() - t0) * 1000.0 / cv::getTickFrequency() << " ms\n";
+
+        // The model carries its own angle/scale range, but every SEARCH setting
+        // has to come from the command line.  Without this the -minscore /
+        // -score-mode / -min-cover / -max values were parsed and then thrown
+        // away, because Matcher::load() resets the config to its defaults.
+        Config merged = matcher.config();
+        merged.minScore    = cfg.minScore;
+        merged.maxMatches  = cfg.maxMatches;
+        merged.minContrast = cfg.minContrast;
+        merged.contrast    = cfg.contrast;
+        merged.useOpenCL   = cfg.useOpenCL;
+        merged.debug       = cfg.debug;
+        merged.scoreMode   = cfg.scoreMode;
+        merged.minCoverage = cfg.minCoverage;
+        // the search range is only overridden when it was asked for explicitly
+        if (gHas(args, "-angle"))
+        {
+            merged.angleStart  = cfg.angleStart;
+            merged.angleExtent = cfg.angleExtent;
+        }
+        if (gHas(args, "-smin")) merged.scaleMin = cfg.scaleMin;
+        if (gHas(args, "-smax")) merged.scaleMax = cfg.scaleMax;
+        matcher.setConfig(merged);
     }
     else
     {
@@ -486,8 +523,10 @@ int main(int argc, char** argv)
                 for (size_t k = 0; k < p.detections->size(); k++)
                 {
                     const Detection& d = (*p.detections)[k];
-                    printf("    #%zu  s=%.3f  a=%.1fdeg  k=%.3f  pos=(%d;%d)\n",
-                           k, d.score, d.angle * 180.0 / CV_PI, d.scale,
+                    printf("    #%zu  s=%.3f", k, d.score);
+                    if (d.coverage > 0.f) printf("  c=%.2f", d.coverage);
+                    printf("  a=%.1fdeg  k=%.3f  pos=(%d;%d)\n",
+                           d.angle * 180.0 / CV_PI, d.scale,
                            (int)d.pos.x, (int)d.pos.y);
                 }
         });

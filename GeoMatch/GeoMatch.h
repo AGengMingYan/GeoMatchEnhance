@@ -75,7 +75,14 @@ struct Config
     bool   useOpenCL    = true;
     int    debug        = 0;
     int    scoreMode    = 1;    // final score aggregation: 1 = positive-mean (default),
-                                // 0 = mean, 2 = trimmed-mean(10%).
+                                // 0 = mean, 2 = trimmed-mean(10%), 3 = clipped-mean
+                                // (positive terms only, but n stays in the
+                                // denominator -> no inflation on partial matches).
+    float  minCoverage  = 0.f;  // 0 = off.  Minimum fraction of the model points
+                                // whose gradient agrees at the reported pose.
+                                // The cheapest way to reject the look-alike
+                                // positions that appear when minScore is lowered
+                                // on repetitive patterns.
 
     // build the corresponding low level parameter structs
     MatchParams toMatchParams() const;
@@ -91,10 +98,12 @@ struct Detection
     float       angle = 0.f;   // radians
     float       scale = 1.f;
     float       score = 0.f;
+    float       coverage = 0.f; // fraction of model points that agree (0 when not computed)
 
     Detection() {}
     Detection(const MatchResult& r)
-        : pos(r.pos), angle(r.angle), scale(r.scale), score(r.score) {}
+        : pos(r.pos), angle(r.angle), scale(r.scale), score(r.score),
+          coverage(r.coverage) {}
 };
 
 //-----------------------------------------------------------------------

@@ -37,6 +37,10 @@ struct MatchResult
     float       angle; // radians
     float       scale;
     float       score;
+    // fraction of the model points whose gradient agrees with the image
+    // (dot product > 0) at the reported pose.  Filled in when scoreMode != 0
+    // or minCoverage > 0; 0 otherwise.  See FindParams::minCoverage.
+    float       coverage = 0.f;
 };
 
 struct ModelPoint
@@ -78,9 +82,17 @@ struct FindParams
     bool   useOpenCL   = true;
     int    debug       = 0;
     int    scoreMode   = 1;    // final score aggregation: 1 = positive-mean (default),
-                               // 0 = mean, 2 = trimmed-mean(10%).
+                               // 0 = mean, 2 = trimmed-mean(10%), 3 = clipped-mean.
                                // search/refine always use mean; this only
                                // re-scores the final matches.
+    // 0 = off.  Reject a match whose model points are only partly present:
+    // coverage = (#points with dot > 0) / n must be >= minCoverage.
+    // This is the cheap answer to "lower minScore and every repetitive
+    // structure on the part scores high": a wrong position still matches a
+    // large part of the model (high mean / high positive-mean) but leaves a
+    // big fraction of the points contradicting it, and coverage falls.
+    // Costs one extra n-point pass per reported match.
+    float  minCoverage = 0.f;
 };
 
 class SHAPEMATCH_API ShapeMatcher

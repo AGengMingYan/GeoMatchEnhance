@@ -352,6 +352,9 @@ struct App
     bool  subpixel       = true;
     bool  useOpenCL      = true;
     int   scoreMode      = 1;           // 1 = positive-mean(默认), 0 = mean, 2 = trimmed-mean
+                                        // 3 = clipped-mean(只算正向但不缩分母, 部分匹配不上高分)
+    float minCoverage    = 0.f;         // 0 = 关闭。 模型点里"梯度方向一致"的最低占比,
+                                        // 用来剔除调低最小分数后冒出来的相似位置
     bool  autoRun        = true;       // 参数改完自动重建模板 + 重匹配
     bool  liveUpdate     = true;       // 拖动滑块的过程中就实时刷新
     float zoom           = 1.0f;       // 1 = 适应窗口
@@ -419,6 +422,7 @@ struct App
         c.useOpenCL    = useOpenCL;
         c.debug        = 0;
         c.scoreMode    = scoreMode;
+        c.minCoverage  = minCoverage;
         return c;
     }
 
@@ -439,6 +443,7 @@ struct App
         subpixel    = c.subpixel != 0;
         useOpenCL   = c.useOpenCL;
         scoreMode   = c.scoreMode;
+        minCoverage = c.minCoverage;
     }
 };
 
@@ -1172,14 +1177,20 @@ static void drawPanel()
     changedSearch |= sliderF("最小间距(px)", &a.minDistance, 0.f, 300.f, "%.0f", commitSearch);
     changedSearch |= sliderF("贪婪度", &a.greediness, 0.3f, 1.f, "%.2f", commitSearch);
     {
-        const char* items[] = { "mean(原始)", "positive-mean(方向一致点比例)", "trimmed-mean(去尾10%)" };
+        const char* items[] = { "mean(原始)", "positive-mean(方向一致点比例)",
+                                "trimmed-mean(去尾10%)", "clipped-mean(正向但不缩分母)" };
         itemWidthForLabel("评分方式");
-        if (ImGui::Combo("评分方式", &a.scoreMode, items, 3))
+        if (ImGui::Combo("评分方式", &a.scoreMode, items, 4))
         {
             changedSearch = true;
             commitSearch  = true;
         }
     }
+    changedSearch |= sliderF("最小覆盖率", &a.minCoverage, 0.f, 1.f, "%.2f", commitSearch);
+    if (a.minCoverage > 0.f)
+        textDimWrapped("0 = 关闭。覆盖率 = 模型点里梯度方向一致的占比，结果表新增的\"覆盖\"列就是它。"
+                       "调低最小分数后冒出来的相似结构通常能拿高分，但只对上模型的一部分，覆盖率明显偏低。"
+                       "本机 case1(十字)实测：真实位置 0.99，相似位置 0.62~0.63，建议 0.75~0.90。");
     if (ImGui::Checkbox("亚像素", &a.subpixel)) { changedSearch = true; commitSearch = true; }
     if (fitsOnLine(checkWidth("OpenCL"))) ImGui::SameLine();
     if (ImGui::Checkbox("OpenCL", &a.useOpenCL))
@@ -1244,12 +1255,13 @@ static void drawPanel()
     else
         ImGui::TextWrapped("搜索总耗时 %.2f ms (%d 次)", a.searchTotalMs, nLoops);
 
-    if (ImGui::BeginTable("##dets", 5,
+    if (ImGui::BeginTable("##dets", 6,
                           ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY,
                           ImVec2(-1, 160)))
     {
         ImGui::TableSetupColumn("#",    ImGuiTableColumnFlags_WidthFixed, 26);
         ImGui::TableSetupColumn("分数", ImGuiTableColumnFlags_WidthFixed, 52);
+        ImGui::TableSetupColumn("覆盖", ImGuiTableColumnFlags_WidthFixed, 44);
         ImGui::TableSetupColumn("位置", ImGuiTableColumnFlags_WidthStretch);
         ImGui::TableSetupColumn("角度", ImGuiTableColumnFlags_WidthFixed, 60);
         ImGui::TableSetupColumn("缩放", ImGuiTableColumnFlags_WidthFixed, 48);
@@ -1260,9 +1272,12 @@ static void drawPanel()
             ImGui::TableNextRow();
             ImGui::TableSetColumnIndex(0); ImGui::Text("%d", (int)i);
             ImGui::TableSetColumnIndex(1); ImGui::Text("%.3f", d.score);
-            ImGui::TableSetColumnIndex(2); ImGui::Text("%.0f, %.0f", d.pos.x, d.pos.y);
-            ImGui::TableSetColumnIndex(3); ImGui::Text("%.1f", d.angle * 180.0f / (float)CV_PI);
-            ImGui::TableSetColumnIndex(4); ImGui::Text("%.2f", d.scale);
+            ImGui::TableSetColumnIndex(2);
+            if (d.coverage > 0.f) ImGui::Text("%.2f", d.coverage);
+            else                  ImGui::TextDisabled("-");
+            ImGui::TableSetColumnIndex(3); ImGui::Text("%.0f, %.0f", d.pos.x, d.pos.y);
+            ImGui::TableSetColumnIndex(4); ImGui::Text("%.1f", d.angle * 180.0f / (float)CV_PI);
+            ImGui::TableSetColumnIndex(5); ImGui::Text("%.2f", d.scale);
         }
         ImGui::EndTable();
     }

@@ -136,6 +136,7 @@ void printModelInfo(const geomatch::Matcher& m, const std::string& file)
            c.minContrast, c.maxPoints, c.numLevels);
     printf("搜索参数    : minScore=%.2f  maxMatches=%d  minDist=%.0f  greedy=%.2f  subpixel=%d\n",
            c.minScore, c.maxMatches, c.minDistance, c.greediness, c.subpixel);
+    printf("评分/过滤   : scoreMode=%d  minCoverage=%.2f\n", c.scoreMode, c.minCoverage);
     printf("==============================================\n\n");
 }
 
@@ -466,7 +467,8 @@ int main(int argc, char** argv)
     if (argc < 3)
     {
         printf("用法: AnalyzeCase <图片目录> <模型文件> [--min-score X] [--limit N] "
-               "[--dump 目录] [--probe N] [--cpu] [--sweep] [--mask 掩码图] [--min-dist X] [--score-mode N]\n");
+               "[--dump 目录] [--probe N] [--cpu] [--sweep] [--mask 掩码图] [--min-dist X] [--score-mode N] "
+               "[--min-cover X]\n");
         return 1;
     }
 
@@ -474,7 +476,8 @@ int main(int argc, char** argv)
     std::string model = argv[2];
     double minScore   = 0.5;
     double minDist    = 0.0;     // 0 = 用模型默认值
-    int    scoreMode  = 1;       // 1 = positive-mean(默认), 0 = mean, 2 = trimmed-mean
+    int    scoreMode  = 1;       // 1 = positive-mean(默认), 0 = mean, 2 = trimmed-mean, 3 = clipped-mean
+    double minCover   = 0.0;     // >0: 丢掉覆盖率低于它的结果(0 = 关闭)
     int    limit      = 0;
     int    probeN     = 0;
     int    topN       = 0;
@@ -491,6 +494,7 @@ int main(int argc, char** argv)
         if      (a == "--min-score") minScore = atof(next().c_str());
         else if (a == "--min-dist")  minDist  = atof(next().c_str());
         else if (a == "--score-mode") scoreMode = atoi(next().c_str());
+        else if (a == "--min-cover") minCover  = atof(next().c_str());
         else if (a == "--limit")     limit    = atoi(next().c_str());
         else if (a == "--probe")     probeN   = atoi(next().c_str());
         else if (a == "--dump")      dumpDir  = next();
@@ -510,13 +514,13 @@ int main(int argc, char** argv)
         fprintf(stderr, "加载模型失败: %s\n", model.c_str());
         return 2;
     }
-    printModelInfo(m, model);
 
     geomatch::Config cfg   = m.config();
     cfg.minScore  = minScore;
     cfg.useOpenCL = useOCL;
     if (minDist > 0) cfg.minDistance = minDist;
     cfg.scoreMode = scoreMode;
+    cfg.minCoverage = (float)minCover;      // 0 = 关闭; 见 FindParams::minCoverage
 
     // >0: 丢掉文件里的模型, 用模板图按指定点数重建
     if (points > 0)
@@ -537,10 +541,13 @@ int main(int argc, char** argv)
             if (cfg.mask.empty()) { fprintf(stderr, "掩码读不出来: %s\n", maskFile.c_str()); return 2; }
         }
         if (!m.create(tpl, cfg)) { fprintf(stderr, "建模板失败\n"); return 2; }
-        printModelInfo(m, std::string("重建: maxPoints=") + std::to_string(points));
     }
 
     m.setConfig(cfg);
+    // 打印必须在 setConfig 之后，否则看到的是模型自带的默认搜索参数
+    printModelInfo(m, model);
+    if (points > 0)
+        printf("重建模型: maxPoints=%d\n", points);
     printModelPoints(m);
 
     //---------------- 图片列表 ----------------
