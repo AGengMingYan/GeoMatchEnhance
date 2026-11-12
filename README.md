@@ -552,6 +552,27 @@ GeoMatchDemo -t case1/temp.jpg -d case1 -o case1/out -loops 5
 > 层数也不是越大越好：`minSide = 24` 会截断（154×148 的模板最多 3 层，355×414 最多 4 层）；
 > 而且目标在粗层上可能糊掉，层数过多会漏掉候选。用 `0`（自动）即可。
 
+**这不是本项目的实现问题 —— Halcon 一样慢。** 本机用 Halcon 17 实测
+（`CreateShapeModel` 的 `NumLevels` 取 1/2/3/auto，同一模板 `case1/temp.jpg`、
+同一 1280×1024 搜索图、角度范围同为 ±5°）：
+
+| NumLevels | Halcon 实际层数 | Halcon FindShapeModel | 本项目搜索 |
+|---|---|---|---|
+| 1 | 1 | **476 / 465 ms** | **545 ms** |
+| 2 | 2 | 862 / 910 ms | 82 ms |
+| 3 | 3 | 34 / 33 ms | 10 ms |
+| auto | 4 | **5.3 / 5.8 ms** | 11.7 ms |
+
+- Halcon 从 auto 退到 1 层也是 **~88 倍**的惩罚（5.3 → 476 ms），与我们的 130 倍同量级；
+- 1 层时两者绝对耗时几乎打平（476 vs 545 ms），说明"1 层很慢"是**金字塔搜索的固有特性**，
+  不是谁写得更差；差距体现在多层上（Halcon auto 5.3 ms vs 我们 11.7 ms）；
+- 还有个反直觉的点：Halcon 的 `NumLevels=2` 比 `1` 更慢（862 vs 476 ms），
+  说明层数不是单调最优，**只能靠实测选，别猜**；
+- 四种设置下 Halcon 给出的 `score` 与 `pos` 完全相同（0.994 / (841.4; 673.8)），
+  再次印证"层数不影响精度，只影响速度"。
+
+复现工具：`build_x64/level_probe.exe`（本项目）、`build_x64/halcon_level_probe.exe`（Halcon 17 x86）。
+
 
 
 ### 对比度阈值：`minContrast` / `contrast` 的量纲与滞后判据
