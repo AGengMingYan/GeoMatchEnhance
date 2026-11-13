@@ -324,6 +324,9 @@ $t = $t.Replace(...)
 
 1. **改源码只用 `editor` 工具**（它的读写进程在白名单内，能拿到明文，也会写成编译器可读的形式）。
    全项目 700+ 次源码编辑都是 `editor` 干的，一次没坏过。
+
+
+
 2. 需要批量替换时，**拆成多个 `editor` 调用**（每次 ≤6000 字符），不要图省事用 PS/sed/python。
 3. `.cpp/.h` 用 PS 改坏后：`git checkout -- <file>` 先恢复成可编译状态，然后用 `editor` 重放改动。
 4. 判断源码是否被写坏：`[IO.File]::ReadAllBytes()` 的头如果是 `E0 A8 91` 且**字节数明显变大**，
@@ -415,3 +418,53 @@ Gitee私人令牌.txt
 > 读取必须用：`cat.exe 该文件 > xxx.json`
 > —— **输出要用 `.json` 等非 `.txt` 扩展名**，写 `.txt` 会被再次加密（实测）。
 > `tools/publish-release.ps1` 已内置这套自动解密，直接 `-File xxx.zip1` 即可。
+
+---
+
+### ImGui：控件挪进 Tab / 折叠分组后，"读标志再执行"的代码必须跟着挪到它后面
+
+2026-11-13 踩过：把 `GeoGUIDemo` 的参数面板拆成 5 个 Tab 之后，
+「参数改动 → 重建模板」全部失灵，连「创建模板」「执行匹配」按钮也没反应。
+
+**根因**是标志变量和"消费它的执行段"位置错位：
+
+```cpp
+static void drawPanel() {
+    bool needCreate = false;          // 每帧重新初始化
+    bool changedModel = false;
+
+    auto panelTplParams = [&]() {     // ① 只是定义，本帧不一定被调用
+        changedModel |= sliderF(...); // ② 切到该 Tab 时才置位
+    };
+
+    if (a.autoRun) {                  // ③ 错位：这段在 TabBar 之前
+        if (commitModel || changedModel) needCreate = true;
+    }
+    if (needCreate) createTemplate(a);  // ④ 读到的一直是 false
+
+    if (ImGui::BeginTabBar(...)) {    // ⑤ 这里才真正执行 lambda
+        if (ImGui::BeginTabItem("② 模板参数")) { panelTplParams(); ImGui::EndTabItem(); }
+        ImGui::EndTabBar();
+    }
+}   // 函数返回 -> lambda 里置位的标志直接丢失，永远不重建
+```
+
+**为什么难发现**：只有"函数返回后仍然为真"的来源才偶然生效（比如别处直接调了
+`createTemplate()`），所以表面症状是「有时行、有时不行」，不逐帧推演看不出来。
+
+**规则（对所有 ImGui 项目适用）：**
+
+1. 凡是「界面写标志 → 标志触发副作用」，**副作用代码必须放在所有
+   `BeginTabBar/EndTabBar`、`CollapsingHeader`、`BeginChild/EndChild` 之后**，
+   并且在同一个函数作用域内。
+2. 分页/折叠只改变"控件是否被绘制"，**不改变"标志何时被写"**；
+   只要标志是局部变量，就一定有这个陷阱。
+3. 更稳的写法：把标志做成 `App`/`State` 的成员（跨帧存活），
+   这样即使位置错了也只是延迟一帧，不会彻底失效 —— 但正确做法仍是第 1 条。
+4. 自检：在 `drawPanel()` 里查 `if (need`、`if (changed` 的行号，
+   确认都排在 `EndTabBar()` 之后。
+
+> 附带教训（同一次）：给 `.clinerules` 插内容时用 `insert_line` 很容易插进
+> 已有编号列表的中间把原文切断。**要么 `insert_line = 行数+1` 追加到末尾，
+> 要么用 `old_text` 精确匹配一个完整段落**，插完立刻回读该处确认。
+
