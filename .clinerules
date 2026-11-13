@@ -234,6 +234,7 @@ fix: improve right panel layout and add total search time
 | `cmd /c "cat.exe a.png.txt > a.png"` | `89 50 4E 47` **明文** | ✅ 可用（已验证多次） |
 
 **结论：白名单认得是 `powershell.exe` 的 .NET 文件 API 和 `cat.exe` 这类外部工具，
+
 不认 cmd.exe 的内建命令（echo），也不认 python / editor。**
 
 因此：
@@ -294,3 +295,31 @@ git push origin master 1.0.2
 例如 a.txt 对应的正常读取进程是cat.exe/cmd.exe/notepad.exe/code.exe...
 a.zip/7z 对应的正常读取进程是7z.exe zip.exe这些
 可以用进程伪装成7z.exe读取a.zip/7z明文，之后输出成a.zip1 a.7z1，这样就是明文没有被加密，仅仅是扩展名变了
+
+### 实测结论：`.zip` 在本机永远是加密落盘的，必须用 `.zip1`（2026-11-13 验证）
+
+对同一个用 .NET `ZipFile::CreateFromDirectory` 生成的包，做三路读数对比：
+
+| 文件名 | 磁盘大小(Get-Item) | python 读到 | `ReadAllBytes` 读到 |
+|---|---|---|---|
+| `x.zip1` | 27576718 | 27576718（`50 4B`） | 27576718（`50 4B`） |
+| `x.zip1` **改名**成 `x.zip` | 27580814 | 27576718 | 27580814（`E0 A8 91`，密文） |
+| 直接写 `x.zip` | 25062040 | 25057944（`50 4B`） | 25057944（`50 4B`） |
+
+**结论：只要文件名以 `.zip` 结尾，落盘就是密文**（改名也会立刻触发加密，体积还会变大）；
+`.zip1` 才是真明文（磁盘/py/ReadAllBytes 三者字节数完全一致）。
+
+因此发布包的正确做法：
+
+1. 生成时**直接用 `.zip1` 作为输出名**：
+   `[System.IO.Compression.ZipFile]::CreateFromDirectory($dist, "$out\x.zip1", Optimal, $true)`
+2. **不要**把它改名成 `.zip` 再交付（会立刻变密文）。
+3. 上传到 Gitee/网页时**直接上传 `.zip1`**；下载方把它改名回 `.zip` 即可
+   （在对方机器上没有这个过滤驱动，改名不影响内容）。
+4. 判断"是不是真明文"的唯一可靠办法是**三者一致**：
+   磁盘 `(Get-Item).Length` == python `os.path.getsize` == `[IO.File]::ReadAllBytes().Length`，
+   且头两字节是 `50 4B`。只看 python 能 `testzip()` 通过是不够的
+   ——它对密文 zip 会透明解密，看起来一切正常，但别人拿到就是坏的。
+
+> 同类坑：`Get-FileHash` 读 .zip 得到的是**密文**的哈希（和 python 算的对不上），
+> 校验哈希请统一用 python 的 `hashlib`，或用 `.zip1` 命名后再算。
