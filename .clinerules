@@ -257,6 +257,56 @@ fix: improve right panel layout and add total search time
    即使 zip 本身是好的（EOCD `50 4B 05 06` 都在）。`Compress-Archive` 也可能被干扰而产出截断包，
    改用 `[System.IO.Compression.ZipFile]::CreateFromDirectory(...)` 更稳。
 
+### 命令行发布到 Gitee（实测 2026-11-13）
+
+**git 推送不到发行版附件**，附件必须走 HTTP API。本机可用 `tools/publish-release.ps1`
+一条命令完成「建发行版 + 上传附件」。
+
+需要用户提供的**只有一样东西：Gitee 私人令牌**（Personal Access Token）
+- 生成地址：https://gitee.com/profile/personal_access_tokens
+- 勾选权限：**projects**（仓库读写）。只给 read-only 不够，创建发行版会 401
+- 传递方式（按优先级）：脚本参数 `-Token` > 环境变量 `GITEE_TOKEN` > 交互式隐藏输入
+
+本机网络前提（已实测）：
+- 直连 gitee.com:443 **不通**；`git push` 走的是 SSH(22)，所以能通
+- 本机 1080 端口是用户自己的 SOCKS5（`tools/socks5-proxy.js`，宿主进程是伪装成 Doubao 的 node）
+- curl 走该代理时 **必须加 `--ssl-no-revoke`**，否则报
+  `schannel: next InitializeSecurityContext failed: CRYPT_E_REVOCATION_OFFLINE (0x80092013)`
+  （代理只转发 TCP，吊销服务器不可达）
+- 完整可用命令形态：
+  `curl.exe -sS --ssl-no-revoke --socks5-hostname 127.0.0.1:1080 -H "Authorization: token XXX" https://gitee.com/api/v5/repos/{owner}/{repo}`
+
+已确认可用的端点（无 token 时返回 401 而非 404，说明存在）：
+- `GET  /repos/{owner}/{repo}`                         仓库信息
+- `GET  /repos/{owner}/{repo}/releases/tags/{tag}`     查发行版（没有则返回字面量 `null`）
+- `POST /repos/{owner}/{repo}/releases`                建发行版（tag_name/name/body/target_commitish）
+- `POST /repos/{owner}/{repo}/releases/{id}/attach_files`  上传附件（multipart，字段名 `file`）
+
+用法：
+```powershell
+$env:GITEE_TOKEN = '你的令牌'
+.\tools\publish-release.ps1 -Tag 1.0.3 -File release_GeoGUIDemo_x64\GeoGUIDemo-1.0.3-win64.zip1
+# 先干跑看会发什么请求（不改任何东西）：
+.\tools\publish-release.ps1 -Tag 1.0.3 -File ...zip1 -WhatIf
+```
+
+脚本已内置的保护：
+- **明文护栏**：文件首两字节不是 `50 4B` 直接拒绝（.zip 在本机落盘即加密，传上去是坏包）
+- 本地 `.zip1` 会自动以 `.zip` 作为上传名，下载方不用改名
+- 发行版已存在时**复用不覆盖**（幂等，可重复执行）
+- 自动找同目录的 `release_body.md` 作为发行版说明
+
+### PowerShell 5.1 的坑：UTF-8 无 BOM 的 .ps1 会被按 GBK 解析
+
+`tools/publish-release.ps1` 第一次写出来是 UTF-8 **无 BOM**，含中文，
+`ParseFile` 报「字符串缺少终止符」「`[` 后面缺少类型名称」等一串假错误——
+其实是 PS 5.1 把 UTF-8 字节按 GBK 解码，多字节汉字吞掉了后面的引号。
+
+**结论：含中文的 `.ps1` 必须存成 UTF-8 带 BOM（`EF BB BF`）。**
+（普通 .txt/.md 反而要不带 BOM，否则某些工具会显示多余字符；这里只针对 PowerShell 脚本。）
+
+   改用 `[System.IO.Compression.ZipFile]::CreateFromDirectory(...)` 更稳。
+
 ## 发布流程：用 git tag + Gitee 发行版附件
 
 **git 本身不能"发布程序"**，它只能打 tag 和推文件。二进制不进仓库，走发行版附件：
