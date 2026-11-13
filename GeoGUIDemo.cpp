@@ -748,7 +748,7 @@ static void loadTargetDir(App& a, const std::wstring& dir)
     }
 
     const int maxThumbs = 200;                       // 再多就没必要了
-    const int thumbH    = (int)(96 * g_scale);
+    const int thumbH    = (int)(120 * g_scale);   // 纵向列表空间更宽裕，缩略图稍大更耐看
     int bad = 0;
 
     for (size_t i = 0; i < files.size() && (int)a.thumbs.size() < maxThumbs; i++)
@@ -964,39 +964,65 @@ static void drawViewPane()
 }
 
 //=======================================================================
-//  左侧下方: 目标图片预览列表(点一张就匹配一张)
+//  最左侧: 目标图片目录（纵向列表，滚动比横向顺手）
+//  点一张就切一张，选中项高亮
 //=======================================================================
-static void drawThumbBar()
+static void textDimWrapped(const char* s);   // 定义在下面的面板工具函数区
+
+static void drawThumbList()
 {
     App& a = g_app;
 
+    ImGui::TextDisabled("图片目录");
+    if (!a.dirPath.empty())
+        ImGui::TextWrapped("%s", a.dirPath.c_str());
+
     if (a.thumbs.empty())
     {
-        ImGui::TextDisabled("图片列表为空 - 点右侧 \"选择图片目录...\" 载入一个目录");
+        textDimWrapped("为空。点右侧「匹配目标 → 选择图片目录...」载入。");
         return;
     }
 
-    ImGui::Text("%d 张，点缩略图切换 (%d/%d)",
-                (int)a.thumbs.size(), a.thumbSel + 1, (int)a.thumbs.size());
+    ImGui::Text("%d 张  当前 %d", (int)a.thumbs.size(), a.thumbSel + 1);
+    if (ImGui::Button("上一张", ImVec2(-1, 0))) selectThumb(a, a.thumbSel - 1);
+    if (ImGui::Button("下一张", ImVec2(-1, 0))) selectThumb(a, a.thumbSel + 1);
+    ImGui::Separator();
 
+    // 缩略图按目录宽度缩放，避免出现横向滚动条
+    const float availW = ImGui::GetContentRegionAvail().x;
     for (int i = 0; i < (int)a.thumbs.size(); i++)
     {
         const Thumb& t = a.thumbs[i];
         if (!t.tex.valid()) continue;
 
-        if (i != 0) ImGui::SameLine();
+        float w = (float)t.tex.w, h = (float)t.tex.h;
+        if (w > availW && w > 0.f)
+        {
+            const float k = availW / w;
+            w *= k;
+            h *= k;
+        }
 
         ImGui::PushID(i);
         const bool sel = (i == a.thumbSel);
-        const ImVec4 bg = sel ? ImVec4(0.20f, 0.60f, 0.28f, 1.00f) : ImVec4(0.12f, 0.12f, 0.14f, 1.00f);
+        const ImVec4 bg = sel ? ImVec4(0.20f, 0.60f, 0.28f, 1.00f)
+                              : ImVec4(0.12f, 0.12f, 0.14f, 1.00f);
         if (ImGui::ImageButton("##thumb",
                                ImTextureRef((ImTextureID)(uintptr_t)t.tex.srv),
-                               ImVec2((float)t.tex.w, (float)t.tex.h),
-                               ImVec2(0, 0), ImVec2(1, 1), bg))
+                               ImVec2(w, h), ImVec2(0, 0), ImVec2(1, 1), bg))
         {
             selectThumb(a, i);
         }
-        ImGui::SetItemTooltip("%s", t.name.c_str());
+        // 选中的那张在左边画一条亮色竖线，比只靠背景色更醒目
+        if (sel)
+        {
+            const ImVec2 p0 = ImGui::GetItemRectMin();
+            const ImVec2 p1 = ImGui::GetItemRectMax();
+            ImGui::GetWindowDrawList()->AddRect(
+                ImVec2(p0.x - 2, p0.y - 2), ImVec2(p1.x + 2, p1.y + 2),
+                IM_COL32(0, 255, 120, 255), 0.f, 0, 2.f);
+        }
+        ImGui::SetItemTooltip("%s (%d/%d)", t.name.c_str(), i + 1, (int)a.thumbs.size());
         ImGui::PopID();
     }
 }
@@ -1088,7 +1114,9 @@ static void drawPanel()
     };
     auto endGroup = []() { ImGui::Unindent(10.f * g_scale); };
 
-    //---------------- 1. 模板 ----------------
+    //---- Tab ① 匹配: 模板源 ----
+    auto panelTemplateSource = [&]()
+    {
     ImGui::SeparatorText("1. 模板图像");
 
     if (ImGui::Button("选择模板图片...", ImVec2(-1, 0)))
@@ -1138,6 +1166,11 @@ static void drawPanel()
     {
         textDimWrapped("ROI: 整幅图 (在左侧图上拖动可框选)");
     }
+    };
+
+    //---- Tab ② 模板参数（建模用，调一次就好） ----
+    auto panelTplParams = [&]()
+    {
 
     //---- 模板参数(分组折叠，避免一屏塞满) ----
     if (group("模板参数: 旋转与缩放", true))
@@ -1188,6 +1221,14 @@ static void drawPanel()
         endGroup();
     }
 
+    ImGui::Separator();
+    if (ImGui::Button("创建模板 / 应用参数", ImVec2(-1, 0))) needCreate = true;
+    textDimWrapped("改完参数也可以切回「① 匹配」再点创建；开了「参数改动后自动刷新」时会立即重建。");
+    };
+
+    //---- Tab ① 匹配: 创建模板 + 模型信息 ----
+    auto panelCreate = [&]()
+    {
     // 参数调完再建模板(点击即重建，并按需自动重匹配)
     if (ImGui::Button("创建模板 / 应用参数", ImVec2(-1, 0))) needCreate = true;
 
@@ -1201,6 +1242,11 @@ static void drawPanel()
         ImGui::TextDisabled("模型: 未创建");
     }
 
+    };
+
+    //---- Tab ④ 掩码 / 模型文件 ----
+    auto panelMaskModel = [&]()
+    {
     //---- 模板掩码(非零区域参与建模) ----
     if (group("模板掩码 (排除重复/不稳定区域)", false))
     {
@@ -1293,6 +1339,11 @@ static void drawPanel()
         endGroup();
     }
 
+    };
+
+    //---- Tab ① 匹配: 选择目标 ----
+    auto panelTarget = [&]()
+    {
     //---------------- 2. 匹配目标 ----------------
     ImGui::SeparatorText("2. 匹配目标");
 
@@ -1321,7 +1372,11 @@ static void drawPanel()
     if (!a.tgtGray.empty())
         ImGui::Text("尺寸: %dx%d", a.tgtGray.cols, a.tgtGray.rows);
 
-    //---------------- 3. 搜索参数 ----------------
+    };
+
+    //---- Tab ① 匹配: 匹配判据（最常调的两个参数） ----
+    auto panelMatchCriteria = [&]()
+    {
     ImGui::SeparatorText("3. 搜索参数");
 
     //---- 匹配判据: 最常调，默认展开 ----
@@ -1364,6 +1419,11 @@ static void drawPanel()
         endGroup();
     }
 
+    };
+
+    //---- Tab ③ 搜索参数（高级） ----
+    auto panelSearchParams = [&]()
+    {
     //---- 结果筛选 ----
     if (group("结果筛选 (实例数 / 去重 / 框样式)", true))
     {
@@ -1417,6 +1477,11 @@ static void drawPanel()
         endGroup();
     }
 
+    };
+
+    //---- Tab ⑤ 界面选项 ----
+    auto panelUi = [&]()
+    {
     //---- 界面选项 ----
     if (group("界面选项", true))
     {
@@ -1445,12 +1510,18 @@ static void drawPanel()
         endGroup();
     }
 
-    //---------------- 4. 执行 ----------------
+    };
+
+    //---- Tab ① 匹配: 执行按钮 ----
+    auto panelRunButtons = [&]()
+    {
     ImGui::SeparatorText("4. 执行匹配");
 
     if (ImGui::Button("执行匹配", ImVec2(-1, 0))) needMatch = true;
     if (ImGui::Button("重复 20 次计时", ImVec2(-1, 0))) runMatch(a, 20);
+    };
 
+    //===== 统一执行：任何 tab 里改的参数都在这里生效 =====
     // 参数一动就把模型和结果刷出来:
     //   松手/键盘提交 -> 一定刷新
     //   拖动过程中   -> 开了实时刷新就每帧刷; 上一轮太慢(>150ms)就等松手再刷, 免得卡住
@@ -1483,6 +1554,9 @@ static void drawPanel()
         a.lastOpMs = (cv::getTickCount() - t0) * 1000.0 / cv::getTickFrequency();
     }
 
+    //---- Tab ① 匹配: 结果 ----
+    auto panelRunResult = [&]()
+    {
     //---- 结果区耗时: 每轮明细 + 搜索总耗时(重复计时时是 N 次的累计) ----
     const int nLoops = a.searchLoops > 0 ? a.searchLoops : 1;
     ImGui::TextWrapped("耗时: 预处理 %.2f ms | 搜索 %.2f ms | 合计 %.2f ms | 刷新 %.1f ms",
@@ -1536,6 +1610,11 @@ static void drawPanel()
         }
     }
 
+    };
+
+    //---- Tab ⑤ 日志 ----
+    auto panelLog = [&]()
+    {
     //---------------- 日志 ----------------
     ImGui::SeparatorText("日志");
     // 填满面板剩下的高度；面板内容超高时可滚动，日志最少保留 100px
@@ -1551,6 +1630,49 @@ static void drawPanel()
         g_logDirty = false;
     }
     ImGui::EndChild();
+    };
+
+    //================= 参数分页 =================
+    // ① 匹配: 模板源、创建、目标、判据、执行、结果  （日常只开这一页）
+    // ② 模板参数: 旋转/缩放/特征提取               （建模时调一次）
+    // ③ 搜索参数: 结果筛选、性能与加速             （高级）
+    // ④ 掩码/模型: 掩码、模型文件存取
+    // ⑤ 界面/日志
+    if (ImGui::BeginTabBar("##paneltabs", ImGuiTabBarFlags_FittingPolicyScroll))
+    {
+        if (ImGui::BeginTabItem("① 匹配"))
+        {
+            panelTemplateSource();
+            panelCreate();
+            panelTarget();
+            panelMatchCriteria();
+            panelRunButtons();
+            panelRunResult();
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("② 模板参数"))
+        {
+            panelTplParams();
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("③ 搜索参数"))
+        {
+            panelSearchParams();
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("④ 掩码/模型"))
+        {
+            panelMaskModel();
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("⑤ 界面/日志"))
+        {
+            panelUi();
+            panelLog();
+            ImGui::EndTabItem();
+        }
+        ImGui::EndTabBar();
+    }
 }
 
 //=======================================================================
@@ -1566,34 +1688,32 @@ static void drawUI()
                  ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
                  ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoSavedSettings);
 
-    // 右侧参数面板宽度。参数较多，面板给宽一点，滑块才能拉得动；
-    // 窗口变窄时按 panelMinW 收缩，保证整个面板仍在窗口内。
-    const float panelW0   = 560.f * g_scale;    // 面板理想宽度
-    const float panelMinW = 420.f * g_scale;    // 面板允许的最窄宽度
-    const float minLeftW  = 260.f * g_scale;    // 左侧视图至少留这么宽
+    // 右栏参数面板宽度。参数分页后单页内容变少，可以窄一些，把空间让给图像。
+    const float panelW0   = 470.f * g_scale;    // 面板理想宽度
+    const float panelMinW = 360.f * g_scale;    // 面板允许的最窄宽度
+    const float thumbW0   = 200.f * g_scale;    // 最左侧图片目录的理想宽度
+    const float thumbMinW = 130.f * g_scale;
+    const float minViewW  = 260.f * g_scale;    // 中间图像区至少留这么宽
     const float gap       = ImGui::GetStyle().ItemSpacing.x;
-    const float thumbH    = 150.f * g_scale;    // 底部图片预览列表的高度
 
-    // 窗口变窄时收缩右侧面板，保证面板整个落在窗口内(否则标签/面板右边框会被窗口右边界裁掉)
+    // 窗口变窄时收缩：先收右侧面板，再收缩略图列，保证图像区不小于 minViewW
     const float availW = ImGui::GetContentRegionAvail().x;
-    float panelW = std::min(panelW0, std::max(panelMinW, availW - minLeftW - gap));
+    float panelW = std::min(panelW0, std::max(panelMinW, availW - thumbW0 - minViewW - gap * 2));
+    float thumbW = std::min(thumbW0,
+                            std::max(thumbMinW, availW - panelW - minViewW - gap * 2));
 
-    //---------------- 左列: 上=图像视图, 下=图片列表 ----------------
-    ImGui::BeginChild("##left", ImVec2(-panelW - gap, -1), ImGuiChildFlags_Borders);
-    {
-        ImGui::BeginChild("##view", ImVec2(-1, -thumbH - gap), ImGuiChildFlags_Borders);
-        drawViewPane();
-        ImGui::EndChild();
-
-        // 图片预览列表: 横向排开，可左右滚动
-        ImGui::BeginChild("##thumbs", ImVec2(-1, thumbH), ImGuiChildFlags_Borders,
-                          ImGuiWindowFlags_HorizontalScrollbar);
-        drawThumbBar();
-        ImGui::EndChild();
-    }
+    //---------------- 最左: 图片目录（纵向列表，滚轮上下翻） ----------------
+    ImGui::BeginChild("##thumblist", ImVec2(thumbW, -1), ImGuiChildFlags_Borders);
+    drawThumbList();
     ImGui::EndChild();
 
-    //---------------- 右列: 操作面板 ----------------
+    //---------------- 中间: 图像视图 ----------------
+    ImGui::SameLine();
+    ImGui::BeginChild("##view", ImVec2(-panelW - gap, -1), ImGuiChildFlags_Borders);
+    drawViewPane();
+    ImGui::EndChild();
+
+    //---------------- 右列: 参数面板（分页） ----------------
     ImGui::SameLine();
     ImGui::BeginChild("##panel", ImVec2(panelW, -1), ImGuiChildFlags_Borders);
     drawPanel();
