@@ -258,7 +258,12 @@ namespace
                       << "  score=" << std::setprecision(3) << d.score;
             if (d.coverage > 0.f)
                 std::cout << "  cover=" << std::setprecision(2) << d.coverage;
-            std::cout << "  pos=(" << (int)d.pos.x << ";" << (int)d.pos.y << ")"
+            // pos is sub-pixel (the sub-pixel refinement returns fractions), so it
+            // must not be truncated to int here - that hid the whole point of
+            // subpixel=2.
+            std::cout << "  pos=(" << std::fixed << std::setprecision(2)
+                      << d.pos.x << ";" << d.pos.y << ")"
+                      << std::defaultfloat
                       << "  angle=" << std::setprecision(1) << (d.angle * 180.0 / CV_PI)
                       << "deg  scale=" << std::setprecision(3) << d.scale << "\n";
         }
@@ -567,9 +572,9 @@ int main(int argc, char** argv)
                     const Detection& d = (*p.detections)[k];
                     printf("    #%zu  s=%.3f", k, d.score);
                     if (d.coverage > 0.f) printf("  c=%.2f", d.coverage);
-                    printf("  a=%.1fdeg  k=%.3f  pos=(%d;%d)\n",
+                    printf("  a=%.1fdeg  k=%.3f  pos=(%.2f;%.2f)\n",
                            d.angle * 180.0 / CV_PI, d.scale,
-                           (int)d.pos.x, (int)d.pos.y);
+                           d.pos.x, d.pos.y);
                 }
         });
 

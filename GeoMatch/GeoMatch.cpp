@@ -491,12 +491,15 @@ cv::Mat Matcher::drawResult(const cv::Mat& gray, const std::vector<Detection>& d
         cv::circle(vis, cv::Point(cvRound(d.pos.x), cvRound(d.pos.y)), 2, col, -1, cv::LINE_AA);
 
         //---- 4) caption under the box ----------------------------------
+        // pos is printed with 2 decimals: the sub-pixel refinement returns
+        // fractions and rounding them here made subpixel=1/2 look identical.
         std::ostringstream cap;
         cap << "#" << k << "  s=" << std::fixed << std::setprecision(3) << d.score;
         if (d.coverage > 0.f)                       // only when the caller computed it
             cap << "  c=" << std::setprecision(2) << d.coverage;
         cap << "  a=" << std::setprecision(1) << (d.angle * 180.0 / CV_PI) << "deg"
-            << "  k=" << std::setprecision(3) << d.scale;
+            << "  k=" << std::setprecision(3) << d.scale
+            << "  (" << std::setprecision(2) << d.pos.x << ";" << d.pos.y << ")";
         std::string txt = cap.str();
         cv::Size ts = cv::getTextSize(txt, cv::FONT_HERSHEY_SIMPLEX, 0.5, 1, nullptr);
         int torgX = box.x;

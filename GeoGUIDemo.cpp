@@ -1514,7 +1514,8 @@ static void drawPanel()
             ImGui::TableSetColumnIndex(2);
             if (d.coverage > 0.f) ImGui::Text("%.2f", d.coverage);
             else                  ImGui::TextDisabled("-");
-            ImGui::TableSetColumnIndex(3); ImGui::Text("%.0f, %.0f", d.pos.x, d.pos.y);
+            // 位置是亚像素的，必须显示小数，否则看不出「亚像素」到底有没有生效
+            ImGui::TableSetColumnIndex(3); ImGui::Text("%.2f, %.2f", d.pos.x, d.pos.y);
             ImGui::TableSetColumnIndex(4); ImGui::Text("%.1f", d.angle * 180.0f / (float)CV_PI);
             ImGui::TableSetColumnIndex(5); ImGui::Text("%.2f", d.scale);
         }

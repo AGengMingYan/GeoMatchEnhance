@@ -658,7 +658,7 @@ int main(int argc, char** argv)
         if (topN > 0)
         {
             for (int k = 0; k < (int)dets.size() && k < topN; k++)
-                printf("      #%d score=%.3f  pos=(%.1f, %.1f)  angle=%.2f  scale=%.3f\n",
+                printf("      #%d score=%.3f  pos=(%.2f, %.2f)  angle=%.2f  scale=%.3f\n",
                        k, dets[k].score, dets[k].pos.x, dets[k].pos.y,
                        dets[k].angle * 180.0 / CV_PI, dets[k].scale);
         }
