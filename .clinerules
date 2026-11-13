@@ -907,3 +907,69 @@ ImGui::EndChild();
 另外拼路径要统一分隔符（`dir + "/temp.jpg"` 遇到 `..\case1` 会拼出
 `..\case1/temp.jpg`，读图失败且**静默**）。
 
+
+---
+
+## 把库做成可交付 SDK：四件事必做（2026-11-13 实测）
+
+### 1. `install(EXPORT)` 会拒绝源码树里的 include 目录
+
+```cmake
+# ❌ 报 "INTERFACE_INCLUDE_DIRECTORIES property contains path ... which is prefixed in the source directory"
+target_include_directories(GeoMatch PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+
+# ✅ 构建用源码树，安装后用 <prefix>/include
+target_include_directories(GeoMatch PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+    $<INSTALL_INTERFACE:include>)
+```
+
+否则 `install(EXPORT ...)` 生成的 `*Targets.cmake` 无法重定位，`find_package` 直接不可用。
+
+### 2. 头文件按原目录结构装，不要打平
+
+头里写的是 `#include "ShapeMatch/ShapeMatch.h"`，所以必须装成
+`include/GeoMatch/`、`include/ShapeMatch/`、`include/NccMatch/`，
+消费方只需要 `-I<sdk>/include`。打平到 `include/` 根下会全部找不到。
+
+### 3. SDK 只带 Release 库 → 用户 Debug 工程必报 LNK2038
+
+```
+GeoMatch.lib(ShapeMatch.cpp.obj) : error LNK2038: "_ITERATOR_DEBUG_LEVEL" 值"0"不匹配"2"
+GeoMatch.lib(ShapeMatch.cpp.obj) : error LNK2038: "RuntimeLibrary" 值"MD_DynamicRelease"不匹配"MDd_DynamicDebug"
+```
+
+这不是库坏了，是 Debug/Release 运行时不兼容。**必须在 SDK 文档里写清楚**
+（解法：用户工程用 Release，或自己 `-DCMAKE_BUILD_TYPE=Debug` 编一份），
+否则新手第一次集成就卡住，还会误以为包有问题。
+
+### 4. 验证 SDK 的唯一可靠办法：独立工程 + `find_package`
+
+不要只看 `cmake --install` 的目录结构对不对。建一个**脱离源码树**的小工程：
+
+```cmake
+set(GeoMatch_DIR "${GEOMATCH_SDK_DIR}/lib/cmake/GeoMatch")
+find_package(GeoMatch REQUIRED)
+add_executable(consumer main.cpp)
+target_link_libraries(consumer PRIVATE GeoMatch::GeoMatch ${OCV_LIB})
+```
+
+本次在三种组合下都跑通才算过：**x64 静态库 / x86 静态库 / x64 DLL**。
+DLL 版还要确认 `isSharedBuild()` 返回 true（说明 `GEOMATCH_SHARED` 传对了）。
+
+### 附：32/64 位 OpenCV 布局不一样
+
+| 来源 | 布局 |
+|---|---|
+| `D:\Develop\OpenCV455\opencv\build`（x64） | `x64/vc15/lib/opencv_world455.lib` |
+| `D:\Develop\OpenCV455_32`（x86） | 扁平：`opencv_world455.lib` 直接放在根目录 |
+
+CMake 里要同时兼容两种（先试 `x64/vc15/lib`，再退回根目录）。
+判断 .lib 真实架构的办法：解析 COFF，首个成员的 `Machine` 字段
+`0x14c` = x86、`0x8664` = x64（`dumpbin /headers` 也行）。
+
+### 附：Ninja 生成器没有 PLATFORM，架构由 vcvars 决定
+
+`cmake -G Ninja -A x64` 不生效。32 位构建要先 `vcvars32.bat` 再 `cmake -G Ninja`，
+所以 `tools/build-x86.bat` 里第一句就是 `call vcvars32.bat`。
+
