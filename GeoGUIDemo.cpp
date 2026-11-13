@@ -1521,39 +1521,6 @@ static void drawPanel()
     if (ImGui::Button("重复 20 次计时", ImVec2(-1, 0))) runMatch(a, 20);
     };
 
-    //===== 统一执行：任何 tab 里改的参数都在这里生效 =====
-    // 参数一动就把模型和结果刷出来:
-    //   松手/键盘提交 -> 一定刷新
-    //   拖动过程中   -> 开了实时刷新就每帧刷; 上一轮太慢(>150ms)就等松手再刷, 免得卡住
-    if (a.autoRun)
-    {
-        const bool live = a.liveUpdate && a.lastOpMs < 150.0;
-        if (commitModel  || (changedModel  && live)) needCreate = true;
-        if (commitSearch || (changedSearch && live)) needMatch  = true;
-        if (a.roiDirty)  { a.roiDirty  = false; needCreate = true; }
-        if (a.maskDirty) { a.maskDirty = false; needCreate = true; }
-    }
-    else
-    {
-        a.roiDirty  = false;
-        a.maskDirty = false;
-    }
-
-    if (needCreate || needMatch)
-    {
-        const int64 t0 = cv::getTickCount();
-        if (needCreate)
-        {
-            createTemplate(a);
-            if (a.autoRun && !a.tgtGray.empty()) runMatch(a, 1);
-        }
-        else
-        {
-            runMatch(a, 1);
-        }
-        a.lastOpMs = (cv::getTickCount() - t0) * 1000.0 / cv::getTickFrequency();
-    }
-
     //---- Tab ① 匹配: 结果 ----
     auto panelRunResult = [&]()
     {
@@ -1672,6 +1639,43 @@ static void drawPanel()
             ImGui::EndTabItem();
         }
         ImGui::EndTabBar();
+    }
+
+    //===== 统一执行：任何 tab 里改的参数都在这里生效 =====
+    // 必须放在 TabBar 之后：所有控件都在上面的 lambda 里，只有当前 tab 会被
+    // 执行；如果这段放在 TabBar 之前，lambda 里置位的 needCreate/changedModel
+    // 会随本帧函数返回而丢失（它们每帧都重新初始化为 false）—— 表现就是
+    // "参数改了但没反应"。
+    // 参数一动就把模型和结果刷出来:
+    //   松手/键盘提交 -> 一定刷新
+    //   拖动过程中   -> 开了实时刷新就每帧刷; 上一轮太慢(>150ms)就等松手再刷, 免得卡住
+    if (a.autoRun)
+    {
+        const bool live = a.liveUpdate && a.lastOpMs < 150.0;
+        if (commitModel  || (changedModel  && live)) needCreate = true;
+        if (commitSearch || (changedSearch && live)) needMatch  = true;
+        if (a.roiDirty)  { a.roiDirty  = false; needCreate = true; }
+        if (a.maskDirty) { a.maskDirty = false; needCreate = true; }
+    }
+    else
+    {
+        a.roiDirty  = false;
+        a.maskDirty = false;
+    }
+
+    if (needCreate || needMatch)
+    {
+        const int64 t0 = cv::getTickCount();
+        if (needCreate)
+        {
+            createTemplate(a);
+            if (a.autoRun && !a.tgtGray.empty()) runMatch(a, 1);
+        }
+        else
+        {
+            runMatch(a, 1);
+        }
+        a.lastOpMs = (cv::getTickCount() - t0) * 1000.0 / cv::getTickFrequency();
     }
 }
 
