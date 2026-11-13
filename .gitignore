@@ -23,3 +23,9 @@ build_x64
 HalconDemo/Halcon17/include/halconcpp/HSheetOfLightModel.h
 HalconDemo
 release_GeoGUIDemo_x64
+
+# 私密凭据：绝不能进仓库
+Gitee私人令牌.txt
+Gitee私人令牌.txt.txt
+*令牌*.txt
+*令牌*.txt.txt

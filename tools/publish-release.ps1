@@ -24,8 +24,14 @@
     这样下载方拿到的就是正常的 zip，不用自己改名。
 
 .PARAMETER Token
-    Gitee 私人令牌。不传则读环境变量 GITEE_TOKEN；再没有就交互式隐藏输入。
+    Gitee 私人令牌。取值顺序：
+      -Token 参数 > 环境变量 GITEE_TOKEN > -TokenFile 指定的文件 > 交互式隐藏输入
     需要的权限：projects（仓库读写）。
+
+.PARAMETER TokenFile
+    把令牌放在文件里。默认 Gitee私人令牌.txt。
+    注意：本机经编辑器/python 写入的 .txt 会被安全软件加密（首字节 E0 A8 91），
+    脚本会自动用 Git 的 cat.exe 解密（输出到 .json 临时文件，因为写 .txt 又会加密）。
 
 .EXAMPLE
     .\publish-release.ps1 -Tag 1.0.3 -File ..\release_GeoGUIDemo_x64\GeoGUIDemo-1.0.3-win64.zip1
@@ -41,7 +47,8 @@ param(
     [string]$BodyFile = '',
     [string]$Name     = '',
     [string]$Repo     = 'ismingyan/geo-match-enhance',
-    [string]$Token    = $env:GITEE_TOKEN,
+    [string]$Token    = '',
+    [string]$TokenFile = 'Gitee私人令牌.txt',
     [string]$Proxy    = '127.0.0.1:1080',
     [switch]$NoProxy,
     [switch]$Prerelease,
@@ -60,7 +67,10 @@ function Invoke-Curl {
     $full += $CurlArgs
 
     if ($WhatIf) {
-        $masked = $full | ForEach-Object { if ($_ -match '^token ') { 'token ***' } else { $_ } }
+        # 绝不把令牌打到屏幕上
+        $masked = $full | ForEach-Object {
+            if ($_ -match 'token\s+[0-9a-fA-F]{8,}') { $_ -replace '(token\s+)\S+', '$1***' } else { $_ }
+        }
         Write-Host ('  [WhatIf] curl.exe ' + ($masked -join ' ')) -ForegroundColor DarkGray
         return @{ code = 0; body = '' }
     }
@@ -72,9 +82,46 @@ function Invoke-Curl {
     return @{ code = $code; body = $body }
 }
 
+function Read-TokenFromFile {
+    param([string]$Path)
+    if (-not $Path) { return $null }
+    if (-not (Test-Path -LiteralPath $Path)) { return $null }
+
+    $bytes = [System.IO.File]::ReadAllBytes((Resolve-Path -LiteralPath $Path).Path)
+    $isCipher = ($bytes.Length -ge 3 -and $bytes[0] -eq 0xE0 -and $bytes[1] -eq 0xA8 -and $bytes[2] -eq 0x91)
+
+    if ($isCipher) {
+        # 本机安全软件对 .txt 加密。用 Git 的 cat.exe 解密，
+        # 且输出必须是非 .txt 扩展名（写 .txt 会被再次加密）。
+        $gitCat = 'C:\Program Files\Git\usr\bin\cat.exe'
+        if (-not (Test-Path -LiteralPath $gitCat)) {
+            throw "令牌文件是密文，但没找到 $gitCat，无法自动解密。"
+        }
+        $tmp = Join-Path $env:TEMP ("gtok_" + [guid]::NewGuid().ToString('N') + ".json")
+        $src = (Resolve-Path -LiteralPath $Path).Path
+        & cmd /c "`"$gitCat`" `"$src`" > `"$tmp`""
+        try   { $text = [System.IO.File]::ReadAllText($tmp, [System.Text.Encoding]::UTF8) }
+        finally { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+    } else {
+        $text = [System.IO.File]::ReadAllText((Resolve-Path -LiteralPath $Path).Path,
+                                              [System.Text.Encoding]::UTF8)
+    }
+
+    $m = [regex]::Match($text, '[0-9a-fA-F]{32}')
+    if ($m.Success) { return $m.Value }
+    return $null
+}
+
 function Get-Token {
     if ($Token) { return $Token }
     if ($env:GITEE_TOKEN) { return $env:GITEE_TOKEN }
+
+    $fromFile = Read-TokenFromFile $TokenFile
+    if ($fromFile) {
+        Write-Host "令牌来源: 文件 $TokenFile" -ForegroundColor DarkGray
+        return $fromFile
+    }
+
     Write-Host '请输入 Gitee 私人令牌（输入时不显示）：' -ForegroundColor Yellow
     $sec  = Read-Host -AsSecureString
     $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec)
@@ -156,21 +203,44 @@ if (-not $WhatIf) {
 }
 
 # ---------------------------------------------------------------- 3) 附件
+$localSize = (Get-Item -LiteralPath $fullPath).Length
 if (-not $WhatIf) {
-    $u = Invoke-Curl @(
-        '-X', 'POST',
+    # 幂等：同名且大小一致的附件已存在就跳过。Gitee 的 attach_files 是"追加"语义，
+    # 直接重跑会产生重复附件（实测过，会出现两条同名记录）。
+    $att = Invoke-Curl @(
         '-H', "Authorization: token $Token",
-        '-F', "file=@$fullPath;filename=$UploadAs",
         "$API/releases/$releaseId/attach_files"
-    )
-    if ($u.body -match '"browser_download_url"\s*:\s*"([^"]+)"') {
-        Write-Host "[3/3] 附件上传成功" -ForegroundColor Green
+    ) -AllowFail
+
+    $dup = $false
+    if ($att.body -match '\[') {
+        try {
+            $arr = $att.body | ConvertFrom-Json
+            foreach ($a in $arr) {
+                if ($a.name -eq $UploadAs -and [int64]$a.size -eq $localSize) { $dup = $true; break }
+            }
+        } catch { }
+    }
+
+    if ($dup) {
+        Write-Host "[3/3] 附件 $UploadAs 已存在且大小一致，跳过上传" -ForegroundColor Yellow
         Write-Host "      发行版页: https://gitee.com/$Repo/releases/tag/$Tag" -ForegroundColor Cyan
-        Write-Host "      下载直链: $($Matches[1])" -ForegroundColor Cyan
     } else {
-        throw "附件上传失败：`n$($u.body)"
+        $u = Invoke-Curl @(
+            '-X', 'POST',
+            '-H', "Authorization: token $Token",
+            '-F', "file=@$fullPath;filename=$UploadAs",
+            "$API/releases/$releaseId/attach_files"
+        )
+        if ($u.body -match '"browser_download_url"\s*:\s*"([^"]+)"') {
+            Write-Host "[3/3] 附件上传成功" -ForegroundColor Green
+            Write-Host "      发行版页: https://gitee.com/$Repo/releases/tag/$Tag" -ForegroundColor Cyan
+            Write-Host "      下载直链: $($Matches[1])" -ForegroundColor Cyan
+        } else {
+            throw "附件上传失败：`n$($u.body)"
+        }
     }
 } else {
-    Write-Host "[3/3] (WhatIf) 将 POST /releases/<id>/attach_files 上传 $UploadAs" -ForegroundColor DarkGray
+    Write-Host "[3/3] (WhatIf) 将先查同名同尺寸附件，没有才 POST /releases/<id>/attach_files" -ForegroundColor DarkGray
     Write-Host "`nWhatIf 结束，没有发起任何修改请求。" -ForegroundColor DarkGray
 }

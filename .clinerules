@@ -373,3 +373,13 @@ a.zip/7z 对应的正常读取进程是7z.exe zip.exe这些
 
 > 同类坑：`Get-FileHash` 读 .zip 得到的是**密文**的哈希（和 python 算的对不上），
 > 校验哈希请统一用 python 的 `hashlib`，或用 `.zip1` 命名后再算。
+
+
+## gitee 私人令牌 
+Gitee私人令牌.txt
+
+> **已加入 `.gitignore`**（`*令牌*.txt`），不会进仓库。
+> 本机用编辑器/python 写入的 `.txt` 是**密文**（首字节 `E0 A8 91`）。
+> 读取必须用：`cat.exe 该文件 > xxx.json`
+> —— **输出要用 `.json` 等非 `.txt` 扩展名**，写 `.txt` 会被再次加密（实测）。
+> `tools/publish-release.ps1` 已内置这套自动解密，直接 `-File xxx.zip1` 即可。
