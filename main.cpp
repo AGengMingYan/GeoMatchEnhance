@@ -226,6 +226,9 @@ namespace
         cfg.debug      = (int)gArgD(a, "-debug", 0);
         cfg.scoreMode  = (int)gArgD(a, "-score-mode", 1);
         cfg.minCoverage = (float)gArgD(a, "-min-cover", 0.0);
+        cfg.metric     = (int)gArgD(a, "-metric", 0);
+        cfg.maxOverlap = gArgD(a, "-max-overlap", 1.0);
+        cfg.subpixel   = (int)gArgD(a, "-subpix", 1);
         cfg.boxMode    = (int)gArgD(a, "-box", 0);
         cfg.showContour   = !gFlag(a, "-no-contour");
         cfg.showPoints    = gFlag(a, "-show-points");
@@ -312,6 +315,9 @@ int main(int argc, char** argv)
     cfg.debug       = (int)gArgD(args, "-debug", 0);
     cfg.scoreMode   = (int)gArgD(args, "-score-mode", 1);
     cfg.minCoverage = (float)gArgD(args, "-min-cover", 0.0);
+    cfg.metric      = (int)gArgD(args, "-metric", 0);
+    cfg.maxOverlap  = gArgD(args, "-max-overlap", 1.0);
+    cfg.subpixel    = (int)gArgD(args, "-subpix", 1);
     cfg.boxMode     = (int)gArgD(args, "-box", 0);
     cfg.showContour   = !gFlag(args, "-no-contour");
     cfg.showPoints    = gFlag(args, "-show-points");
@@ -393,6 +399,9 @@ int main(int argc, char** argv)
         merged.debug       = cfg.debug;
         merged.scoreMode   = cfg.scoreMode;
         merged.minCoverage = cfg.minCoverage;
+        merged.metric      = cfg.metric;
+        merged.maxOverlap  = cfg.maxOverlap;
+        merged.subpixel    = cfg.subpixel;
         merged.boxMode     = cfg.boxMode;
         merged.showContour   = cfg.showContour;
         merged.showPoints    = cfg.showPoints;

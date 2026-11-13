@@ -358,7 +358,9 @@ struct App
     int   maxMatches     = 12;
     float minDistance    = 30.f;
     float greediness     = 0.9f;
-    bool  subpixel       = true;
+    int   subpixelMode   = 1;           // 0 = 关闭, 1 = 插值(默认), 2 = 最小二乘
+    int   metric         = 0;           // 0 = 要求极性一致, 1 = 忽略整体极性反转, 2 = 忽略逐点极性
+    float maxOverlap     = 1.f;         // 1 = 关闭; 两个实例重叠超过这个比例只留高分那个
     bool  useOpenCL      = true;
     int   scoreMode      = 1;           // 1 = positive-mean(默认), 0 = mean, 2 = trimmed-mean
                                         // 3 = clipped-mean(只算正向但不缩分母, 部分匹配不上高分)
@@ -446,7 +448,9 @@ struct App
         c.maxMatches   = maxMatches;
         c.minDistance  = minDistance;
         c.greediness   = greediness;
-        c.subpixel     = subpixel ? 1 : 0;
+        c.subpixel     = subpixelMode;
+        c.metric       = metric;
+        c.maxOverlap   = maxOverlap;
         c.useOpenCL    = useOpenCL;
         c.debug        = 0;
         c.scoreMode    = scoreMode;
@@ -474,7 +478,8 @@ struct App
         maxMatches  = c.maxMatches;
         minDistance = (float)c.minDistance;
         greediness  = (float)c.greediness;
-        subpixel    = c.subpixel != 0;
+        subpixelMode = c.subpixel;
+        metric       = c.metric;      // metric/maxOverlap 只影响搜索, 模型里没有
         useOpenCL   = c.useOpenCL;
         scoreMode   = c.scoreMode;
         minCoverage = c.minCoverage;
@@ -1315,6 +1320,22 @@ static void drawPanel()
             }
         }
         changedSearch |= sliderF("最小覆盖率", &a.minCoverage, 0.f, 1.f, "%.2f", commitSearch);
+        {
+            // 极性(Halcon 的 Metric)：目标亮/暗反转或局部反光时用
+            const char* items[] = { "要求极性一致(默认)",
+                                    "忽略整体反转(明暗互换)",
+                                    "忽略逐点极性(局部反光)" };
+            itemWidthForLabel("极性");
+            if (ImGui::Combo("极性", &a.metric, items, 3))
+            {
+                changedSearch = true;
+                commitSearch  = true;
+            }
+        }
+        if (a.metric == 2)
+            textWarnWrapped("「忽略逐点极性」走标量扫描，比默认慢数倍；只在确实有局部反光时用。");
+        else if (a.metric == 1)
+            textDimWrapped("「忽略整体反转」把两遍扫描取较大值，耗时约为默认的 2 倍。");
         if (a.minCoverage > 0.f)
             textDimWrapped("0 = 关闭。覆盖率 = 模型点里梯度方向一致的占比，结果表\"覆盖\"列就是它。"
                            "调低最小分数后冒出来的相似结构通常能拿高分，但只对上模型的一部分，覆盖率明显偏低。"
@@ -1327,6 +1348,10 @@ static void drawPanel()
     {
         changedSearch |= sliderI("最大匹配数", &a.maxMatches, 1, 64, commitSearch);
         changedSearch |= sliderF("最小间距(px)", &a.minDistance, 0.f, 300.f, "%.0f", commitSearch);
+        changedSearch |= sliderF("最大重叠(1=关闭)", &a.maxOverlap, 0.f, 1.f, "%.2f", commitSearch);
+        if (a.maxOverlap < 0.999f)
+            textDimWrapped("两个实例的模型框重叠超过该比例时只保留高分那个（按交集/较小框面积），"
+                           "与模板尺寸和缩放无关，比「最小间距」更通用。");
         {
             // 结果框样式只影响画出来的样子，不影响匹配结果
             const char* items[] = { "固定方框(水平，尺寸=模板x缩放)",
@@ -1348,9 +1373,20 @@ static void drawPanel()
     if (group("性能与加速", false))
     {
         changedSearch |= sliderF("贪婪度", &a.greediness, 0.3f, 1.f, "%.2f", commitSearch);
-        textDimWrapped("越大越快，但可能漏检。");
-        if (ImGui::Checkbox("亚像素", &a.subpixel)) { changedSearch = true; commitSearch = true; }
-        if (fitsOnLine(checkWidth("OpenCL"))) ImGui::SameLine();
+        {
+            // 亚像素模式(Halcon 的 SubPixel)
+            const char* items[] = { "关闭",
+                                    "插值(默认，抛物线)",
+                                    "最小二乘(更准，稍慢)" };
+            itemWidthForLabel("亚像素");
+            if (ImGui::Combo("亚像素", &a.subpixelMode, items, 3))
+            {
+                changedSearch = true;
+                commitSearch  = true;
+            }
+        }
+        textDimWrapped("贪婪度越大越快，但可能漏检。亚像素选「最小二乘」会在插值结果上再迭代"
+                       "拟合，边缘较软/低对比时位置更稳。");
         if (ImGui::Checkbox("OpenCL", &a.useOpenCL))
         {
             changedSearch = true;

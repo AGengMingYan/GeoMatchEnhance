@@ -500,7 +500,10 @@ GeoMatchDemo -t case1/temp.jpg -d case1 -o case1/out -loops 5
 | `scoreMode` | 最终评分方式 | 调低 `minScore` 追召回时改用 3（clipped-mean），见下节 |
 | `minCoverage` | 最小覆盖率（0=关闭） | 调低 `minScore` 后误检多时开启，0.75~0.90 起调 |
 | `greediness` | 搜索贪心度 | 0~1，越大越快但可能漏检 |
-| `minDistance` | 实例最小间距 | 多实例场景调大减少冗余 |
+| `minDistance` | 实例最小间距（像素） | 多实例场景调大减少冗余；跨尺寸场景改用 `maxOverlap` |
+| `maxOverlap` | 实例最大重叠比例（1=关闭，Halcon 同名参数） | 按「交集/较小模型框面积」计算，与模板尺寸和缩放无关，不需要随尺寸重调。0.5 是 Halcon 默认值 |
+| `metric` | 梯度极性（Halcon 的 `Metric`） | 0=要求极性一致(默认) / 1=忽略整体反转 / 2=忽略逐点极性。见下节 |
+| `subpixel` | 亚像素方式（Halcon 的 `SubPixel`） | 0=none / 1=interpolation(默认) / 2=least_squares |
 | `useOpenCL` | OpenCL 加速 | 有 GPU 时开启可加速预处理 |
 | `subpixel` | 亚像素细化 | 1 开启，精度敏感场景不可关 |
 | `minContrast` (lo) | 滞后**低**阈值：边缘像素的最低梯度幅值 | 见下节「对比度阈值」 |
@@ -577,6 +580,48 @@ GeoMatchDemo -t case1/temp.jpg -d case1 -o case1/out -loops 5
 复现工具：`build_x64/level_probe.exe`（本项目）、`build_x64/halcon_level_probe.exe`（Halcon 17 x86）。
 
 
+
+### 极性（`metric`）：目标明暗反转 / 局部反光
+
+模板里的梯度是**有符号**的。默认（`metric = 0`，等价 Halcon 的 `use_polarity`）要求图像梯度方向与模板一致，
+所以亮背景上的暗目标一旦变成暗背景上的亮目标，分数会大幅下降甚至检不到。
+
+| `metric` | Halcon 名字 | 做法 | 代价 |
+|---|---|---|---|
+| 0 | `use_polarity` | 直接累加点积（默认） | — |
+| 1 | `ignore_global_polarity` | 用正常模型和取反模型各扫一遍，逐位置取较大值，等于 `\|mean\|` | **约 2×**（两遍扫描） |
+| 2 | `ignore_local_polarity` | 逐点取 `\|dot\|`，方向完全不管 | **慢数倍**（走标量扫描，SIMD 卷积核表达不了） |
+
+实测（`case1` 模板，把搜索图整幅反相 `255-x`）：
+
+| metric | 结果 |
+|---|---|
+| 0 | **0 个**（找不到） |
+| 1 | 1 个，`s=0.988 pos=(841;674)` —— 和原图完全一致，耗时 84 ms（默认 40 ms） |
+| 2 | 4 个，最高 `s=0.983 pos=(841;674)`，但耗时 939 ms 且冒出 3 个弱误检 |
+
+> 结论：**能整幅反转就用 `metric=1`**，代价只有 2 倍且结果干净；`metric=2` 只在"只有局部边缘反光/翻向"
+> 时才值得（它几乎失去方向选择性，误检会变多）。
+
+### 亚像素方式（`subpixel`）
+
+| 值 | 名字 | 做法 |
+|---|---|---|
+| 0 | `none` | 只取整数网格结果 |
+| 1 | `interpolation` | 在 x/y/角度/尺度上各做一次抛物线插值（默认，原实现） |
+| 2 | `least_squares` | 取峰周围 **3×3** 个得分，用最小二乘拟合 `a+bx+cy+dx²+exy+fy²`，取该曲面的极值点 |
+
+实测（把模板以已知亚像素位移贴到合成图上，6 个位移的平均定位误差）：
+
+| subpixel | 平均误差 |
+|---|---|
+| 0 `none` | 0.357 px |
+| 1 `interpolation` | 0.078 px |
+| 2 `least_squares` | **0.063 px** |
+
+提升主要来自峰形不对称的情况（例如某一位移下插值 0.115 px、最小二乘 0.076 px）。
+角度/尺度仍用插值结果：在这类图它们比位置更病态，让它们一起动会把中心拖偏 0.2~0.4 px
+（这条也写进了代码注释，避免以后有人"顺手"改成四参数联合优化）。
 
 ### 对比度阈值：`minContrast` / `contrast` 的量纲与滞后判据
 

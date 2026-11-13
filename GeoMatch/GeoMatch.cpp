@@ -112,8 +112,10 @@ FindParams Config::toFindParams() const
     p.minScore   = minScore;
     p.maxMatches = maxMatches;
     p.minDistance = minDistance;
+    p.maxOverlap  = maxOverlap;
     p.greediness = greediness;
     p.subpixel   = subpixel;
+    p.metric     = metric;
     p.useOpenCL  = useOpenCL;
     p.debug      = debug;
     p.scoreMode  = scoreMode;

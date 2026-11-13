@@ -1174,8 +1174,12 @@ void ShapeMatcher::correlateSparseX(int level, const XForm& xf, cv::Mat& scoreMa
 //***********************************************************************
 namespace
 {
+    // Gradient polarity handling (Halcon's Metric), shared by all scorers.
+    // dot = model-normal . image-gradient, in [-1, 1].
+    enum : int { POL_USE = 0, POL_GLOBAL = 1, POL_LOCAL = 2 };
+
     inline float scorePos(const cv::Mat& sx, const cv::Mat& sy, const XForm& xf,
-                          int ay, int ax, float limit)
+                          int ay, int ax, float limit, int metric = POL_USE)
     {
         const int n = xf.n;
         const int16_t* pox = xf.ox.data();
@@ -1190,22 +1194,37 @@ namespace
             int xx = ax + pox[k];
             const uint16_t* rx = sx.ptr<uint16_t>(yy);
             const uint16_t* ry = sy.ptr<uint16_t>(yy);
-            sum += pnx[k] * f16ToF32(rx[xx]) + pny[k] * f16ToF32(ry[xx]);
+            float d = pnx[k] * f16ToF32(rx[xx]) + pny[k] * f16ToF32(ry[xx]);
+            if (metric == POL_LOCAL) d = std::fabs(d);
+            sum += d;
             if (limit > -9.f && k > (n >> 2))
             {
-                // every term is at most 1 -> stop when the target can no longer be reached
-                if (sum + (float)(n - k - 1) < lim)
+                // Every term is at most 1 in magnitude, so either
+                //   |sum| <= |partial| + (n - k - 1)   (use / global polarity)
+                //   sum   <=  partial  + (n - k - 1)   (local, monotone)
+                // holds.  When even that upper bound is below the target the
+                // position cannot qualify and the scan stops early.
+                const float reach = (metric == POL_GLOBAL ? std::fabs(sum) : sum)
+                                    + (float)(n - k - 1);
+                if (reach < lim)
                     return -1.f;
             }
         }
+        if (metric == POL_GLOBAL) sum = std::fabs(sum);
         return sum / n;
     }
 
     // robust re-scoring of the final matches.  search/refine use mean (scorePos);
     // this only re-aggregates the per-point dot products at the found pose so a
     // few flipped points do not drag the reported confidence down.
+    //
+    // The polarity transform is applied to the per-point dots *before*
+    // aggregating, so every score mode composes with it:
+    //   metric 1 (global): if the total is negative, all dots are negated
+    //   metric 2 (local) : every dot is replaced by |dot|
+    // metric 0 with mode 0 gives exactly the same number as scorePos().
     inline float scorePosMode(const cv::Mat& sx, const cv::Mat& sy, const XForm& xf,
-                              int ay, int ax, int mode)
+                              int ay, int ax, int mode, int metric = POL_USE)
     {
         const int n = xf.n;
         const int16_t* pox = xf.ox.data();
@@ -1213,71 +1232,66 @@ namespace
         const float* pnx = xf.nx.data();
         const float* pny = xf.ny.data();
 
-        if (mode == 0)   // mean (identical to scorePos without early-exit)
+        std::vector<float> dots;
+        dots.resize((size_t)n);
+        for (int k = 0; k < n; k++)
         {
-            float sum = 0.f;
-            for (int k = 0; k < n; k++)
-            {
-                const uint16_t* rx = sx.ptr<uint16_t>(ay + poy[k]);
-                const uint16_t* ry = sy.ptr<uint16_t>(ay + poy[k]);
-                sum += pnx[k] * f16ToF32(rx[ax + pox[k]]) +
-                       pny[k] * f16ToF32(ry[ax + pox[k]]);
-            }
-            return sum / n;
+            const uint16_t* rx = sx.ptr<uint16_t>(ay + poy[k]);
+            const uint16_t* ry = sy.ptr<uint16_t>(ay + poy[k]);
+            dots[(size_t)k] = pnx[k] * f16ToF32(rx[ax + pox[k]]) +
+                              pny[k] * f16ToF32(ry[ax + pox[k]]);
+        }
+
+        if (metric == POL_GLOBAL)
+        {
+            double tot = 0;
+            for (int k = 0; k < n; k++) tot += dots[(size_t)k];
+            if (tot < 0)
+                for (int k = 0; k < n; k++) dots[(size_t)k] = -dots[(size_t)k];
+        }
+        else if (metric == POL_LOCAL)
+        {
+            for (int k = 0; k < n; k++) dots[(size_t)k] = std::fabs(dots[(size_t)k]);
+        }
+
+        if (mode == 0)   // mean
+        {
+            double sum = 0;
+            for (int k = 0; k < n; k++) sum += dots[(size_t)k];
+            return n > 0 ? (float)(sum / n) : 0.f;
         }
 
         if (mode == 1)   // positive-mean: drop points whose direction flipped
         {
-            float sum = 0.f;
+            double sum = 0;
             int cnt = 0;
             for (int k = 0; k < n; k++)
-            {
-                const uint16_t* rx = sx.ptr<uint16_t>(ay + poy[k]);
-                const uint16_t* ry = sy.ptr<uint16_t>(ay + poy[k]);
-                float d = pnx[k] * f16ToF32(rx[ax + pox[k]]) +
-                          pny[k] * f16ToF32(ry[ax + pox[k]]);
-                if (d > 0.f) { sum += d; cnt++; }
-            }
-            return cnt > 0 ? sum / cnt : 0.f;
+                if (dots[(size_t)k] > 0.f) { sum += dots[(size_t)k]; cnt++; }
+            return cnt > 0 ? (float)(sum / cnt) : 0.f;
         }
 
         if (mode == 3)   // clipped-mean: same sum as mode 1, but n stays in the
                          // denominator, so a pose that only covers half of the
                          // model cannot reach a high score the way mode 1 can
         {
-            float sum = 0.f;
+            double sum = 0;
             for (int k = 0; k < n; k++)
-            {
-                const uint16_t* rx = sx.ptr<uint16_t>(ay + poy[k]);
-                const uint16_t* ry = sy.ptr<uint16_t>(ay + poy[k]);
-                float d = pnx[k] * f16ToF32(rx[ax + pox[k]]) +
-                          pny[k] * f16ToF32(ry[ax + pox[k]]);
-                if (d > 0.f) sum += d;
-            }
-            return sum / n;
+                if (dots[(size_t)k] > 0.f) sum += dots[(size_t)k];
+            return n > 0 ? (float)(sum / n) : 0.f;
         }
 
         // mode 2: trimmed-mean, drop the worst 10% of points
-        std::vector<float> dots;
-        dots.reserve(n);
-        for (int k = 0; k < n; k++)
-        {
-            const uint16_t* rx = sx.ptr<uint16_t>(ay + poy[k]);
-            const uint16_t* ry = sy.ptr<uint16_t>(ay + poy[k]);
-            dots.push_back(pnx[k] * f16ToF32(rx[ax + pox[k]]) +
-                           pny[k] * f16ToF32(ry[ax + pox[k]]));
-        }
         const int trim = n / 10;
         if (trim <= 0 || n - 2 * trim <= 0)
         {
-            float s = 0.f;
-            for (float d : dots) s += d;
-            return s / n;
+            double sum = 0;
+            for (int k = 0; k < n; k++) sum += dots[(size_t)k];
+            return n > 0 ? (float)(sum / n) : 0.f;
         }
         std::sort(dots.begin(), dots.end());
-        float s = 0.f;
-        for (int i = trim; i < n - trim; i++) s += dots[i];
-        return s / (n - 2 * trim);
+        double sum = 0;
+        for (int i = trim; i < n - trim; i++) sum += dots[(size_t)i];
+        return (float)(sum / (n - 2 * trim));
     }
 
     // one pass over the model points, returning everything the final
@@ -1290,24 +1304,50 @@ namespace
     struct PoseScore { float mean, clipped, coverage; };
 
     inline PoseScore scorePoseDetail(const cv::Mat& sx, const cv::Mat& sy, const XForm& xf,
-                                     int ay, int ax)
+                                     int ay, int ax, int metric = POL_USE)
     {
         const int n = xf.n;
-        float sum = 0.f, posSum = 0.f;
-        int   cnt = 0;
+        std::vector<float> dots;
+        dots.resize((size_t)n);
+        double total = 0;
         for (int k = 0; k < n; k++)
         {
             const uint16_t* rx = sx.ptr<uint16_t>(ay + xf.oy[k]);
             const uint16_t* ry = sy.ptr<uint16_t>(ay + xf.oy[k]);
-            const float d = xf.nx[k] * f16ToF32(rx[ax + xf.ox[k]]) +
-                            xf.ny[k] * f16ToF32(ry[ax + xf.ox[k]]);
+            dots[(size_t)k] = xf.nx[k] * f16ToF32(rx[ax + xf.ox[k]]) +
+                              xf.ny[k] * f16ToF32(ry[ax + xf.ox[k]]);
+            total += dots[(size_t)k];
+        }
+
+        // metric 1 flips every dot when the total is negative, so the score and
+        // the coverage both describe the globally inverted interpretation.
+        // metric 2 uses |dot| for the score but keeps the signed dots for the
+        // coverage, because "which points disagree" is still the useful signal.
+        const bool flip = (metric == POL_GLOBAL && total < 0.0);
+        double sum = 0.0, posSum = 0.0;
+        int    cnt = 0;
+        for (int k = 0; k < n; k++)
+        {
+            float d = dots[(size_t)k];
+            if (flip) d = -d;
             sum += d;
             if (d > 0.f) { posSum += d; cnt++; }
         }
+
         PoseScore ps;
         const float inv = n > 0 ? 1.f / (float)n : 0.f;
-        ps.mean     = sum * inv;
-        ps.clipped  = posSum * inv;
+        if (metric == POL_LOCAL)
+        {
+            double a = 0;
+            for (int k = 0; k < n; k++) a += std::fabs(dots[(size_t)k]);
+            ps.mean    = (float)a * inv;
+            ps.clipped = (float)a * inv;
+        }
+        else
+        {
+            ps.mean    = (float)sum * inv;
+            ps.clipped = (float)posSum * inv;
+        }
         ps.coverage = (float)cnt * inv;
         return ps;
     }
@@ -1317,7 +1357,7 @@ namespace
 //  refine all candidates one level down
 //=======================================================================
 void ShapeMatcher::refineLevel(int level, std::vector<Candidate>& cands,
-                               int maxKeep, double minScore)
+                               int maxKeep, double minScore, int metric)
 {
     const int stride = 1 << level;
     const int nA = (int)angleGrid_.size();
@@ -1399,7 +1439,7 @@ void ShapeMatcher::refineLevel(int level, std::vector<Candidate>& cands,
                             by = std::min(std::max(by, xf.R), srcGx_[level].rows - 1 - xf.R);
                             float v = (bx < xf.R || by < xf.R)
                                           ? -2.f
-                                          : scorePos(srcGx_[level], srcGy_[level], xf, by, bx, limit);
+                                          : scorePos(srcGx_[level], srcGy_[level], xf, by, bx, limit, metric);
                             scoreBuf[(((size_t)i * ns + j) * W + (dy + win)) * W + (dx + win)] = v;
                             if (v > best.score)
                             {
@@ -1479,7 +1519,7 @@ void ShapeMatcher::refineLevel(int level, std::vector<Candidate>& cands,
 //=======================================================================
 //  sub-pixel refinement (parabolic fit in x, y, angle and scale)
 //=======================================================================
-void ShapeMatcher::subpixelRefine(int level, Candidate& c)
+void ShapeMatcher::subpixelRefine(int level, Candidate& c, int mode, int metric)
 {
     XForm& xf0 = getXForm(level, c.angleIdx, c.scaleIdx);
     // scorePos is sampled at ax+-1 and ay+-1 and the model reaches +-R around
@@ -1493,11 +1533,11 @@ void ShapeMatcher::subpixelRefine(int level, Candidate& c)
     int ax = std::min(std::max(cvRound(c.pos.x), lo), hiX);
     int ay = std::min(std::max(cvRound(c.pos.y), lo), hiY);
 
-    float s0 = scorePos(srcGx_[level], srcGy_[level], xf0, ay, ax, -10.f);
-    float spx = scorePos(srcGx_[level], srcGy_[level], xf0, ay, ax + 1, -10.f);
-    float smx = scorePos(srcGx_[level], srcGy_[level], xf0, ay, ax - 1, -10.f);
-    float spy = scorePos(srcGx_[level], srcGy_[level], xf0, ay + 1, ax, -10.f);
-    float smy = scorePos(srcGx_[level], srcGy_[level], xf0, ay - 1, ax, -10.f);
+    float s0 = scorePos(srcGx_[level], srcGy_[level], xf0, ay, ax, -10.f, metric);
+    float spx = scorePos(srcGx_[level], srcGy_[level], xf0, ay, ax + 1, -10.f, metric);
+    float smx = scorePos(srcGx_[level], srcGy_[level], xf0, ay, ax - 1, -10.f, metric);
+    float spy = scorePos(srcGx_[level], srcGy_[level], xf0, ay + 1, ax, -10.f, metric);
+    float smy = scorePos(srcGx_[level], srcGy_[level], xf0, ay - 1, ax, -10.f, metric);
 
     float dx = 0.f, dy = 0.f;
     float den = 2.f * s0 - spx - smx;
@@ -1520,9 +1560,9 @@ void ShapeMatcher::subpixelRefine(int level, Candidate& c)
         // every getXForm() may purge the cache, so no reference may be kept
         // across two calls
         float vp = scorePos(srcGx_[level], srcGy_[level],
-                            getXForm(level, ap, c.scaleIdx), ay, ax, -10.f);
+                            getXForm(level, ap, c.scaleIdx), ay, ax, -10.f, metric);
         float vm = scorePos(srcGx_[level], srcGy_[level],
-                            getXForm(level, am, c.scaleIdx), ay, ax, -10.f);
+                            getXForm(level, am, c.scaleIdx), ay, ax, -10.f, metric);
         float d = 2.f * v0 - vp - vm;
         if (d > 1e-6f)
         {
@@ -1537,9 +1577,9 @@ void ShapeMatcher::subpixelRefine(int level, Candidate& c)
         int sp = std::min(c.scaleIdx + 1, nS - 1), sm = std::max(c.scaleIdx - 1, 0);
         float v0 = s0;
         float vp = scorePos(srcGx_[level], srcGy_[level],
-                            getXForm(level, c.angleIdx, sp), ay, ax, -10.f);
+                            getXForm(level, c.angleIdx, sp), ay, ax, -10.f, metric);
         float vm = scorePos(srcGx_[level], srcGy_[level],
-                            getXForm(level, c.angleIdx, sm), ay, ax, -10.f);
+                            getXForm(level, c.angleIdx, sm), ay, ax, -10.f, metric);
         float d = 2.f * v0 - vp - vm;
         if (d > 1e-6f)
         {
@@ -1548,7 +1588,460 @@ void ShapeMatcher::subpixelRefine(int level, Candidate& c)
             c.scale = (float)(scaleGrid_[c.scaleIdx] + t * scaleStep_);
         }
     }
+
+    // 2 = least_squares: the parabola only looks at +-1 samples in each
+    // direction, so on soft edges it stops where the score surface is still
+    // curved.  Gauss-Newton on the actual residuals polishes the pose, starting
+    // from the interpolated one.
+    if (mode >= 2)
+        leastSquaresRefine(level, c, metric);
 }
+
+//=======================================================================
+//  polarity aware scan (Halcon's Metric)
+//=======================================================================
+void ShapeMatcher::scanPose(int level, const XForm& xf, cv::Mat& scoreMap, int& R,
+                            double target, double greed, int metric, bool nested)
+{
+    if (metric == POL_USE)
+    {
+        correlateSparseX(level, xf, scoreMap, R, target, greed, nested);
+        return;
+    }
+
+    if (metric == POL_GLOBAL)
+    {
+        // |mean(dot)| == max(mean(dot), mean(-dot)).  Running the existing scan
+        // a second time with negated normals therefore gives exactly the
+        // globally inverted score, and the greedy pruning stays valid for both
+        // passes (it bounds `sum`, and one of the two carries the positive sign).
+        correlateSparseX(level, xf, scoreMap, R, target, greed, nested);
+        XForm nxf = xf;                       // copies the offsets too
+        for (size_t i = 0; i < nxf.nx.size(); i++) nxf.nx[i] = -nxf.nx[i];
+        for (size_t i = 0; i < nxf.ny.size(); i++) nxf.ny[i] = -nxf.ny[i];
+        cv::Mat negMap;
+        int R2 = R;
+        correlateSparseX(level, nxf, negMap, R2, target, greed, nested);
+        cv::max(scoreMap, negMap, scoreMap);
+        return;
+    }
+
+    scanLocalPolarity(level, xf, scoreMap, R, target, greed, nested);
+}
+
+void ShapeMatcher::scanLocalPolarity(int level, const XForm& xf, cv::Mat& scoreMap, int& R,
+                                     double target, double greed, bool nested)
+{
+    R = xf.R;
+    const int K = 2 * R + 1;
+    const cv::Mat& gx = srcGx_[level];
+    const cv::Mat& gy = srcGy_[level];
+    CV_Assert(gx.type() == CV_16F && gy.type() == CV_16F);
+    scoreMap.create(gx.rows - K + 1, gx.cols - K + 1, CV_32F);
+
+    const int n = xf.n;
+    const int W = scoreMap.cols;
+    if (n <= 0 || W <= 0 || scoreMap.rows <= 0) return;
+
+    const int16_t* pox = xf.ox.data();
+    const int16_t* poy = xf.oy.data();
+    const float* pnx = xf.nx.data();
+    const float* pny = xf.ny.data();
+    const float invN = 1.f / (float)n;
+
+    // |dot| is in [0, 1] and the sum only grows, so the same monotone bound as
+    // the normal scan applies: once sum + remaining cannot reach the target the
+    // position is dead.
+    const double g = std::min(std::max(greed, 0.0), 0.98);
+    const float limN = (float)(target * n);
+    const float slope = (float)((1.0 - g * target) / ((1.0 - g) * std::max(1, n)));
+
+    auto scanRows = [&](int y0, int y1)
+    {
+        for (int y = y0; y < y1; y++)
+        {
+            float* orow = scoreMap.ptr<float>(y);
+            const int yBase = y + R;
+            for (int x = 0; x < W; x++)
+            {
+                const int xBase = x + R;
+                float sum = 0.f;
+                bool dead = false;
+                for (int k = 0; k < n; k++)
+                {
+                    const uint16_t* rx = gx.ptr<uint16_t>(yBase + poy[k]);
+                    const uint16_t* ry = gy.ptr<uint16_t>(yBase + poy[k]);
+                    const int ix = xBase + pox[k];
+                    const float d = pnx[k] * f16ToF32(rx[ix]) +
+                                    pny[k] * f16ToF32(ry[ix]);
+                    sum += std::fabs(d);
+                    const int m = k + 1;
+                    if (((m & 7) == 0) || m == n)
+                    {
+                        const float limA = ((target - 1.f) + slope * m) * m;
+                        const float limB = limN * (float)m * invN;
+                        const float lim = std::max(0.f, std::min(limA, limB));
+                        if (sum + (float)(n - m) < lim) { dead = true; break; }
+                    }
+                }
+                orow[x] = dead ? -1.f : sum * invN;
+            }
+        }
+    };
+
+    if (nested)
+        scanRows(0, scoreMap.rows);
+    else
+        cv::parallel_for_(cv::Range(0, scoreMap.rows),
+                          [&](const cv::Range& r) { scanRows(r.start, r.end); },
+                          std::max(1.0, (double)scoreMap.rows / 4.0));
+}
+
+//=======================================================================
+//  least squares sub-pixel refinement helpers
+//=======================================================================
+namespace
+{
+    struct SubXForm
+    {
+        std::vector<float> fx, fy;   // centre-relative position, sub-pixel
+        std::vector<float> nx, ny;   // unit normal, rotated
+        int n = 0;
+    };
+
+    inline void buildSubXForm(const std::vector<ModelPoint>& pts, double angle,
+                              double scale, SubXForm& s)
+    {
+        const int n = (int)pts.size();
+        s.n = n;
+        s.fx.resize((size_t)n); s.fy.resize((size_t)n);
+        s.nx.resize((size_t)n); s.ny.resize((size_t)n);
+        const float ca = (float)std::cos(angle), sa = (float)std::sin(angle);
+        const float sc = (float)scale;
+        for (int k = 0; k < n; k++)
+        {
+            const ModelPoint& mp = pts[(size_t)k];
+            s.fx[(size_t)k] = sc * (mp.x * ca + mp.y * sa);
+            s.fy[(size_t)k] = sc * (-mp.x * sa + mp.y * ca);
+            const float inv = (mp.mag > 1e-6f) ? (1.f / mp.mag) : 0.f;
+            s.nx[(size_t)k] = (mp.gx * ca + mp.gy * sa) * inv;
+            s.ny[(size_t)k] = (-mp.gx * sa + mp.gy * ca) * inv;
+        }
+    }
+
+    inline float sampleBilinear(const cv::Mat& m, int x0, int y0, float tx, float ty)
+    {
+        const uint16_t* r0 = m.ptr<uint16_t>(y0);
+        const uint16_t* r1 = m.ptr<uint16_t>(y0 + 1);
+        const float a = f16ToF32(r0[x0]), b = f16ToF32(r0[x0 + 1]);
+        const float c = f16ToF32(r1[x0]), d = f16ToF32(r1[x0 + 1]);
+        return (a * (1.f - tx) + b * tx) * (1.f - ty) + (c * (1.f - tx) + d * tx) * ty;
+    }
+
+    // Per-point dot products at a sub-pixel pose.  Returns false when the model
+    // would reach outside the image, in which case the caller rejects the step.
+    inline bool dotsAt(const cv::Mat& gx, const cv::Mat& gy, const SubXForm& s,
+                       float px, float py, int metric, std::vector<float>& dots)
+    {
+        const int n = s.n;
+        const int w = gx.cols, h = gx.rows;
+        dots.resize((size_t)n);
+        for (int k = 0; k < n; k++)
+        {
+            const float fx = px + s.fx[(size_t)k];
+            const float fy = py + s.fy[(size_t)k];
+            const int x0 = (int)std::floor(fx);
+            const int y0 = (int)std::floor(fy);
+            if (x0 < 0 || y0 < 0 || x0 + 1 >= w || y0 + 1 >= h)
+                return false;
+            const float tx = fx - (float)x0, ty = fy - (float)y0;
+            const float ix = sampleBilinear(gx, x0, y0, tx, ty);
+            const float iy = sampleBilinear(gy, x0, y0, tx, ty);
+            const float d = s.nx[(size_t)k] * ix + s.ny[(size_t)k] * iy;
+            dots[(size_t)k] = (metric == POL_LOCAL) ? std::fabs(d) : d;
+        }
+        return true;
+    }
+
+    // solve a small system A z = b (n <= 6) with partial pivoting
+    inline bool solveSmall(double A[6][6], double b[6], int n, double z[6])
+    {
+        for (int c = 0; c < n; c++)
+        {
+            int piv = c;
+            for (int r = c + 1; r < n; r++)
+                if (std::fabs(A[r][c]) > std::fabs(A[piv][c])) piv = r;
+            if (std::fabs(A[piv][c]) < 1e-14) return false;
+            if (piv != c)
+            {
+                for (int j = 0; j < n; j++) std::swap(A[c][j], A[piv][j]);
+                std::swap(b[c], b[piv]);
+            }
+            for (int r = c + 1; r < n; r++)
+            {
+                const double f = A[r][c] / A[c][c];
+                if (f == 0.0) continue;
+                for (int j = c; j < n; j++) A[r][j] -= f * A[c][j];
+                b[r] -= f * b[c];
+            }
+        }
+        for (int c = n - 1; c >= 0; c--)
+        {
+            double s = b[c];
+            for (int j = c + 1; j < n; j++) s -= A[c][j] * z[j];
+            z[c] = s / A[c][c];
+        }
+        return true;
+    }
+}
+
+//=======================================================================
+//  least squares sub-pixel refinement (Halcon SubPixel = 'least_squares')
+//
+//  Samples the score on the 3x3 grid around the integer peak, fits
+//      s(x, y) = a + b*x + c*y + d*x^2 + e*x*y + f*y^2
+//  by least squares (all nine samples, so the x*y term is modelled) and takes
+//  the stationary point of that surface.
+//
+//  Why not a Gauss-Newton on the per-point residuals: the dot products the
+//  scorer uses are weighted by the image gradient magnitude, which is not 1, so
+//  sum(1 - dot)^2 is not an "edge agreement" cost - it degenerates into
+//  "maximise gradient magnitude" and pulls the centre onto the strongest edge
+//  nearby (measured: 0.2-0.4 px bias away from the truth).  The quadratic fit
+//  works on the score the search actually optimises, and the cross term makes it
+//  more accurate than the separable parabola of mode 1 when the peak is skewed.
+//
+//  Angle and scale keep the interpolated values from mode 1: they are far less
+//  well conditioned here and letting them move drags the centre off.
+//=======================================================================
+void ShapeMatcher::leastSquaresRefine(int level, Candidate& c, int metric)
+{
+    const int R = modelLevels_[level].activePoints > 0 ? getXForm(level, c.angleIdx, c.scaleIdx).R : 0;
+    const cv::Mat& gx = srcGx_[level];
+    const cv::Mat& gy = srcGy_[level];
+    const int lo = R, hiX = gx.cols - 1 - R, hiY = gy.rows - 1 - R;
+    if (lo > hiX || lo > hiY) return;
+
+    const int ax = std::min(std::max(cvRound(c.pos.x), lo), hiX);
+    const int ay = std::min(std::max(cvRound(c.pos.y), lo), hiY);
+
+    const XForm* pxf = findXForm(level, c.angleIdx, c.scaleIdx);
+    if (!pxf) return;
+
+    // ---- 3x3 score samples ------------------------------------------------
+    double s[9];
+    double sx[9], sy[9];
+    int ns = 0;
+    for (int dy = -1; dy <= 1; dy++)
+        for (int dx = -1; dx <= 1; dx++)
+        {
+            const int px = std::min(std::max(ax + dx, lo), hiX);
+            const int py = std::min(std::max(ay + dy, lo), hiY);
+            s[ns] = scorePos(gx, gy, *pxf, py, px, -10.f, metric);
+            sx[ns] = (double)(px - ax);
+            sy[ns] = (double)(py - ay);
+            ns++;
+        }
+
+    // ---- least squares fit of the 6 coefficients --------------------------
+    double A[6][6] = { { 0 } };
+    double rhs[6] = { 0 };
+    for (int i = 0; i < ns; i++)
+    {
+        const double x = sx[i], y = sy[i];
+        const double phi[6] = { 1.0, x, y, x * x, x * y, y * y };
+        for (int p = 0; p < 6; p++)
+        {
+            rhs[p] += phi[p] * s[i];
+            for (int q = 0; q < 6; q++) A[p][q] += phi[p] * phi[q];
+        }
+    }
+    double coef[6];
+    if (!solveSmall(A, rhs, 6, coef)) return;
+
+    const double b = coef[1], cc = coef[2], d = coef[3], e = coef[4], f = coef[5];
+    const double D = 4.0 * d * f - e * e;
+    if (D <= 1e-12 || d >= 0.0) return;          // not a maximum: keep the pose
+
+    double dx = (-2.0 * f * b + e * cc) / D;
+    double dy = (e * b - 2.0 * d * cc) / D;
+    dx = std::min(std::max(dx, -1.0), 1.0);
+    dy = std::min(std::max(dy, -1.0), 1.0);
+
+    // guard: the fitted surface must not be wildly better than the samples
+    const double atPeak = scorePos(gx, gy, *pxf,
+                                   std::min(std::max(cvRound(ay + dy), lo), hiY),
+                                   std::min(std::max(cvRound(ax + dx), lo), hiX),
+                                   -10.f, metric);
+    if (atPeak < -0.5f) return;
+
+    c.pos = cv::Point2f((float)(ax + dx), (float)(ay + dy));
+}
+
+#if 0   // superseded by the quadratic-fit least squares above
+//=======================================================================
+//  local maxima of a score map
+//=======================================================================
+void ShapeMatcher::leastSquaresRefine(int level, Candidate& c, int metric)
+{
+    const std::vector<ModelPoint>& pts = modelLevels_[level].points;
+    const int n = (int)pts.size();
+    if (n < 8) return;
+
+    const cv::Mat& gx = srcGx_[level];
+    const cv::Mat& gy = srcGy_[level];
+
+    double th[4] = { (double)c.pos.x, (double)c.pos.y,
+                     (double)c.angle, (double)c.scale };
+    const double th0[4] = { th[0], th[1], th[2], th[3] };
+
+    const double hStep[4] = {
+        0.08, 0.08,
+        std::max(1e-5, std::fabs(angleStep_) * 0.20),
+        std::max(1e-6, std::fabs(scaleStep_) * 0.20)
+    };
+    // how far it may walk from the grid pose, so a bad start cannot slide onto
+    // a different object
+    const double maxDxy   = 2.0;
+    const double maxDang  = std::max(1e-4, std::fabs(angleStep_));
+    const double maxDscal = std::max(1e-5, std::fabs(scaleStep_));
+
+    SubXForm sxf, sPlus, sMinus;
+    std::vector<float> d0, dPlus, dMinus;
+    std::vector<float> wgt;
+    std::vector<float> jac[4];
+    wgt.resize((size_t)n);
+    for (int p = 0; p < 4; p++) jac[p].resize((size_t)n);
+
+    buildSubXForm(pts, th[2], th[3], sxf);
+    if (!dotsAt(gx, gy, sxf, (float)th[0], (float)th[1], metric, d0)) return;
+
+    double bestE = 0;
+    for (int k = 0; k < n; k++)
+    {
+        const double r = 1.0 - (double)d0[(size_t)k];
+        bestE += r * r;
+    }
+
+    // Only x and y are refined.  Angle and scale are kept at the interpolated
+    // values: on these images they are far less well conditioned than the
+    // position and letting them move drags the centre off by up to 0.3 px.
+    const int NP = 2;
+    for (int iter = 0; iter < 8; iter++)
+    {
+        // ---- finite-difference Jacobian of the dot products -------------
+        for (int p = 0; p < NP; p++)
+        {
+            double tp[4], tm[4];
+            for (int j = 0; j < 4; j++) { tp[j] = th[j]; tm[j] = th[j]; }
+            tp[p] += hStep[p];
+            tm[p] -= hStep[p];
+
+            sPlus = sxf;            // only the centre moves
+            sMinus = sxf;
+            if (!dotsAt(gx, gy, sPlus, (float)tp[0], (float)tp[1], metric, dPlus)) return;
+            if (!dotsAt(gx, gy, sMinus, (float)tm[0], (float)tm[1], metric, dMinus)) return;
+
+            const float inv2h = (float)(1.0 / (2.0 * hStep[p]));
+            for (int k = 0; k < n; k++)
+                jac[p][(size_t)k] = (dPlus[(size_t)k] - dMinus[(size_t)k]) * inv2h;
+        }
+        // Points that contradict the model (d <= 0) are treated as outliers with
+        // zero weight.  Without this the objective sum(1-d)^2 also rewards poses
+        // where some points sit on an inverted edge (|d| -> 1), so the refinement
+        // would happily slide onto the wrong polarity.
+        for (int k = 0; k < n; k++) wgt[(size_t)k] = (d0[(size_t)k] > 0.f) ? 1.f : 0.f;
+        double wsum = 0;
+        for (int k = 0; k < n; k++) wsum += wgt[(size_t)k];
+        if (wsum < 0.25 * (double)n) break;      // too few agreeing points
+
+        // the baseline cost has to use the same weights as the step, otherwise
+        // the first iteration compares two different objectives
+        if (iter == 0)
+        {
+            bestE = 0;
+            for (int k = 0; k < n; k++)
+            {
+                if (wgt[(size_t)k] == 0.f) continue;
+                const double r = 1.0 - (double)d0[(size_t)k];
+                bestE += r * r;
+            }
+        }
+
+        // ---- normal equations H d = g -----------------------------------
+        double H[4][4] = { { 0 } };
+        double g[4] = { 0 };
+        for (int p = 0; p < NP; p++)
+        {
+            double gp = 0;
+            for (int k = 0; k < n; k++)
+                gp += wgt[(size_t)k] * (double)jac[p][(size_t)k] *
+                      (1.0 - (double)d0[(size_t)k]);
+            g[p] = gp;
+            for (int q = 0; q <= p; q++)
+            {
+                double s = 0;
+                for (int k = 0; k < n; k++)
+                    s += wgt[(size_t)k] * (double)jac[p][(size_t)k] *
+                         (double)jac[q][(size_t)k];
+                H[p][q] = H[q][p] = s;
+            }
+        }
+
+        // Jacobi preconditioning keeps the solve well behaved when the two
+        // directions have very different curvature
+        double sc[4];
+        for (int p = 0; p < NP; p++)
+            sc[p] = std::sqrt(std::max(H[p][p], 1e-16));
+
+        double A[4][4], b[4], z[4];
+        for (int p = 0; p < NP; p++)
+        {
+            b[p] = g[p] / sc[p];
+            for (int q = 0; q < NP; q++) A[p][q] = H[p][q] / (sc[p] * sc[q]);
+        }
+        for (int p = 0; p < NP; p++) A[p][p] += 1e-3;    // light damping
+        if (!solveSmall(A, b, NP, z)) break;
+
+        double dth[4] = { 0, 0, 0, 0 };
+        for (int p = 0; p < NP; p++) dth[p] = z[p] / sc[p];
+
+        dth[0] = std::min(std::max(dth[0], -0.5), 0.5);
+        dth[1] = std::min(std::max(dth[1], -0.5), 0.5);
+
+        double cand[4];
+        for (int p = 0; p < 4; p++) cand[p] = th[p] + dth[p];
+        cand[0] = std::min(std::max(cand[0], th0[0] - maxDxy), th0[0] + maxDxy);
+        cand[1] = std::min(std::max(cand[1], th0[1] - maxDxy), th0[1] + maxDxy);
+
+        if (!dotsAt(gx, gy, sxf, (float)cand[0], (float)cand[1], metric, dPlus)) break;
+
+        double newE = 0;
+        for (int k = 0; k < n; k++)
+        {
+            if (wgt[(size_t)k] == 0.f) continue;
+            const double r = 1.0 - (double)dPlus[(size_t)k];
+            newE += r * r;
+        }
+        if (newE >= bestE - 1e-12) break;    // no improvement: converged
+
+        for (int p = 0; p < 4; p++) th[p] = cand[p];
+        d0.swap(dPlus);
+        bestE = newE;
+
+        if (std::fabs(dth[0]) < 1e-3 && std::fabs(dth[1]) < 1e-3 &&
+            std::fabs(dth[2]) < 1e-5 && std::fabs(dth[3]) < 1e-6) break;
+    }
+
+    c.pos   = cv::Point2f((float)th[0], (float)th[1]);
+    c.angle = (float)th[2];
+    c.scale = (float)th[3];
+    float s = 0.f;
+    for (int k = 0; k < n; k++) s += d0[(size_t)k];
+    if (metric == POL_GLOBAL) s = std::fabs(s);
+    c.score = s / (float)n;
+}
+#endif  // dead Gauss-Newton implementation
 
 //=======================================================================
 //  local maxima of a score map
@@ -1779,13 +2272,16 @@ std::vector<MatchResult> ShapeMatcher::findShapeModel(const cv::Mat& gray, const
                 int R = 0;
                 const XForm& xf = getXForm(top, ai, si);
                 const int K = 2 * xf.R + 1;
-                if (K * K <= 6 * std::max(1, xf.n))
+                // the dense path builds a correlation kernel, which cannot
+                // express |dot|; any polarity other than use_polarity therefore
+                // goes through the sparse scan
+                if (fp.metric == 0 && K * K <= 6 * std::max(1, xf.n))
                 {
                     correlate(top, ai, si, map, R);
                     nDense++;
                 }
                 else
-                    correlateSparse(top, ai, si, map, R, topTarget, fp.greediness);
+                    scanPose(top, xf, map, R, topTarget, fp.greediness, fp.metric, false);
                 if (fp.debug)
                 {
                     double mn, mx;
@@ -1829,8 +2325,8 @@ std::vector<MatchResult> ShapeMatcher::findShapeModel(const cv::Mat& gray, const
                                 fprintf(stderr, "  [dbg] cache miss in worker: "
                                         "ai=%d si=%d\n", ai, si);
                         }
-                        correlateSparseX(top, *pxf, lmap, R, topTarget,
-                                         fp.greediness, true);
+                        scanPose(top, *pxf, lmap, R, topTarget,
+                                 fp.greediness, fp.metric, true);
                         if (fp.debug)
                         {
                             double mn, mx;
@@ -1883,7 +2379,7 @@ std::vector<MatchResult> ShapeMatcher::findShapeModel(const cv::Mat& gray, const
     for (int l = top - 1; l >= 0; l--)
     {
         int64 tr0 = cv::getTickCount();
-        refineLevel(l, cands, maxKeep, fp.minScore);
+        refineLevel(l, cands, maxKeep, fp.minScore, fp.metric);
         phRefine += msSince(tr0);
         if (fp.debug && !cands.empty())
         {
@@ -1899,12 +2395,36 @@ std::vector<MatchResult> ShapeMatcher::findShapeModel(const cv::Mat& gray, const
     {
         int64 tsub0 = cv::getTickCount();
         for (size_t i = 0; i < cands.size(); i++)
-            subpixelRefine(0, cands[i]);
+            subpixelRefine(0, cands[i], fp.subpixel, fp.metric);
         phSubpixel = msSince(tsub0);
     }
 
     std::sort(cands.begin(), cands.end(),
               [](const Candidate& a, const Candidate& b) { return a.score > b.score; });
+
+    // Overlap between two instances, for maxOverlap.  Both are the same rotated
+    // rectangle (template size x its own scale), so this is
+    //   intersection area / area of the smaller rectangle,
+    // 0 = no overlap, 1 = one completely contains the other.
+    const cv::Size2f tplSize((float)modelLevels_[0].size.width,
+                             (float)modelLevels_[0].size.height);
+    auto overlapOf = [&](const MatchResult& a, const MatchResult& b) -> double
+    {
+        if (tplSize.width <= 0.f || tplSize.height <= 0.f) return 0.0;
+        const cv::Size2f sa(tplSize.width * a.scale, tplSize.height * a.scale);
+        const cv::Size2f sb(tplSize.width * b.scale, tplSize.height * b.scale);
+        // the pose maps the model by [[ca, sa], [-sa, ca]], i.e. a rotation of
+        // -angle; RotatedRect counts the angle the other way round in an image
+        cv::RotatedRect ra(a.pos, sa, -(double)a.angle * 180.0 / CV_PI);
+        cv::RotatedRect rb(b.pos, sb, -(double)b.angle * 180.0 / CV_PI);
+        std::vector<cv::Point2f> inter;
+        const int rc = cv::rotatedRectangleIntersection(ra, rb, inter);
+        const double smaller = std::min((double)sa.area(), (double)sb.area());
+        if (rc == cv::INTERSECT_NONE || inter.size() < 3 || smaller <= 0.0)
+            return 0.0;
+        return std::min(1.0, std::fabs(cv::contourArea(inter)) / smaller);
+    };
+    const bool useOverlap = (fp.maxOverlap < 0.999);
 
     const float minD = (float)std::max(1.0, fp.minDistance);
     for (size_t i = 0; i < cands.size() && (int)results.size() < fp.maxMatches; i++)
@@ -1920,6 +2440,12 @@ std::vector<MatchResult> ShapeMatcher::findShapeModel(const cv::Mat& gray, const
                 std::abs(c.scale - o.scale) < 0.12)
             {
                 dup = true; break;
+            }
+            if (useOverlap)
+            {
+                MatchResult candRes;
+                candRes.pos = c.pos; candRes.angle = c.angle; candRes.scale = c.scale;
+                if (overlapOf(candRes, o) > fp.maxOverlap) { dup = true; break; }
             }
         }
         if (!dup)
@@ -1963,14 +2489,20 @@ std::vector<MatchResult> ShapeMatcher::findShapeModel(const cv::Mat& gray, const
             ax = std::min(std::max(ax, xf.R), srcGx_[0].cols - 1 - xf.R);
             ay = std::min(std::max(ay, xf.R), srcGx_[0].rows - 1 - xf.R);
 
-            const PoseScore ps = scorePoseDetail(srcGx_[0], srcGy_[0], xf, ay, ax);
+            const PoseScore ps = scorePoseDetail(srcGx_[0], srcGy_[0], xf, ay, ax, fp.metric);
             r.coverage = ps.coverage;
             if (fp.scoreMode == 2)          // trimmed-mean needs the sorted dots
-                r.score = scorePosMode(srcGx_[0], srcGy_[0], xf, ay, ax, 2);
+                r.score = scorePosMode(srcGx_[0], srcGy_[0], xf, ay, ax, 2, fp.metric);
             else if (fp.scoreMode == 0)     // mean: identical to the search score
                 r.score = ps.mean;
             else if (fp.scoreMode == 1)     // positive-mean
-                r.score = ps.coverage > 0.f ? ps.clipped / ps.coverage : 0.f;
+            {
+                // local polarity makes every point positive, so coverage is not
+                // a useful denominator there
+                r.score = (fp.metric == 2 || ps.coverage <= 0.f)
+                              ? ps.mean
+                              : ps.clipped / ps.coverage;
+            }
             else                            // any other mode, i.e. 3 = clipped-mean
                 r.score = ps.clipped;
         }

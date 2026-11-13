@@ -76,9 +76,45 @@ struct FindParams
 {
     double minScore    = 0.6;
     int    maxMatches  = 20;
+    // 0 = off.  Minimum centre distance between two reported instances, in
+    // pixels at the search image scale.  Kept for compatibility; prefer
+    // maxOverlap below because it is scale independent.
     double minDistance = 40;
+
+    // Halcon's MaxOverlap: the model rectangles of two reported instances may
+    // not overlap by more than this fraction.  Overlap is
+    //   intersection area / area of the smaller rectangle,
+    // computed from the two rotated rectangles (template size x scale at the
+    // found pose), so it does not have to be retuned when the template size
+    // or the scale range changes.  1.0 = off (default, keeps old behaviour),
+    // 0 = no overlap at all allowed.  Halcon's default is 0.5.
+    double maxOverlap  = 1.0;
+
     double greediness  = 0.9;
+
+    // Sub-pixel refinement (Halcon's SubPixel):
+    //   0 = none          - keep the integer grid result
+    //   1 = interpolation - parabola through (p-1, p, p+1) in x, y, angle,
+    //                       scale.  Cheap, what this library always did.
+    //   2 = least_squares - Gauss-Newton on sum(1 - dot)^2 over
+    //                       (x, y, angle, scale) with sub-pixel sampling.
+    //                       More accurate on soft/low-contrast edges, slower.
+    //   (Halcon's 'minimum_distance' is not implemented.)
     int    subpixel    = 1;
+
+    // Gradient polarity (Halcon's Metric):
+    //   0 = use_polarity           - the gradient direction must match the
+    //                                template exactly (default, Halcon default)
+    //   1 = ignore_global_polarity  - a globally inverted target (bright/dark
+    //                                swapped) still matches: the score becomes
+    //                                |mean| of the dot products
+    //   2 = ignore_local_polarity   - the direction is ignored per point:
+    //                                score = mean(|dot|).  Handles targets where
+    //                                only part of the edges flip (specular
+    //                                metal, mixed lighting).  Slower: the scan
+    //                                cannot use the SIMD correlation kernel.
+    int    metric      = 0;
+
     bool   useOpenCL   = true;
     int    debug       = 0;
     int    scoreMode   = 1;    // final score aggregation: 1 = positive-mean (default),
@@ -219,6 +255,24 @@ private:
                           double target, double greed, bool nested = false);
     void extractCandidates(const cv::Mat& scoreMap, int level, int aIdx, int sIdx, int R,
                            double thresh, std::vector<Candidate>& out, int maxPerMap, int nmsRadius);
-    void refineLevel(int level, std::vector<Candidate>& cands, int maxKeep, double minScore);
-    void subpixelRefine(int level, Candidate& c);
+    void refineLevel(int level, std::vector<Candidate>& cands, int maxKeep, double minScore,
+                     int metric = 0);
+    // mode 1 = parabola interpolation (default), mode 2 = least squares
+    void subpixelRefine(int level, Candidate& c, int mode, int metric);
+
+    // Gauss-Newton on sum(1 - dot)^2 over (x, y, angle, scale) with bilinear
+    // sampling of the gradient field.  Used by subpixel mode 2.
+    void leastSquaresRefine(int level, Candidate& c, int metric);
+
+    // One pose scan that respects the polarity (Halcon Metric):
+    //   0 use_polarity          -> the SIMD sparse scan
+    //   1 ignore_global_polarity-> two scans (normal + negated normals), max
+    //   2 ignore_local_polarity -> scalar scan on mean(|dot|)
+    void scanPose(int level, const XForm& xf, cv::Mat& scoreMap, int& R,
+                  double target, double greed, int metric, bool nested);
+
+    // metric 2 (ignore_local_polarity) needs mean(|dot|), which the SIMD
+    // correlation kernel cannot express, so this is a plain scalar scan.
+    void scanLocalPolarity(int level, const XForm& xf, cv::Mat& scoreMap, int& R,
+                           double target, double greed, bool nested);
 };

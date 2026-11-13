@@ -70,8 +70,17 @@ struct Config
     double minScore     = 0.55;
     int    maxMatches   = 12;
     double minDistance  = 30.0;
+    // Halcon's MaxOverlap: instances whose model rectangles overlap by more
+    // than this fraction cannot both be reported.  Scale independent, so it
+    // does not have to be retuned when the template size or the scale range
+    // changes.  1.0 = off (default), 0.5 is Halcon's default.
+    double maxOverlap   = 1.0;
     double greediness   = 0.9;
+    // 0 = none, 1 = parabola interpolation (default), 2 = least squares
     int    subpixel     = 1;
+    // Halcon's Metric: 0 = use_polarity (default), 1 = ignore_global_polarity,
+    // 2 = ignore_local_polarity.  See FindParams::metric.
+    int    metric       = 0;
     bool   useOpenCL    = true;
     int    debug        = 0;
     int    scoreMode    = 1;    // final score aggregation: 1 = positive-mean (default),
