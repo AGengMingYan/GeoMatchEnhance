@@ -6,7 +6,7 @@
 //    AnalyzeCase <图片目录> <模型文件> [选项]
 //
 //  选项:
-//    --min-score X   最小分数(默认 0.5)
+//    --min-score X   最小分数(默认 0.7)
 //    --limit N       只跑前 N 张(默认全跑)
 //    --dump <目录>   把带框的结果图写到目录里
 //    --probe N       对前 N 张图做位姿探针: 看看在找到的位姿附近分数怎么变
@@ -490,7 +490,7 @@ int main(int argc, char** argv)
 
     std::string dir   = argv[1];
     std::string model = argv[2];
-    double minScore   = 0.5;
+    double minScore   = 0.7;
     double minDist    = 0.0;     // 0 = 用模型默认值
     int    scoreMode  = 0;       // 0 = mean(默认, 与 Halcon 一致), 1 = positive-mean,
                                  // 2 = trimmed-mean, 3 = clipped-mean

@@ -987,3 +987,62 @@ CMake 里要同时兼容两种（先试 `x64/vc15/lib`，再退回根目录）�
 `cmake -G Ninja -A x64` 不生效。32 位构建要先 `vcvars32.bat` 再 `cmake -G Ninja`，
 所以 `tools/build-x86.bat` 里第一句就是 `call vcvars32.bat`。
 
+
+---
+
+## 验证指标前先确认「打印格式」：`setprecision(n)` 默认是有效数字，不是小数位（2026-11-13 踩坑）
+
+`GeoMatchDemo` 打印角度原来是：
+
+```cpp
+<< std::defaultfloat << "  angle=" << std::setprecision(1) << (d.angle * 180.0 / CV_PI)
+```
+
+默认浮点格式下 `setprecision(n)` = **有效数字位数**，于是：
+
+| 真值 | 打印成 | 看起来像 |
+|---|---|---|
+| 14.77° | `1e+01` | 10° |
+| 15.0° | `2e+01` | 20° |
+| 45.05° | `5e+01` | 50° |
+
+据此我判断"存在 5° 角度偏差"，然后一路去查金字塔角度网格、`subpixelRefine`
+的抛物线插值、`c.angleIdx` 同步……**全是白做**。真实误差只有 0.05°。
+
+正确写法（定点）：
+
+```cpp
+<< "  angle=" << std::fixed << std::setprecision(2) << (d.angle * 180.0 / CV_PI)
+<< "deg  scale=" << std::setprecision(3) << d.scale
+```
+
+### 规则
+
+1. **任何"精度/误差"类指标，先看打印格式。** `std::setprecision(n)` 不加 `std::fixed`
+   就是有效数字；`%.0g` / `%g` 同理。
+2. 快速判断：同一行里如果 `0.002` 打成 `0.002`、`45` 却打成 `5e+01`，就是有效数字格式。
+3. 用**独立工具**交叉验证真值（本次用 OpenCV `matchTemplate` + 旋转扫描，
+   在真值角度给出 ncc=0.9979），能立刻把"算法退化"和"格式问题"分开。
+4. 比较新旧指标前先确认两边**打印口径一致**，否则比的是格式不是算法。
+
+## CLI 默认值必须与库/GUI 默认值一致，否则命令行指标整体失真
+
+| 位置 | `scoreMode` 默认 |
+|---|---|
+| `Config` / `FindParams` / `App`（GUI） | `0`（mean，与 Halcon 一致） |
+| `main.cpp` 的 `-score-mode` | **`1`（positive-mean）← 漏改** |
+
+后果：库和 GUI 用 mean、命令行用 positive-mean，同一个假位姿的分数从 0.567 被抬到 0.946，
+**命令行跑出来的指标整体虚高**，而且分数"看起来更好"，极难发现。
+
+**规则**：改默认值时用 grep 把该名字的**所有**赋值点列出来逐个确认，
+包括 `main.cpp` / `main1.cpp` / 示例程序 / `toConfig()` / `syncFromConfig()`。
+自动检查：
+
+```powershell
+Select-String -Path *.cpp,*/*.cpp,*/*.h -Pattern 'scoreMode\s*=' |
+    ForEach-Object { $_.Filename + ':' + $_.LineNumber + '  ' + $_.Line.Trim() }
+```
+
+**一句话：默认值只应有一处定义；命令行"未指定"必须回落到库默认，不要另抄一份字面量。**
+

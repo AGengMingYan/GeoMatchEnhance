@@ -82,9 +82,10 @@ struct MatchParams
 
 struct FindParams
 {
-    // 0.45: the default scoreMode is now 0 (mean, Halcon-compatible), whose
-    // scores run ~0.10 lower than the old positive-mean for the same pose.
-    double minScore    = 0.45;
+    // 0.7: 默认评分阈值。默认 scoreMode 是 0（mean，Halcon 语义），同一位姿
+    // 的分数比旧的 positive-mean 低约 0.10；需要追召回时可手动调低，但要配合
+    // minCoverage / scoreMode 抑制误检（见 README 的"误检抑制"章节）。
+    double minScore    = 0.7;
     int    maxMatches  = 20;
     // 0 = off.  Minimum centre distance between two reported instances, in
     // pixels at the search image scale.  Kept for compatibility; prefer
@@ -149,6 +150,12 @@ struct FindParams
     // big fraction of the points contradicting it, and coverage falls.
     // Costs one extra n-point pass per reported match.
     float  minCoverage = 0.f;
+
+    // 评分稳健性改进已内建，不再提供开关：
+    //  - 软门限梯度归一化：弱梯度按 min(mag/minContrast,1) 给部分权重而非归零，
+    //    轻微模糊/光照变化下分数不再塌到 0.4~0.7（见 prepareSource）。
+    //  - 亚像素梯度采样：精化/复评在模型点真实旋转位置双线性插值，消除整数
+    //    取整的 <=0.5px 抖动，降低斜角误差（粗扫仍用整数卷积核保速度）。
 };
 
 class SHAPEMATCH_API ShapeMatcher

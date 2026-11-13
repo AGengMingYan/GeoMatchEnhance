@@ -36,3 +36,26 @@ _sdk64dll
 _sdk32
 build_dll64
 build_x86
+
+# 本机加密软件产生的图片/文件密文备份（原名后追加 .txt，仅本地使用，见 .clinerules）
+*.png.txt
+*.jpg.txt
+*.jpeg.txt
+*.bmp.txt
+*.tif.txt
+*.tiff.txt
+*.ico.txt
+
+# 匹配模型序列化产物：形状模型 .shm，NCC 模型 .ncm（运行时生成，可由模板重建）
+*.shm
+*.ncm
+
+# CLI / Demo 匹配结果输出目录
+out/
+
+# 外部标准数据集（Oxford 等，体积大，可重新下载，不入库）
+dataset/
+
+# 本机明文加密包约定扩展名（.zip/.7z 落盘即密文，详见 .clinerules）
+*.zip1
+*.7z1

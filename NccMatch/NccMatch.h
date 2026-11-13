@@ -76,7 +76,7 @@ struct NccParams
 //-----------------------------------------------------------------------
 struct NccFindParams
 {
-    double minScore   = 0.5;
+    double minScore   = 0.7;   // NCC 分数范围 [-1,1]，0.7 算"较像"，0.8 以上基本确定
     int    maxMatches = 1;
     // Halcon's MaxOverlap: two reported instances may not overlap by more than
     // this fraction of the smaller rotated rectangle.  0.5 is Halcon's default

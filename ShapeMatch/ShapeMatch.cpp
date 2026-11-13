@@ -114,7 +114,8 @@ static inline float f16ToF32(uint16_t h)
 
 struct XForm
 {
-    std::vector<int16_t> ox, oy;
+    std::vector<int16_t> ox, oy;   // cvRound of the rotated offset (coarse scan)
+    std::vector<float>   fx, fy;   // exact rotated offset (sub-pixel sampling)
     std::vector<float>   nx, ny;
     int  R = 0;
     int  n = 0;
@@ -632,6 +633,7 @@ void ShapeMatcher::buildXForm(int level, int aIdx, int sIdx, XForm& xf) const
     const float ca = (float)std::cos(a), sa = (float)std::sin(a);
 
     xf.ox.resize(n); xf.oy.resize(n);
+    xf.fx.resize(n); xf.fy.resize(n);
     xf.nx.resize(n); xf.ny.resize(n);
     int R = 0;
     for (int k = 0; k < n; k++)
@@ -646,6 +648,9 @@ void ShapeMatcher::buildXForm(int level, int aIdx, int sIdx, XForm& xf) const
         int ix = cvRound(cx), iy = cvRound(cy);
         xf.ox[k] = (int16_t)ix;
         xf.oy[k] = (int16_t)iy;
+        // exact (sub-pixel) rotated offset, used by the built-in bilinear scoring
+        xf.fx[k] = cx;
+        xf.fy[k] = cy;
         xf.nx[k] = vx;
         xf.ny[k] = vy;
         int m = std::max(std::abs(ix), std::abs(iy));
@@ -736,16 +741,20 @@ namespace
     template <class T>
     void normGradients(const T& gray, T& sx, T& sy, double minContrast)
     {
-        T gx, gy, mag, den, msk, tx, ty;
+        T gx, gy, mag, den, tx, ty;
         cv::Sobel(gray, gx, CV_32F, 1, 0, 3);
         cv::Sobel(gray, gy, CV_32F, 0, 1, 3);
         cv::magnitude(gx, gy, mag);
         cv::max(mag, cv::Scalar(minContrast), den);
         cv::divide(gx, den, tx);
         cv::divide(gy, den, ty);
-        cv::threshold(mag, msk, minContrast, 1.0, cv::THRESH_BINARY);
-        cv::multiply(tx, msk, sx);
-        cv::multiply(ty, msk, sy);
+        // 软门限（内建）：连续斜坡 w = min(mag / minContrast, 1)，弱梯度给部分
+        // 权重而非直接归零，轻微模糊/光照变化下分数不会塌到 0.4~0.7 区间。
+        T w;
+        cv::divide(mag, cv::Scalar(minContrast), w);
+        cv::min(w, cv::Scalar(1.0), w);
+        cv::multiply(tx, w, sx);
+        cv::multiply(ty, w, sy);
     }
 
     //-------------------------------------------------------------------
@@ -773,7 +782,8 @@ namespace
         return i;
     }
 
-    void gradientHalves(const cv::Mat& gray8, cv::Mat& gx16, cv::Mat& gy16, double minContrast)
+    void gradientHalves(const cv::Mat& gray8, cv::Mat& gx16, cv::Mat& gy16,
+                        double minContrast)
     {
         CV_Assert(gray8.type() == CV_8U);
         const int h = gray8.rows, w = gray8.cols;
@@ -842,10 +852,10 @@ namespace
                 const __m256 mag = _mm256_sqrt_ps(
                     _mm256_add_ps(_mm256_mul_ps(gx, gx), _mm256_mul_ps(gy, gy)));
                 const __m256 den = _mm256_max_ps(mag, vmc);
-                // multiply by 0/1, exactly like cv::threshold + cv::multiply
-                const __m256 mask = _mm256_and_ps(_mm256_cmp_ps(mag, vmc, _CMP_GT_OQ), one);
-                const __m256 ox = _mm256_mul_ps(_mm256_div_ps(gx, den), mask);
-                const __m256 oy = _mm256_mul_ps(_mm256_div_ps(gy, den), mask);
+                // 软门限（内建）：连续斜坡 min(mag/mc,1)，弱梯度给部分权重而非归零
+                const __m256 wt = _mm256_min_ps(_mm256_div_ps(mag, vmc), one);
+                const __m256 ox = _mm256_mul_ps(_mm256_div_ps(gx, den), wt);
+                const __m256 oy = _mm256_mul_ps(_mm256_div_ps(gy, den), wt);
                 _mm_storeu_si128((__m128i*)(gxr + x), _mm256_cvtps_ph(ox, _MM_FROUND_TO_NEAREST_INT));
                 _mm_storeu_si128((__m128i*)(gyr + x), _mm256_cvtps_ph(oy, _MM_FROUND_TO_NEAREST_INT));
             }
@@ -860,7 +870,7 @@ namespace
                     const float gy = (float)(D[xx - 1] + 2 * D[xx] + D[xx + 1]);
                     const float mag = std::sqrt(gx * gx + gy * gy);
                     const float den = std::max(mag, mc);
-                    const float m = (mag > mc) ? 1.f : 0.f;
+                    const float m = std::min(mag / mc, 1.f);
                     fx[t] = gx / den * m;
                     fy[t] = gy / den * m;
                 }
@@ -883,7 +893,7 @@ namespace
                 const float gy = (float)(D[x - 1] + 2 * D[x] + D[x + 1]);
                 const float mag = std::sqrt(gx * gx + gy * gy);
                 const float den = std::max(mag, mc);
-                const float m = (mag > mc) ? 1.f : 0.f;
+                const float m = std::min(mag / mc, 1.f);
                 gxr[x] = f32ToF16(gx / den * m);
                 gyr[x] = f32ToF16(gy / den * m);
             }
@@ -1179,6 +1189,28 @@ namespace
     // dot = model-normal . image-gradient, in [-1, 1].
     enum : int { POL_USE = 0, POL_GLOBAL = 1, POL_LOCAL = 2 };
 
+    // P0: bilinear sample of one f16 gradient plane at a sub-pixel location.
+    // The caller guarantees y,x stay inside [0, h-2] x [0, w-2]; the clamp at
+    // the end covers the last row/column so a border pose never reads OOB.
+    inline float sampleF16Bilinear(const cv::Mat& m, float fy, float fx)
+    {
+        int x0 = (int)std::floor(fx), y0 = (int)std::floor(fy);
+        int x1 = x0 + 1, y1 = y0 + 1;
+        x0 = std::min(std::max(x0, 0), m.cols - 1);
+        y0 = std::min(std::max(y0, 0), m.rows - 1);
+        x1 = std::min(std::max(x1, 0), m.cols - 1);
+        y1 = std::min(std::max(y1, 0), m.rows - 1);
+        const float tx = fx - std::floor(fx), ty = fy - std::floor(fy);
+        const float v00 = f16ToF32(m.ptr<uint16_t>(y0)[x0]);
+        const float v01 = f16ToF32(m.ptr<uint16_t>(y0)[x1]);
+        const float v10 = f16ToF32(m.ptr<uint16_t>(y1)[x0]);
+        const float v11 = f16ToF32(m.ptr<uint16_t>(y1)[x1]);
+        const float top = v00 + (v01 - v00) * tx;
+        const float bot = v10 + (v11 - v10) * tx;
+        return top + (bot - top) * ty;
+    }
+
+
     inline float scorePos(const cv::Mat& sx, const cv::Mat& sy, const XForm& xf,
                           int ay, int ax, float limit, int metric = POL_USE)
     {
@@ -1213,6 +1245,29 @@ namespace
         }
         if (metric == POL_GLOBAL) sum = std::fabs(sum);
         return sum / n;
+    }
+
+    // P0: sub-pixel counterpart of scorePos().  The centre (ay, ax) is allowed
+    // to be fractional and each model point uses its exact rotated offset
+    // (xf.fx/fy), so the image gradients are bilinear-interpolated instead of
+    // snapped to a pixel.  No early-exit pruning here: this runs only on the few
+    // surviving candidates and a partial-sum bound is not valid once sampling
+    // is interpolated.  Borders are handled inside sampleF16Bilinear.
+    inline float scorePosSubpix(const cv::Mat& sx, const cv::Mat& sy, const XForm& xf,
+                                 float ay, float ax, int metric = POL_USE)
+    {
+        const int n = xf.n;
+        float sum = 0.f;
+        for (int k = 0; k < n; k++)
+        {
+            const float gx = sampleF16Bilinear(sx, ay + xf.fy[k], ax + xf.fx[k]);
+            const float gy = sampleF16Bilinear(sy, ay + xf.fy[k], ax + xf.fx[k]);
+            float d = xf.nx[k] * gx + xf.ny[k] * gy;
+            if (metric == POL_LOCAL) d = std::fabs(d);
+            sum += d;
+        }
+        if (metric == POL_GLOBAL) sum = std::fabs(sum);
+        return n > 0 ? sum / n : 0.f;
     }
 
     // robust re-scoring of the final matches.  search/refine use mean (scorePos);
@@ -1313,10 +1368,10 @@ namespace
         double total = 0;
         for (int k = 0; k < n; k++)
         {
-            const uint16_t* rx = sx.ptr<uint16_t>(ay + xf.oy[k]);
-            const uint16_t* ry = sy.ptr<uint16_t>(ay + xf.oy[k]);
-            dots[(size_t)k] = xf.nx[k] * f16ToF32(rx[ax + xf.ox[k]]) +
-                              xf.ny[k] * f16ToF32(ry[ax + xf.ox[k]]);
+            // 亚像素梯度采样（内建）：在真实旋转位置双线性插值，消除整数取整抖动
+            const float gx = sampleF16Bilinear(sx, (float)ay + xf.fy[k], (float)ax + xf.fx[k]);
+            const float gy = sampleF16Bilinear(sy, (float)ay + xf.fy[k], (float)ax + xf.fx[k]);
+            dots[(size_t)k] = xf.nx[k] * gx + xf.ny[k] * gy;
             total += dots[(size_t)k];
         }
 
@@ -1590,11 +1645,20 @@ void ShapeMatcher::subpixelRefine(int level, Candidate& c, int mode, int metric)
     int ax = std::min(std::max(cvRound(c.pos.x), lo), hiX);
     int ay = std::min(std::max(cvRound(c.pos.y), lo), hiY);
 
-    float s0 = scorePos(srcGx_[level], srcGy_[level], xf0, ay, ax, -10.f, metric);
-    float spx = scorePos(srcGx_[level], srcGy_[level], xf0, ay, ax + 1, -10.f, metric);
-    float smx = scorePos(srcGx_[level], srcGy_[level], xf0, ay, ax - 1, -10.f, metric);
-    float spy = scorePos(srcGx_[level], srcGy_[level], xf0, ay + 1, ax, -10.f, metric);
-    float smy = scorePos(srcGx_[level], srcGy_[level], xf0, ay - 1, ax, -10.f, metric);
+    // 亚像素梯度采样（内建）：在模型点真实旋转位置双线性插值采样图像梯度，
+    // 消除整数取整的 <=0.5px 抖动。+-1 的抛物线探测仍整像素移动，保证有限差分
+    // 曲率可比。粗扫仍走整数卷积核，这里只作用于少量存活候选。
+    auto eval = [&](const XForm& xf, int cy, int cx) -> float
+    {
+        return scorePosSubpix(srcGx_[level], srcGy_[level], xf,
+                              (float)cy, (float)cx, metric);
+    };
+
+    float s0 = eval(xf0, ay, ax);
+    float spx = eval(xf0, ay, ax + 1);
+    float smx = eval(xf0, ay, ax - 1);
+    float spy = eval(xf0, ay + 1, ax);
+    float smy = eval(xf0, ay - 1, ax);
 
     float dx = 0.f, dy = 0.f;
     float den = 2.f * s0 - spx - smx;
@@ -1616,10 +1680,8 @@ void ShapeMatcher::subpixelRefine(int level, Candidate& c, int mode, int metric)
         float v0 = s0;
         // every getXForm() may purge the cache, so no reference may be kept
         // across two calls
-        float vp = scorePos(srcGx_[level], srcGy_[level],
-                            getXForm(level, ap, c.scaleIdx), ay, ax, -10.f, metric);
-        float vm = scorePos(srcGx_[level], srcGy_[level],
-                            getXForm(level, am, c.scaleIdx), ay, ax, -10.f, metric);
+        float vp = eval(getXForm(level, ap, c.scaleIdx), ay, ax);
+        float vm = eval(getXForm(level, am, c.scaleIdx), ay, ax);
         float d = 2.f * v0 - vp - vm;
         if (d > 1e-6f)
         {
@@ -1633,10 +1695,8 @@ void ShapeMatcher::subpixelRefine(int level, Candidate& c, int mode, int metric)
     {
         int sp = std::min(c.scaleIdx + 1, nS - 1), sm = std::max(c.scaleIdx - 1, 0);
         float v0 = s0;
-        float vp = scorePos(srcGx_[level], srcGy_[level],
-                            getXForm(level, c.angleIdx, sp), ay, ax, -10.f, metric);
-        float vm = scorePos(srcGx_[level], srcGy_[level],
-                            getXForm(level, c.angleIdx, sm), ay, ax, -10.f, metric);
+        float vp = eval(getXForm(level, c.angleIdx, sp), ay, ax);
+        float vm = eval(getXForm(level, c.angleIdx, sm), ay, ax);
         float d = 2.f * v0 - vp - vm;
         if (d > 1e-6f)
         {

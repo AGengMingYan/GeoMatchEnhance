@@ -13,7 +13,7 @@
 //                 -mask mask.png
 //
 //    search:  NccDemo -t2 -load model.ncm -s img.png -o out
-//                 -minscore 0.5    min_score
+//                 -minscore 0.7    min_score
 //                 -max 1           num_matches
 //                 -overlap 0.5     max_overlap
 //                 -subpix 1        sub_pixel
@@ -79,7 +79,7 @@ namespace
             "\n"
             "search one image:\n"
             "  NccDemo -t2 -load <model.ncm> -s <image> -o <outdir> [options]\n"
-            "     -minscore F     default 0.5                         (min_score)\n"
+            "     -minscore F     default 0.7                         (min_score)\n"
             "     -max N          default 1                           (num_matches)\n"
             "     -overlap F      default 0.5                         (max_overlap)\n"
             "     -subpix 0|1     default 1                           (sub_pixel)\n"
@@ -185,7 +185,7 @@ int main(int argc, char** argv)
     const double loadMs = (cv::getTickCount() - tl) * 1000.0 / cv::getTickFrequency();
 
     NccFindParams fp;
-    fp.minScore   = argD(a, "-minscore", 0.5);
+    fp.minScore   = argD(a, "-minscore", 0.7);
     fp.maxMatches = (int)argD(a, "-max", 1);
     fp.maxOverlap = argD(a, "-overlap", 0.5);
     fp.subpixel   = (int)argD(a, "-subpix", 1);

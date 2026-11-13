@@ -49,7 +49,7 @@ int main(int argc, char** argv)
     cfg.maxPoints   = 1200;
     cfg.numLevels   = 0;             // 0 = 自动。不要填 1，会退化成暴力搜索
 
-    cfg.minScore    = 0.45;          // 默认评分是 mean（与 Halcon 一致）
+    cfg.minScore    = 0.7;           // 默认评分是 mean（与 Halcon 一致）
     cfg.maxMatches  = 5;
     cfg.scoreMode   = 0;             // 0 = mean；不要用 1（分数会虚高）
     cfg.subpixel    = 1;             // 0 关 / 1 抛物线 / 2 最小二乘

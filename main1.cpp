@@ -61,7 +61,7 @@ void t2() {
         std::cout << "        #" << k
                     << "  score=" << std::setprecision(3) << d.score
                     << "  pos=(" << (int)d.pos.x << "," << (int)d.pos.y << ")"
-                    << "  angle=" << std::setprecision(1) << (d.angle * 180.0 / CV_PI)
+                    << "  angle=" << std::fixed << std::setprecision(2) << (d.angle * 180.0 / CV_PI)
                     << "deg  scale=" << std::setprecision(3) << d.scale << "\n";
     }
     cv::Mat vis = m.drawResult(img, dets);

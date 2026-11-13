@@ -75,7 +75,7 @@ int main()
     cv::Mat img = cv::imread("scene.jpg", cv::IMREAD_GRAYSCALE);
 
     geomatch::Config cfg;               // 建模 + 搜索参数都在这里
-    cfg.minScore = 0.45;                // 默认评分是 mean，0.45 左右起步
+    cfg.minScore = 0.7;                 // 默认评分是 mean；偏保守(误检优先)，追召回可调低
 
     geomatch::Matcher m;
     if (!m.create(tpl, cfg)) return 1;  // 或 m.load("model.shm")
@@ -197,7 +197,7 @@ find_package(GeoMatch REQUIRED)
 
 | 字段 | 默认 | 含义 |
 |---|---|---|
-| `minScore` | `0.45` | 最低分数 |
+| `minScore` | `0.7` | 最低分数 |
 | `maxMatches` | `12` | 最多返回几个实例 |
 | `minDistance` | `30.0` | 两实例中心的最小像素距离 |
 | `maxOverlap` | `1.0` | Halcon 的 `MaxOverlap`；1.0 = 关闭，0.5 是 Halcon 默认 |
@@ -208,6 +208,14 @@ find_package(GeoMatch REQUIRED)
 | `minCoverage` | `0` | 最小覆盖率，`0` = 关闭 |
 | `useOpenCL` | `true` | 是否尝试 GPU 预处理 |
 | `debug` | `0` | >0 打印调试信息 |
+
+> **两项评分稳健性改进已内建（无开关，默认生效）：**
+> 1. **软门限梯度归一化**：弱梯度按 `min(mag/minContrast,1)` 给部分权重而非直接归零，
+>    轻微模糊/光照变化下分数不再塌到 0.4~0.7 区间；只改分数刻度，不改变哪些像素算边缘。
+> 2. **亚像素梯度采样**：精化/复评在模型点真实旋转位置（亚像素）双线性插值采样图像梯度，
+>    消除整数取整的 ≤0.5px 抖动，斜角角度误差实测降约 1/3；粗扫仍用整数卷积核保速度。
+>    注意亚像素插值会让分数刻度整体略下移，真实小角度场景影响很小（实测 7 张实拍图
+>    默认 minScore=0.7 全命中），但 45° 以上的极端旋转重采样可能需要适当调低 `minScore`。
 
 > **`scoreMode` 千万不要用 1**。它的定义是 `clipped / coverage`，
 > 只在"方向一致"的点上取平均；错位置上仍有九成点方向一致，于是报 0.95+。
@@ -292,7 +300,7 @@ find_package(GeoMatch REQUIRED)
 
 | 字段 | 默认 | 含义 |
 |---|---|---|
-| `minScore` | `0.5` | 分数范围 `[-1,1]`，0.5 左右算"像" |
+| `minScore` | `0.7` | 分数范围 `[-1,1]`，0.7 左右算"像"，0.8 以上基本确定 |
 | `maxMatches` | `1` | 最多返回几个 |
 | `maxOverlap` | `0.5` | 实例重叠超过这个比例只留高分那个 |
 | `subpixel` | `1` | `0` 关 / `1` 抛物线 |

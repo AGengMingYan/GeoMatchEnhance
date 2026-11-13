@@ -220,11 +220,11 @@ namespace
 
         //---------------- match -----------------------------------------
         Config cfg = m.config();          // keeps the model's own ranges
-        cfg.minScore   = gArgD(a, "-minscore", 0.55);
+        cfg.minScore   = gArgD(a, "-minscore", 0.7);
         cfg.maxMatches = (int)gArgD(a, "-max", 12);
         cfg.useOpenCL  = (int)gArgD(a, "-ocl", 1) != 0;
         cfg.debug      = (int)gArgD(a, "-debug", 0);
-        cfg.scoreMode  = (int)gArgD(a, "-score-mode", 1);
+        cfg.scoreMode  = (int)gArgD(a, "-score-mode", 0);
         cfg.minCoverage = (float)gArgD(a, "-min-cover", 0.0);
         // minDistance only when asked for, so the value stored in the model wins
         if (gHas(a, "-min-dist")) cfg.minDistance = gArgD(a, "-min-dist", cfg.minDistance);
@@ -263,8 +263,10 @@ namespace
             // subpixel=2.
             std::cout << "  pos=(" << std::fixed << std::setprecision(2)
                       << d.pos.x << ";" << d.pos.y << ")"
-                      << std::defaultfloat
-                      << "  angle=" << std::setprecision(1) << (d.angle * 180.0 / CV_PI)
+                      // angle/scale 必须用定点小数：默认浮点格式下
+                      // setprecision(1) 只有 1 位有效数字，14.77 会被打成
+                      // "1e+01"、45 会被打成 "5e+01"，看起来像几度的误差。
+                      << "  angle=" << std::setprecision(2) << (d.angle * 180.0 / CV_PI)
                       << "deg  scale=" << std::setprecision(3) << d.scale << "\n";
         }
         if (dets.empty()) std::cout << "        (nothing found)\n";
@@ -314,13 +316,13 @@ int main(int argc, char** argv)
     const std::string loadModel = gArg(args, "-load", "");
     const std::string maskFile  = gArg(args, "-mask", "");
 
-    cfg.minScore    = gArgD(args, "-minscore", 0.55);
+    cfg.minScore    = gArgD(args, "-minscore", 0.7);
     cfg.maxMatches  = (int)gArgD(args, "-max", 12);
     cfg.minContrast = gArgD(args, "-contrast", 12.0);
     cfg.contrast    = gArgD(args, "-hi", 30.0);
     cfg.useOpenCL   = (int)gArgD(args, "-ocl", 1) != 0;
     cfg.debug       = (int)gArgD(args, "-debug", 0);
-    cfg.scoreMode   = (int)gArgD(args, "-score-mode", 1);
+    cfg.scoreMode   = (int)gArgD(args, "-score-mode", 0);
     cfg.minCoverage = (float)gArgD(args, "-min-cover", 0.0);
     if (gHas(args, "-min-dist")) cfg.minDistance = gArgD(args, "-min-dist", cfg.minDistance);
     cfg.metric      = (int)gArgD(args, "-metric", 0);

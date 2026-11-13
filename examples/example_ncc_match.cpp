@@ -57,7 +57,7 @@ int main(int argc, char** argv)
 
     //---- 2) 搜索（对标 Halcon find_ncc_model） ----
     geomatch::NccFindParams fp;
-    fp.minScore   = 0.5;        // NCC 分数范围 [-1,1]，0.5 左右算"像"
+    fp.minScore   = 0.7;        // NCC 分数范围 [-1,1]，0.7 左右算"像"
     fp.maxMatches = 5;
     fp.maxOverlap = 0.5;        // Halcon 的 MaxOverlap
     fp.subpixel   = 1;

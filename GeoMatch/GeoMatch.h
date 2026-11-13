@@ -78,10 +78,10 @@ struct Config
     int    minChainLen = 2;       // drop edge chains shorter than this (pixels)
 
     // ---- search ----
-    // 0.45: the default scoreMode is 0 (mean, Halcon-compatible), whose scores
-    // run ~0.10 lower than positive-mean for the same pose.  Raise it once you
-    // have measured your own data.
-    double minScore     = 0.45;
+    // 0.7: 默认评分阈值。默认 scoreMode 是 0（mean，Halcon 语义），同一位姿的
+    // 分数比旧 positive-mean 低约 0.10。追召回可手动调低，但建议配合 minCoverage
+    // / scoreMode 抑制误检；Raise it/lower it once you have measured your data.
+    double minScore     = 0.7;
     int    maxMatches   = 12;
     double minDistance  = 30.0;
     // Halcon's MaxOverlap: instances whose model rectangles overlap by more
@@ -113,6 +113,9 @@ struct Config
                                 // The cheapest way to reject the look-alike
                                 // positions that appear when minScore is lowered
                                 // on repetitive patterns.
+
+    // 注：软门限梯度归一化与亚像素梯度采样已内建为默认行为（见 ShapeMatch
+    // 的 prepareSource / subpixelRefine），不再提供 Config 开关。
 
     // ---- visualisation ------------------------------------------------
     // how drawResult() marks a found instance

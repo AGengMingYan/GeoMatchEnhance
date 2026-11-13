@@ -356,9 +356,9 @@ struct App
     bool  autoHi         = true;       // 高阈值跟随低阈值(见 hiFor())
     int   maxPoints      = 1200;
     int   numLevels      = 0;          // 0 = 自动
-    float minScore       = 0.40f;       // 默认评分方式是 mean(与 Halcon 一致)，分数比旧的
-                                        // positive-mean 低 0.10~0.13，所以阈值同步下调。
-                                        // Halcon 的常用起点是 0.5，本工具留一点余量。
+    float minScore       = 0.70f;       // 默认评分方式是 mean(与 Halcon 一致)。
+                                        // 滑块可在 0.05~1.00 间调整；追召回时调低，
+                                        // 并配合最小覆盖率 / 评分方式抑制误检。
     int   maxMatches     = 12;
     float minDistance    = 30.f;
     float greediness     = 0.9f;
@@ -402,7 +402,7 @@ struct App
     int   nccMetric         = 0;       // 0 = use_polarity, 1 = ignore_global_polarity
 
     //---- NCC 搜索参数 ----
-    float nccMinScore    = 0.5f;
+    float nccMinScore    = 0.7f;
     int   nccMaxMatches  = 1;
     float nccMaxOverlap  = 0.5f;
     int   nccSubpixel    = 1;          // 0 = 关闭, 1 = 插值(抛物线)
