@@ -21,8 +21,18 @@ build/*
 _ai_tmp
 build_x64
 OpenCV455_MSVC32/
-HalconDemo/Halcon17/include/halconcpp/HSheetOfLightModel.h
-HalconDemo
+# Halcon 17 SDK（lib/dll/头，随 Halcon 安装，体积大，不入库）
+HalconDemo/Halcon17/
+HalconDemo/*.exe
+HalconDemo/*.obj
+HalconDemo/*.ilk
+HalconDemo/*.pdb
+HalconDemo/Debug/
+HalconDemo/Release/
+HalconDemo/x64/
+HalconDemo/x86/
+HalconDemo/*.shm
+HalconDemo/*.ncm
 release_GeoGUIDemo_x64
 
 # 私密凭据：绝不能进仓库
