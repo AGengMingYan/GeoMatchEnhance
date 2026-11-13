@@ -46,6 +46,7 @@
 #include <opencv2/opencv.hpp>
 #include <opencv2/core/utils/filesystem.hpp>
 #include "GeoMatch/GeoMatch.h"
+#include "NccMatch/NccMatch.h"
 
 //=======================================================================
 //  D3D11 设备 / 交换链
@@ -377,12 +378,35 @@ struct App
     double lastOpMs      = 0;          // 上一次"重建 + 匹配"的总耗时，用来自动降频
 
     //---- 本次搜索结果里的耗时统计(点"重复 20 次计时"时是累计值) ----
+    bool   showResultOnce = false;     // 跑完搜索后自动切到「匹配结果」页签
     double searchTotalMs = 0;          // 搜索总耗时 = 每次搜索 × 重复次数
     double benchWallMs   = 0;          // 整次 detect 调用的墙钟耗时(含预处理/重复)
     int    searchLoops   = 0;          // 这次搜索重复了几次
 
+    //---- 匹配方式 ----
+    // 0 = 形状匹配(比梯度方向, ShapeMatch/)，1 = NCC(比灰度, NccMatch/)
+    // 两种模型完全不通用：切换时必须重建模板（modelReady 会被清零）。
+    int   matchMode      = 0;
+
+    //---- NCC 建模参数(界面单位) ----
+    float nccAngleStartDeg  = -180.f;
+    float nccAngleExtentDeg = 360.f;
+    float nccAngleStepDeg   = 0.f;     // 0 = 自动(1 度)
+    int   nccModelLevels    = 0;       // 0 = 自动
+    int   nccMetric         = 0;       // 0 = use_polarity, 1 = ignore_global_polarity
+
+    //---- NCC 搜索参数 ----
+    float nccMinScore    = 0.5f;
+    int   nccMaxMatches  = 1;
+    float nccMaxOverlap  = 0.5f;
+    int   nccSubpixel    = 1;          // 0 = 关闭, 1 = 插值(抛物线)
+
     //---- 数据 ----
     geomatch::Matcher matcher;
+    geomatch::NccMatcher ncc;
+    bool    nccReady   = false;
+    double  nccBuildMs = 0;
+    std::vector<geomatch::NccResult> nccDets;   // 最近一次 NCC 搜索的原始结果
     bool    modelReady = false;
     double  buildMs    = 0;
 
@@ -562,8 +586,82 @@ static cv::Mat templatePatch(const App& a)
     return *src;
 }
 
+// 与 templatePatch() 返回的 patch 对齐的掩码。
+// 掩码是按「模板源图」画的，而 patch 可能是 ROI 裁出来的一块，所以要跟着裁；
+// 尺寸对不上时宁可不传掩码，也不要让 NccMatcher 去猜（它会把掩码 resize 成
+// 模板尺寸，那样 ROI 掩码会被整体缩放，位置全错）。
+static cv::Mat maskForPatch(const App& a, const cv::Size& patchSize)
+{
+    if (a.mask.empty()) return cv::Mat();
+    if (a.mask.size() == patchSize) return a.mask;
+
+    const cv::Mat* src = !a.tplGray.empty() ? &a.tplGray
+                        : (!a.tgtGray.empty() ? &a.tgtGray : nullptr);
+    if (!src || src->empty() || a.mask.size() != src->size()) return cv::Mat();
+
+    const int want = (src == &a.tplGray) ? 2 : 1;
+    if (a.roiHas && a.roiOwner == want)
+    {
+        const cv::Rect r = a.roi & cv::Rect(0, 0, src->cols, src->rows);
+        if (r.width > 4 && r.height > 4) return a.mask(r).clone();
+    }
+    return cv::Mat();
+}
+
+//=======================================================================
+//  NCC 建模 (create_ncc_model)
+//=======================================================================
+static void createNccTemplate(App& a)
+{
+    cv::Mat patch = templatePatch(a);
+    if (patch.empty())
+    {
+        logLine("没有可用于创建模板的图像");
+        return;
+    }
+
+    geomatch::NccParams p;
+    p.angleStart  = a.nccAngleStartDeg  * (float)CV_PI / 180.f;
+    p.angleExtent = a.nccAngleExtentDeg * (float)CV_PI / 180.f;
+    p.angleStep   = a.nccAngleStepDeg   * (float)CV_PI / 180.f;
+    p.numLevels   = a.nccModelLevels;
+    p.metric      = a.nccMetric;
+    const cv::Mat m = maskForPatch(a, patch.size());
+    if (!m.empty()) p.mask = m;
+
+    const int64 t0 = cv::getTickCount();
+    const bool ok = a.ncc.createNccModel(patch, p);
+    const double ms = (cv::getTickCount() - t0) * 1000.0 / cv::getTickFrequency();
+
+    if (!ok)
+    {
+        logf("NCC 建模失败 (%dx%d)，试试缩小角度范围或换一块模板", patch.cols, patch.rows);
+        return;
+    }
+
+    a.nccReady   = true;
+    a.modelReady = true;            // 统一标志：当前模式下的模型是否可用
+    a.nccBuildMs = ms;
+    a.buildMs    = ms;
+
+    a.modelVis = a.ncc.drawModelFeatures(2.0);
+    a.texModel.set(toBGRA(a.modelVis));
+
+    logf("NCC 模型已创建: %dx%d  像素=%d  层数=%d  %d 个角度(步长 %.2f 度)  用时 %.1f ms",
+         patch.cols, patch.rows, a.ncc.modelPixelCount(), a.ncc.numLevels(),
+         a.ncc.angleCount(), a.ncc.angleStep() * 180.0 / CV_PI, ms);
+    if (p.mask.empty())
+        logf("提示: NCC 用模板整幅区域做相关，模板里的重复纹理/背景会一起参与，"
+             "建议涂掩码只留唯一结构");
+    if (a.nccAngleExtentDeg >= 359.f)
+        logf("提示: 角度范围 %.0f 度时画布要放大到对角线，搜索比窄角度慢，"
+             "已知角度就把它收窄", a.nccAngleExtentDeg);
+}
+
 static void createTemplate(App& a)
 {
+    if (a.matchMode == 1) { createNccTemplate(a); return; }
+
     cv::Mat patch = templatePatch(a);
     if (patch.empty())
     {
@@ -632,8 +730,81 @@ static void createTemplate(App& a)
              "可适当减小「最大点数」", 100.0f * wm / sm);
 }
 
+//=======================================================================
+//  NCC 搜索 (find_ncc_model)
+//=======================================================================
+static void runNccMatch(App& a, int loops)
+{
+    if (!a.nccReady)
+    {
+        logLine("还没有 NCC 模型，先创建或加载一个");
+        return;
+    }
+    if (a.tgtGray.empty())
+    {
+        logLine("还没有匹配目标图片");
+        return;
+    }
+
+    geomatch::NccFindParams fp;
+    fp.minScore   = a.nccMinScore;
+    fp.maxMatches = a.nccMaxMatches;
+    fp.maxOverlap = a.nccMaxOverlap;
+    fp.subpixel   = a.nccSubpixel;
+    fp.numLevels  = 0;              // 0 = 用模型自己的层数
+
+    const int loopsUsed = std::max(1, loops);
+    std::vector<geomatch::NccResult> res;
+    double preMs = 0, searchMs = 0;
+
+    const int64 t0 = cv::getTickCount();
+    for (int i = 0; i < loopsUsed; i++)
+    {
+        res      = a.ncc.findNccModel(a.tgtGray, fp);
+        preMs    = a.ncc.lastPreprocessTime();
+        searchMs = a.ncc.lastSearchTime();
+    }
+    const double wallMs = (cv::getTickCount() - t0) * 1000.0 / cv::getTickFrequency();
+
+    // 统一成 Detection，复用结果列表 / 耗时显示（NCC 不做尺度，scale 恒为 1；
+    // 也没有 coverage，表里会显示 "-"）
+    a.dets.clear();
+    a.dets.reserve(res.size());
+    for (size_t i = 0; i < res.size(); i++)
+    {
+        geomatch::Detection d;
+        d.pos   = res[i].pos;
+        d.angle = (float)res[i].angle;
+        d.scale = 1.f;
+        d.score = (float)res[i].score;
+        a.dets.push_back(d);
+    }
+    a.nccDets = res;
+
+    a.timing.preprocessMs = preMs;
+    a.timing.searchMs     = searchMs;
+
+    a.searchLoops   = loopsUsed;
+    a.searchTotalMs = searchMs * loopsUsed;
+    a.benchWallMs   = wallMs;
+
+    a.resultVis = a.ncc.drawResult(a.tgtGray, res);
+    a.texResult.set(toBGRA(a.resultVis));
+    a.showResultOnce = true;        // 自动切到「匹配结果」页，否则画面上看不到框
+
+    logf("NCC 匹配: %d 个结果  预处理 %.2f ms  搜索 %.2f ms  搜索总耗时 %.2f ms (%d 次)  "
+         "合计 %.2f ms",
+         (int)res.size(), preMs, searchMs, a.searchTotalMs, loopsUsed,
+         preMs + searchMs);
+    if (loopsUsed > 1)
+        logf("  重复 %d 次: 墙钟总耗时 %.1f ms  平均 %.2f ms/次",
+             loopsUsed, wallMs, wallMs / loopsUsed);
+}
+
 static void runMatch(App& a, int loops)
 {
+    if (a.matchMode == 1) { runNccMatch(a, loops); return; }
+
     if (!a.modelReady)
     {
         logLine("还没有模板模型，先创建或加载一个");
@@ -669,6 +840,7 @@ static void runMatch(App& a, int loops)
     a.resultVis = a.matcher.drawResult(a.tgtGray, dets);
     const double drawMs = (cv::getTickCount() - tDraw) * 1000.0 / cv::getTickFrequency();
     a.texResult.set(toBGRA(a.resultVis));
+    a.showResultOnce = true;        // 自动切到「匹配结果」页，否则画面上看不到框
 
     logf("匹配: %d 个结果  预处理 %.2f ms  搜索 %.2f ms  搜索总耗时 %.2f ms (%d 次)  合计 %.2f ms  绘图 %.1f ms",
          (int)dets.size(), tm.preprocessMs, tm.searchMs, a.searchTotalMs, loopsUsed,
@@ -909,17 +1081,21 @@ static void drawImageView(const char* id, const char* info, Texture& tex, int ro
         }
 
         ImDrawList* dl = ImGui::GetWindowDrawList();
+        // ROI 框用青色，不要用绿色：绿色是"匹配到的目标"的语义（drawResult 里
+        // #0 用亮绿、其它实例用橙），两者同色时用户分不清哪个是匹配结果、哪个是
+        // 自己框的模板区域。
+        const ImU32 roiCol = IM_COL32(0, 200, 255, 255);
         if (a.dragging)
         {
             ImVec2 p0 = toScr(ImVec2(std::min(a.dragA.x, a.dragB.x), std::min(a.dragA.y, a.dragB.y)));
             ImVec2 p1 = toScr(ImVec2(std::max(a.dragA.x, a.dragB.x), std::max(a.dragA.y, a.dragB.y)));
-            dl->AddRect(p0, p1, IM_COL32(0, 255, 0, 255), 0.f, 0, 2.f);
+            dl->AddRect(p0, p1, roiCol, 0.f, 0, 2.f);
         }
         else if (a.roiHas && a.roiOwner == roiOwner)
         {
             ImVec2 p0 = toScr(ImVec2((float)a.roi.x, (float)a.roi.y));
             ImVec2 p1 = toScr(ImVec2((float)(a.roi.x + a.roi.width), (float)(a.roi.y + a.roi.height)));
-            dl->AddRect(p0, p1, IM_COL32(0, 255, 0, 255), 0.f, 0, 2.f);
+            dl->AddRect(p0, p1, roiCol, 0.f, 0, 2.f);
         }
     }
 
@@ -933,12 +1109,23 @@ static void drawViewPane()
 
     if (ImGui::BeginTabBar("##viewtabs"))
     {
-        if (ImGui::BeginTabItem("匹配结果"))
+        // 刚跑完一次搜索时自动切到「匹配结果」页。
+        // 否则结果只画在这个页签里，用户停在「目标图」页上会以为"匹配没出结果"
+        // （实测反馈：日志显示命中 1 个，画面上什么都没变）。
+        ImGuiTabItemFlags resFlags = ImGuiTabItemFlags_None;
+        if (a.showResultOnce) resFlags |= ImGuiTabItemFlags_SetSelected;
+
+        if (ImGui::BeginTabItem("匹配结果", nullptr, resFlags))
         {
             snprintf(info, sizeof(info), "匹配结果  %dx%d  命中 %d",
                      a.texResult.w, a.texResult.h, (int)a.dets.size());
-            drawImageView("##area_result", info, a.texResult, a.texResult.valid() ? 1 : 0);
+            // roiOwner = 0: 结果页只显示匹配框。
+            // 传 1 会让 drawImageView() 把「ROI 框」也画在这张图上，而模板常常就是
+            // 用同一个 ROI 裁出来的（尺寸完全相同、位置只差几十像素），于是看起来
+            // 像"匹配出了好几个绿框"。同时也避免了在结果图上误拖鼠标改动模板 ROI。
+            drawImageView("##area_result", info, a.texResult, 0);
             ImGui::EndTabItem();
+            a.showResultOnce = false;       // 只在这一次请求后清除
         }
         if (ImGui::BeginTabItem("目标图"))
         {
@@ -1114,6 +1301,34 @@ static void drawPanel()
     };
     auto endGroup = []() { ImGui::Unindent(10.f * g_scale); };
 
+    //---- Tab ① 匹配: 匹配方式（形状 / NCC） ----
+    auto panelMatchMode = [&]()
+    {
+    ImGui::SeparatorText("0. 匹配方式");
+
+    int mode = a.matchMode;
+    ImGui::RadioButton("形状匹配 (梯度)", &mode, 0);
+    ImGui::SameLine();
+    ImGui::RadioButton("NCC (灰度相关)", &mode, 1);
+
+    if (mode != a.matchMode)
+    {
+        a.matchMode  = mode;
+        a.modelReady = false;      // 形状模型和 NCC 模型不通用，必须重建
+        needCreate   = true;
+        logf("匹配方式切换为: %s", mode == 1 ? "NCC (灰度相关)" : "形状匹配 (梯度)");
+        logLine(mode == 1 ? "NCC: 请在「② 模板参数」确认角度范围，然后建模板"
+                          : "形状匹配: 请在「② 模板参数」调对比度/点数，然后建模板");
+    }
+
+    if (a.matchMode == 1)
+        textDimWrapped("NCC 比归一化灰度：对亮度/对比度变化不敏感，适合低对比、模糊、"
+                       "纯纹理表面；但重复纹理处处都像，不适合。只搜索旋转，没有尺度。");
+    else
+        textDimWrapped("形状匹配比梯度方向：对遮挡、光照变化、噪声更鲁棒，"
+                       "需要模板里有明显的边。支持旋转 + 尺度。");
+    };
+
     //---- Tab ① 匹配: 模板源 ----
     auto panelTemplateSource = [&]()
     {
@@ -1171,6 +1386,36 @@ static void drawPanel()
     //---- Tab ② 模板参数（建模用，调一次就好） ----
     auto panelTplParams = [&]()
     {
+
+    //---- NCC 模式: 只有旋转/极性，没有梯度提取参数 ----
+    if (a.matchMode == 1)
+    {
+        if (group("NCC 模型参数: 旋转与极性", true))
+        {
+            changedModel |= sliderF("起始角(度)",  &a.nccAngleStartDeg,  -180.f, 180.f, "%.0f", commitModel);
+            changedModel |= sliderF("角度范围(度)", &a.nccAngleExtentDeg,   0.f, 360.f, "%.0f", commitModel);
+            changedModel |= sliderF("角度步长(度, 0=自动)", &a.nccAngleStepDeg, 0.f, 5.f, "%.2f", commitModel);
+            changedModel |= sliderI("金字塔层数(0=自动)", &a.nccModelLevels, 0, 8, commitModel);
+            {
+                const char* items[] = { "use_polarity (要求明暗一致)",
+                                        "ignore_global_polarity (允许整体反相)" };
+                itemWidthForLabel("极性(Metric)");
+                if (ImGui::Combo("极性(Metric)", &a.nccMetric, items, 2))
+                {
+                    changedModel = true;
+                    commitModel  = true;
+                }
+            }
+            textDimWrapped("NCC 只搜索旋转、不搜索尺度，所以这里没有缩放参数。"
+                           "角度范围 360 度时画布要放大到对角线(搜索变慢)，已知角度就收窄。");
+            endGroup();
+        }
+
+        ImGui::Separator();
+        if (ImGui::Button("创建 NCC 模型 / 应用参数", ImVec2(-1, 0))) needCreate = true;
+        textDimWrapped("改完参数也可以切回「① 匹配」再点创建；开了「参数改动后自动刷新」时会立即重建。");
+        return;         // NCC 模式不显示梯度相关的特征提取参数
+    }
 
     //---- 模板参数(分组折叠，避免一屏塞满) ----
     if (group("模板参数: 旋转与缩放", true))
@@ -1234,8 +1479,13 @@ static void drawPanel()
 
     if (a.modelReady)
     {
-        ImGui::Text("模型: %d 个点 / %d 层 / 建模板 %.1f ms",
-                    a.matcher.modelPointCount(), a.matcher.numLevels(), a.buildMs);
+        if (a.matchMode == 1)
+            ImGui::Text("NCC 模型: %d 像素 / %d 层 / %d 个角度 / 建模板 %.1f ms",
+                        a.ncc.modelPixelCount(), a.ncc.numLevels(),
+                        a.ncc.angleCount(), a.nccBuildMs);
+        else
+            ImGui::Text("模型: %d 个点 / %d 层 / 建模板 %.1f ms",
+                        a.matcher.modelPointCount(), a.matcher.numLevels(), a.buildMs);
     }
     else
     {
@@ -1312,19 +1562,58 @@ static void drawPanel()
     //---- 模型文件 ----
     if (group("模型文件 (保存 / 加载)", false))
     {
+        // 两种模型的格式完全不同：形状匹配 .shm，NCC .ncm（Halcon 风格自定义格式）
         static char modelPath[260] = "case1/model.shm";
+        static int  lastMode = -1;
+        if (lastMode != a.matchMode)
+        {
+            lastMode = a.matchMode;
+            strncpy(modelPath, a.matchMode == 1 ? "case1/model.ncm" : "case1/model.shm",
+                    sizeof(modelPath) - 1);
+            modelPath[sizeof(modelPath) - 1] = '\0';
+        }
+
         ImGui::SetNextItemWidth(-1);
         ImGui::InputText("##modelpath", modelPath, sizeof(modelPath));
+
         if (ImGui::Button("保存模型", ImVec2(-120, 0)))
         {
-            if (!a.modelReady) logLine("没有模型可保存");
+            if (a.matchMode == 1)
+            {
+                if (!a.nccReady) logLine("没有 NCC 模型可保存");
+                else if (a.ncc.writeNccModel(modelPath)) logf("NCC 模型已保存: %s", modelPath);
+                else logf("保存失败: %s", modelPath);
+            }
+            else if (!a.modelReady) logLine("没有模型可保存");
             else if (a.matcher.save(modelPath)) logf("模型已保存: %s", modelPath);
             else logf("保存失败: %s", modelPath);
         }
         ImGui::SameLine();
         if (ImGui::Button("加载模型", ImVec2(-1, 0)))
         {
-            if (a.matcher.load(modelPath))
+            if (a.matchMode == 1)
+            {
+                if (a.ncc.readNccModel(modelPath))
+                {
+                    a.nccReady   = true;
+                    a.modelReady = true;
+                    a.nccBuildMs = 0;
+                    a.buildMs    = 0;
+                    // 模型文件里存了角度范围/步长/极性，界面要跟着走，
+                    // 否则下次「创建」会用界面上的旧值把模型改掉
+                    const geomatch::NccParams& np = a.ncc.params();
+                    a.nccAngleStartDeg  = (float)(np.angleStart  * 180.0 / CV_PI);
+                    a.nccAngleExtentDeg = (float)(np.angleExtent * 180.0 / CV_PI);
+                    a.nccAngleStepDeg   = (float)(np.angleStep   * 180.0 / CV_PI);
+                    a.nccMetric         = np.metric;
+                    a.modelVis = a.ncc.drawModelFeatures(2.0);
+                    a.texModel.set(toBGRA(a.modelVis));
+                    logf("NCC 模型已加载: %s  (%d 像素 / %d 层 / %d 角度)", modelPath,
+                         a.ncc.modelPixelCount(), a.ncc.numLevels(), a.ncc.angleCount());
+                }
+                else logf("加载失败: %s (NCC 模型请用 .ncm)", modelPath);
+            }
+            else if (a.matcher.load(modelPath))
             {
                 a.modelReady = true;
                 a.buildMs    = 0;
@@ -1379,6 +1668,19 @@ static void drawPanel()
     {
     ImGui::SeparatorText("3. 搜索参数");
 
+    //---- NCC 模式: 只有分数（其余在「③ 搜索参数」） ----
+    if (a.matchMode == 1)
+    {
+        if (group("NCC 判据 (分数)", true))
+        {
+            changedSearch |= sliderF("最小分数", &a.nccMinScore, 0.05f, 1.00f, "%.2f", commitSearch);
+            textDimWrapped("NCC 分数范围 [-1, 1]：0.5 左右算「较像」，0.8 以上基本确定。"
+                           "实例数 / 最大重叠 / 亚像素 在「③ 搜索参数」里。");
+            endGroup();
+        }
+        return;         // 覆盖率、评分方式、极性都是形状匹配专有
+    }
+
     //---- 匹配判据: 最常调，默认展开 ----
     if (group("匹配判据 (分数 / 覆盖率)", true))
     {
@@ -1424,6 +1726,29 @@ static void drawPanel()
     //---- Tab ③ 搜索参数（高级） ----
     auto panelSearchParams = [&]()
     {
+    //---- NCC 模式: 只有分数/实例数/重叠/亚像素 ----
+    if (a.matchMode == 1)
+    {
+        if (group("NCC 搜索参数", true))
+        {
+            changedSearch |= sliderI("最大匹配数", &a.nccMaxMatches, 1, 64, commitSearch);
+            changedSearch |= sliderF("最大重叠", &a.nccMaxOverlap, 0.f, 1.f, "%.2f", commitSearch);
+            {
+                const char* items[] = { "关闭", "插值(默认，抛物线)" };
+                itemWidthForLabel("亚像素");
+                if (ImGui::Combo("亚像素", &a.nccSubpixel, items, 2))
+                {
+                    changedSearch = true;
+                    commitSearch  = true;
+                }
+            }
+            textDimWrapped("最大重叠 = 两个实例最多重叠多少比例仍算两个 (Halcon 的 MaxOverlap)。"
+                           "最小分数在「① 匹配 → 3. 搜索参数」里。");
+            endGroup();
+        }
+        return;         // NCC 模式不显示覆盖率/评分方式/贪婪度等形状匹配参数
+    }
+
     //---- 结果筛选 ----
     if (group("结果筛选 (实例数 / 去重 / 框样式)", true))
     {
@@ -1609,6 +1934,7 @@ static void drawPanel()
     {
         if (ImGui::BeginTabItem("① 匹配"))
         {
+            panelMatchMode();
             panelTemplateSource();
             panelCreate();
             panelTarget();
@@ -1762,7 +2088,13 @@ static void autoInit(App& a, const std::string& dir)
 //=======================================================================
 int main(int argc, char** argv)
 {
-    const std::string dir = (argc > 1) ? argv[1] : "case1";
+    // 参数：--ncc 切换默认匹配方式；第一个非选项参数当目录（默认 case1）
+    std::string dir = "case1";
+    for (int i = 1; i < argc; i++)
+    {
+        if (std::strcmp(argv[i], "--ncc") == 0) { g_app.matchMode = 1; continue; }
+        if (argv[i][0] != '-') { dir = argv[i]; }
+    }
 
     //---------------- 窗口 + D3D11 ----------------
     ImGui_ImplWin32_EnableDpiAwareness();

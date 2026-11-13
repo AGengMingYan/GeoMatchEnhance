@@ -69,6 +69,8 @@ option(GEOMATCH_BUILD_SHARED "build GeoMatch as a shared library" OFF)
 set(GEOMATCH_SOURCES
     ShapeMatch/ShapeMatch.cpp
     ShapeMatch/ShapeMatch.h
+    NccMatch/NccMatch.cpp
+    NccMatch/NccMatch.h
     GeoMatch/GeoMatch.cpp
     GeoMatch/GeoMatch.h
 )
@@ -101,6 +103,17 @@ endif()
 add_executable(GeoMatchDemo main.cpp)
 add_executable(Demo1 main1.cpp)
 add_executable(GeoGUIDemo GeoGUIDemo.cpp)
+# NCC 命令行前端(对标 Halcon create_ncc_model / find_ncc_model)
+add_executable(NccDemo NccDemo.cpp)
+target_include_directories(NccDemo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+if(OpenCV_LIBS)
+    target_link_libraries(NccDemo PRIVATE GeoMatch ${OpenCV_LIBS})
+else()
+    target_link_libraries(NccDemo PRIVATE GeoMatch ${OpenCV_LIBS} ${OpenCV_LIBRARIES})
+endif()
+if(MSVC)
+    target_compile_options(NccDemo PRIVATE /utf-8 $<$<CONFIG:Release>:/O2 /arch:AVX2>)
+endif()
 
 # 命令行分析工具: 拿已有模型跑一批真实图片，打印每张的分数/位姿/耗时
 add_executable(AnalyzeCase AnalyzeCase.cpp)

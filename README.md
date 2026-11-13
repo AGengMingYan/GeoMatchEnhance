@@ -15,6 +15,7 @@
 - [GUI 工具使用说明](#gui-工具使用说明)
 - [API 概览](#api-概览)
 - [测试报告](#测试报告)
+- [NCC 匹配（灰度相关）](#ncc-匹配灰度相关nccmatch)
 - [性能调优](#性能调优)
 
 > **第一次用？** 直接看 [三步测试 Demo](docs/快速上手-三步测试Demo.md)：
@@ -32,7 +33,8 @@
 - **模板掩码（mask）**：可用掩码图指定仅部分区域参与建模，排除纹理不稳定区域，显著提升分数稳定性
 - **OpenCL 加速**：可选 GPU 加速预处理（Sobel 梯度）
 - **可视化工具**：模型点/梯度可视化、匹配结果叠加绘制
-- **图形界面（GUI）**：`GeoGUIDemo` 提供交互式调参、ROI 框选、掩码涂抹，详见 [GUI 工具使用说明](docs/GeoGUIDemo使用说明.md)
+- **NCC 匹配（第二种匹配方式）**：`NccMatch/` 实现 Halcon 的 `create_ncc_model` / `find_ncc_model`（灰度归一化互相关、旋转搜索、无尺度），低对比度 / 模糊 / 纯纹理表面比形状匹配更稳，详见 [NCC 匹配](#ncc-匹配灰度相关nccmatch)
+- **图形界面（GUI）**：`GeoGUIDemo` 提供交互式调参、ROI 框选、掩码涂抹、两种匹配方式切换，详见 [GUI 工具使用说明](docs/GeoGUIDemo使用说明.md)
 - **内置测试工具**：合成角度/尺度精度测试、自检、批量性能测试、机器基准测试
 
 ---
@@ -47,14 +49,21 @@ geo-match-enhance/
 ├── ShapeMatch/          # 底层匹配核心（createShapeModel / findShapeModel）
 │   ├── ShapeMatch.h
 │   └── ShapeMatch.cpp
+├── NccMatch/            # NCC 匹配（createNccModel / findNccModel，对标 Halcon）
+│   ├── NccMatch.h
+│   └── NccMatch.cpp
 ├── main.cpp             # 命令行前端 GeoMatchDemo
+├── NccDemo.cpp          # 命令行前端 NccDemo
 ├── main1.cpp            # 简化版交互 Demo
+├── GeoGUIDemo.cpp       # ImGui 图形界面（两种匹配方式共用）
 ├── case1/               # 示例模板与搜索图
 ├── CMakeLists.txt
 └── docs/                # 本文档引用的测试图片
 ```
 
-调用方只需 `#include "GeoMatch/GeoMatch.h"`，所有底层细节封装在 `ShapeMatcher` 中，通过 `geomatch::Matcher` 门面暴露。
+调用方只需 `#include "GeoMatch/GeoMatch.h"`（形状匹配）或
+`#include "NccMatch/NccMatch.h"`（NCC），所有底层细节封装在 `ShapeMatcher` /
+`NccMatcher` 中，通过 `geomatch::Matcher` 门面暴露。
 
 ---
 
@@ -484,6 +493,102 @@ GeoMatchDemo -t case1/temp.jpg -d case1 -o case1/out -loops 5
 | B（合成 box） | 7/8 | 0.157° | 1.44 px | 161.2 ms |
 
 方法 A 因模板与背景同源，得分与精度均接近理想；方法 B 跨图合成更贴近真实场景，角度误差仍在 0.3° 以内、位置误差在 2.3 px 以内，验证了算法的鲁棒性与亚像素精度。
+
+---
+
+## NCC 匹配（灰度相关，`NccMatch/`）
+
+形状匹配比的是**梯度方向**，在低对比度、模糊、纯纹理表面上容易丢点；
+这时改用 Halcon 的 `create_ncc_model` / `find_ncc_model` 那一套**归一化灰度互相关**更稳。
+本项目在 `NccMatch/` 里实现了同一套接口：
+
+| 我们的方法 | 对应 Halcon | 说明 |
+|---|---|---|
+| `NccMatcher::createNccModel` | `create_ncc_model` | 模板只需一次，模型可存 `.ncm` |
+| `NccMatcher::findNccModel` | `find_ncc_model` | 返回位置 / 角度 / 分数 |
+| `writeNccModel` / `readNccModel` | `write_ncc_model` / `read_ncc_model` | 二进制序列化 |
+
+**NCC 只搜旋转，不搜尺度**（Halcon 的 NCC 也没有 `ScaleMin/ScaleMax`），
+所以结果里没有 scale。它擅长"是不是同一块表面"，不擅长重复纹理
+（重复纹理处处相关都高，这种情况用形状匹配）。
+
+### 两种匹配方式怎么选
+
+| 场景 | 建议 |
+|---|---|
+| 低对比度 / 模糊 / 纯纹理表面 | **NCC**（形状匹配会因点数塌陷而误检） |
+| 重复纹理、需要区分相似区域 | **形状匹配**（NCC 会同时命中多处） |
+| 需要尺度变化 | **形状匹配**（NCC 没有尺度维度） |
+
+GUI 里在「①匹配」页顶部的「0. 匹配方式」单选切换，切换时会自动重建模型
+（两种模型格式不通用：`.shm` 是形状、`.ncm` 是 NCC）。
+
+### 精度（与 Halcon 17 同进程对比）
+
+模板 `case1/temp.jpg`（154×148），搜索图 1280×1024，360° 搜索：
+
+| 图 | Halcon score | 我们 score | Δscore | Δpos | Δangle |
+|---|---|---|---|---|---|
+| tmp_grab_...178 | 0.9928 | 0.9911 | -0.0017 | 0.14 px | 0.08° |
+| tmp_grab_...464 | 0.8990 | 0.8974 | -0.0016 | 0.25 px | 0.08° |
+| tmp_grab_...529 | 0.8916 | 0.8901 | -0.0016 | 0.26 px | 0.07° |
+
+我们系统性低 0.0016~0.0018（归一化分母的细节差异），位置差 ≤0.26 px、角度差 ≤0.15°。
+
+合成旋转真值（整图旋转 θ，700×700 噪声底 + 贴模板），7 个角度全部命中：
+
+| θ | 我们 / Halcon 角度 | Δangle | Δpos |
+|---|---|---|---|
+| 0° | -0.01° / -0.21° | 0.20° | 0.18 px |
+| 45° | 44.99° / 44.88° | 0.11° | 0.59 px |
+| 90° | 89.99° / 89.98° | 0.01° | 0.92 px |
+| 135° | 134.99° / 134.88° | 0.12° | 1.09 px |
+
+**角度差 ≤0.20°、位置差 ≤1.1 px。**
+
+### 速度
+
+`case1` 9 张（7 张有目标）、154×148 模板、360° 搜索、20 核：
+
+| 版本 | 平均耗时 |
+|---|---|
+| 初版（3 层金字塔、单线程） | 439.8 ms/张 |
+| 5 层金字塔 + 候选剪枝 + 有效区间遍历（单线程） | 49.4 ms/张 |
+| 再加速（粗扫/精化/亚像素全部并行） | **约 20 ms/张** |
+
+单张与 Halcon 同进程对比：Halcon 7 ms、我们 23 ms。
+
+加速主要来自四点（细节见提交记录）：
+
+1. **层数按 Halcon 给满**（`minSide = 8` → 154×148 模板有 5 层）。
+   粗层角度数少、画布小，这一项就把粗扫从 479 ms 降到 6 ms。
+2. **候选逐层剪枝**：每层都保留 30 个候选会让 level-0 的 214×214 画布被算 30 遍。
+3. **每行只走掩膜的有效区间**（360° 画布有一半是空的），且无逐像素分支。
+4. **`cv::parallel_for_`**：粗扫按角度拆、精化按（候选×角度）拆、亚像素按候选拆。
+   旋转模板缓存必须改成串行预建，否则是数据竞争。
+
+### 两个容易踩的坑（都已在代码里处理）
+
+- **层间位置映射必须用「搜索图像」金字塔的比例**，不能用模板比例、更不能硬编码 `*2`：
+  `pyrDown` 对奇数尺寸取整，700×700 的实际比例是 175/87 ≠ 2。乘错会让候选每层偏移几像素，
+  深层窗口直接落空（表现为"分数明明很高却报 0 命中"），而且 1280×1024 这种 2 的幂尺寸不会暴露。
+- **粗层峰值不可信时要退一层重扫**：154×148 模板的最粗层只有 9×9，纯噪声场景
+  `map max` 只有 0.55，前 10 个候选全是噪声峰。低于 `max(0.7, min(0.9, minScore×1.2))`
+  就退一层（最多退两层，绝不低于 level 0，否则"没有目标"的图会卡几秒）。
+
+### 命令行前端
+
+```bash
+# 建模型
+build_x64/NccDemo.exe -t1 -t case1/temp.jpg -save case1/temp.ncm
+#                       [-levels N] [-angle DEG] [-angle-step DEG] [-metric 0|1] [-mask png]
+
+# 搜单张 / 整目录
+build_x64/NccDemo.exe -load case1/temp.ncm -s case1/tmp_grab_1762994178.jpg -o out
+build_x64/NccDemo.exe -load case1/temp.ncm -d case1 -o out -minscore 0.5 -max 1
+```
+
+`-debug 1` 会打印 `[coarse | refine | subpix]` 三段耗时，`-debug 2` 还会打印每层的候选表。
 
 ---
 
