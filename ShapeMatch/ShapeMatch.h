@@ -74,7 +74,9 @@ struct MatchParams
 
 struct FindParams
 {
-    double minScore    = 0.6;
+    // 0.45: the default scoreMode is now 0 (mean, Halcon-compatible), whose
+    // scores run ~0.10 lower than the old positive-mean for the same pose.
+    double minScore    = 0.45;
     int    maxMatches  = 20;
     // 0 = off.  Minimum centre distance between two reported instances, in
     // pixels at the search image scale.  Kept for compatibility; prefer
@@ -117,8 +119,18 @@ struct FindParams
 
     bool   useOpenCL   = true;
     int    debug       = 0;
-    int    scoreMode   = 1;    // final score aggregation: 1 = positive-mean (default),
-                               // 0 = mean, 2 = trimmed-mean(10%), 3 = clipped-mean.
+    int    scoreMode   = 0;    // final score aggregation:
+                               //   0 = mean        (default, Halcon-compatible)
+                               //   2 = trimmed-mean(10%)
+                               //   1 = positive-mean  -> clipped/coverage, i.e. it
+                               //       averages ONLY over the points that already
+                               //       agree, so a wrong position where 90 % of the
+                               //       points happen to agree scores 0.95+.  Do NOT
+                               //       make this the default again: measured against
+                               //       Halcon 17 on a repetitive-texture template, the
+                               //       same false position scored 0.946 with mode 1,
+                               //       0.567 with mode 0 and 0.556 in Halcon.
+                               //   3 = clipped-mean
                                // search/refine always use mean; this only
                                // re-scores the final matches.
     // 0 = off.  Reject a match whose model points are only partly present:

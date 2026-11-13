@@ -492,7 +492,8 @@ int main(int argc, char** argv)
     std::string model = argv[2];
     double minScore   = 0.5;
     double minDist    = 0.0;     // 0 = 用模型默认值
-    int    scoreMode  = 1;       // 1 = positive-mean(默认), 0 = mean, 2 = trimmed-mean, 3 = clipped-mean
+    int    scoreMode  = 0;       // 0 = mean(默认, 与 Halcon 一致), 1 = positive-mean,
+                                 // 2 = trimmed-mean, 3 = clipped-mean
     double minCover   = 0.0;     // >0: 丢掉覆盖率低于它的结果(0 = 关闭)
     int    limit      = 0;
     int    probeN     = 0;

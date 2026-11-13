@@ -133,8 +133,8 @@ GeoMatchDemo -bench
 | `-angle <deg>` | 角度范围（`-load` 时需显式给出才覆盖模型自带范围） | 360 |
 | `-smin/-smax` | 尺度范围 | 1.0 / 1.0 |
 | `-mask <file>` | 模板掩码图（非零区域参与建模） | 无（整幅参与） |
-| `-minscore` | 最小得分 | 0.55 |
-| `-score-mode N` | 最终评分方式：0=mean, 1=positive-mean, 2=trimmed-mean, 3=clipped-mean | 1 |
+| `-minscore` | 最小得分 | 0.45 |
+| `-score-mode N` | 最终评分方式：0=mean（与 Halcon 一致）, 1=positive-mean（会虚高）, 2=trimmed-mean, 3=clipped-mean | 0 |
 | `-min-cover X` | 最小覆盖率，0=关闭（见"误检抑制"） | 0 |
 | `-max` | 最大匹配数 | 12 |
 | `-loops N` | 每图重复次数（计时） | 1 |
@@ -180,7 +180,7 @@ cfg.angleStart  = -CV_PI;
 cfg.angleExtent = 2 * CV_PI;
 cfg.scaleMin    = 0.7;
 cfg.scaleMax    = 1.3;
-cfg.minScore    = 0.55;
+cfg.minScore    = 0.45;   // 默认评分方式是 mean(与 Halcon 一致)，阈值比旧版低一些
 
 // 可选：模板掩码(非零区域才参与建模)，用于排除纹理不稳定的区域
 // cfg.mask = cv::imread("mask.png", cv::IMREAD_GRAYSCALE);
@@ -602,7 +602,7 @@ build_x64/NccDemo.exe -load case1/temp.ncm -d case1 -o out -minscore 0.5 -max 1
 | `scaleMin` / `scaleMax` | 尺度范围 | 无缩放需求设为 1.0，搜索最快 |
 | `mask` | 模板掩码（非零区域参与建模） | 排除晶粒/纹理不稳定区域可大幅提升分数稳定性 |
 | `minScore` | 最小得分 | 提高可减少候选、加速 |
-| `scoreMode` | 最终评分方式 | 调低 `minScore` 追召回时改用 3（clipped-mean），见下节 |
+| `scoreMode` | 最终评分方式 | 默认 0（mean，与 Halcon 一致）。**不要用 1**：它只在"方向一致"的点上取平均，错位置也会报 0.95+，见下节 | 
 | `minCoverage` | 最小覆盖率（0=关闭） | 调低 `minScore` 后误检多时开启，0.75~0.90 起调 |
 | `greediness` | 搜索贪心度 | 0~1，越大越快但可能漏检 |
 | `minDistance` | 实例最小间距（像素） | 多实例场景调大减少冗余；跨尺寸场景改用 `maxOverlap` |
@@ -758,6 +758,65 @@ build_x64/NccDemo.exe -load case1/temp.ncm -d case1 -o out -minscore 0.5 -max 1
 推到灰度差 30 时点数掉到 24、散布比 25.3，立刻冒出 6 个结果 —— 其中 4 个覆盖率 c=0.88~1.00，
 **连 `minCoverage` 也筛不掉**（点太少时覆盖率同样失去判别力）。
 
+### 与 Halcon 17 的对照实验（2026-11-13）
+
+**结论：Halcon 没有这个问题。** 同一个假位姿上：
+
+| 评分方式 | 假位姿分数 |
+|---|---|
+| 旧默认 `scoreMode=1`（positive-mean） | **0.946** |
+| 新默认 `scoreMode=0`（mean） | **0.567** |
+| Halcon 17 `find_shape_model` | **0.556** |
+
+所以这不是"点太少"或孔径问题**本身**，而是 `scoreMode=1` 的定义：
+
+```
+scoreMode=1:  score = clipped / coverage    // 只在「方向一致」的点上取平均
+```
+
+`cos > 0` 这个判据很宽松——在错位置上仍有约九成点方向一致，于是
+"九成点平均 0.95" 被报成 0.946。Halcon 用梯度矢量的归一化点积，同一位姿只给 0.556。
+
+实验设置与数据：
+
+- 工具：`tools/halcon_shape_contrast.{cpp,bat}` → `build_x64/halcon_shape_contrast.exe`
+  （x64，同进程同时链接 Halcon 17 与 `GeoMatch.lib`，同模板、同图、同对比度）
+- 对比度量纲已校验：两边在 `33/39`（灰度差）同时归零
+  （Halcon 报 `#8510 too many few points`，我们 build failed），说明 GUI 的「灰度差」≈ Halcon `Contrast`
+- 模板：从 `test1/tmp_grab_1762994178.jpg` 按用户现场位置裁 185×158（中心 854.5,346.0）
+- 场景：同一张图里纹路重复
+
+| 对比度（灰度差） | 我们 sm=1 | 我们 sm=0 | Halcon 17 |
+|---|---|---|---|
+| 13/17（现场值） | 1.000 true / **0.946 FALSE**(858.0,524.9) | 1.000 true / **0.567** | **0.970 true**（无假峰） |
+| 22/27 | 1.000 true / 0.960 FALSE | — | 0.990 true / **0.556 FALSE**（同位置） |
+
+排除"点数塌陷"：把 `maxPoints` 提到 2400 / 4000（点数 3303 ≈ Halcon 的 3207），
+假位置分数仍是 0.949 / 0.950 → **是评分公式，不是点数**。
+
+改 mean 后真匹配是否还准（`temp.jpg` 154×148 @ `tmp_grab_1762994464.jpg`，13/17）：
+
+| 实现 | 真位置分数 |
+|---|---|
+| 旧 sm=1 | 0.977 |
+| 新 sm=0 | **0.856** |
+| Halcon 17 | **0.842** |
+
+其它图（sm=0）：178 → 0.997（Halcon 0.991）、189 → 0.990（Halcon 0.989）。
+**mean 模式下与 Halcon 差 ≤0.02**，旧默认则系统性高 0.13。
+
+复现：
+
+```powershell
+cmd /c tools\build-halcon-shape-contrast.bat
+$env:PATH='D:\Develop\Halcon17\bin\x64-win64;'+$env:PATH; $env:HALCONARCH='x64-win64'
+build_x64\halcon_shape_contrast.exe <template.png> <image.jpg> --gt col,row --levels 13:17 -v
+#   --ours-score-mode 0|1|2|3   --ours-max-points N   --halcon-opt auto|point_reduction_high
+```
+
+> 注意：本机用 python/`cv2.imwrite` 写出的 PNG 是**密文**，Halcon 的读取器会直接 abort
+> （`0xC0000409`）。裁剪模板必须用 PowerShell 的 `System.Drawing`，或用 `cat.exe` 解密后再用。
+
 ### 怎么避免
 
 **诊断优先（代码已内置）**
@@ -777,6 +836,10 @@ build_x64/NccDemo.exe -load case1/temp.ncm -d case1 -o out -minscore 0.5 -max 1
 | 法线最集中方向占比 | ≤ 0.6 | > 0.6 | 单一走向主导时位置判别力弱 |
 
 **调参顺序（按有效性）**
+
+0. **先把「评分方式」留在 mean（默认）**。旧默认 positive-mean 会让错位置也报 0.95+
+   （实测同一位姿：0.946 vs Halcon 0.556），换回 mean 后同一假峰只有 0.567，任何阈值都能挡掉。
+   代价是分数整体下移约 0.1，`minScore` 要同步下调（本版默认 0.40~0.45）。
 
 1. **别把最小对比度推过头**。以点数为准：点掉到 150 以下就说明过头了，回退到上一个值。
 2. **模板要选"有二维结构"的区域**：转角、字符、缺口、不对称边缘。纯直线段/纯边缘带再好的参数也救不了。

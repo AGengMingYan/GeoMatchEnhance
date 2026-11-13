@@ -83,8 +83,15 @@ struct Config
     int    metric       = 0;
     bool   useOpenCL    = true;
     int    debug        = 0;
-    int    scoreMode    = 1;    // final score aggregation: 1 = positive-mean (default),
-                                // 0 = mean, 2 = trimmed-mean(10%), 3 = clipped-mean
+    int    scoreMode    = 0;    // final score aggregation:
+                                //   0 = mean        (default, Halcon-compatible)
+                                //   2 = trimmed-mean(10%)
+                                //   1 = positive-mean  -> clipped/coverage, averages
+                                //       ONLY over the agreeing points, so a wrong
+                                //       position where most points happen to agree
+                                //       scores 0.95+ (measured: 0.946 vs Halcon 0.556
+                                //       on the same false pose).  Do not default to it.
+                                //   3 = clipped-mean
                                 // (positive terms only, but n stays in the
                                 // denominator -> no inflation on partial matches).
     float  minCoverage  = 0.f;  // 0 = off.  Minimum fraction of the model points

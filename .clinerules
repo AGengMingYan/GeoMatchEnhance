@@ -754,4 +754,156 @@ const double ry = (double)py[l].rows / (double)py[l + 1].rows;
    数"某种颜色的 blob 个数与 bbox"。注意先按面板区域裁剪（`im[60:700, 205:1020]`），
    否则右栏文字的同色像素会混进来；面积阈值取 20~60 就够滤掉文字笔画。
 
+---
+
+## 形状匹配的「分数虚高」先查评分定义，别急着怪点数/孔径（2026-11-13 实测）
+
+用户报「纹路匹配时把最小对比度拉高，特征变少后出现位置错误的 95% 高分」。
+第一反应通常是「点数塌陷 + 孔径问题」。**但和 Halcon 17 对照后结论不同**：
+
+| 同一个假位姿 | 分数 |
+|---|---|
+| 旧默认 `scoreMode=1`（positive-mean） | **0.946** |
+| `scoreMode=0`（mean） | **0.567** |
+| Halcon 17 `find_shape_model` | **0.556** |
+
+原因在 `scoreMode=1` 的定义：`score = clipped / coverage` —— **分母只有「方向一致」的点**。
+`cos > 0` 判据很宽松，错位置上仍约九成点方向一致 → "九成点平均 0.95" 报成 0.946。
+Halcon 用梯度矢量归一化点积，同一位姿只有 0.556。**Halcon 没有这个毛病。**
+
+已把默认改成 `scoreMode = 0`（mean，Halcon 语义），`minScore` 同步从 0.55/0.6 降到 0.40/0.45
+（mean 下分数整体低 0.10~0.13；真匹配 0.856 vs Halcon 0.842，差 ≤0.02）。
+
+### 排查顺序（下次遇到「分数高但位置错」）
+
+1. **先换评分方式**：GUI「评分方式」切 `mean`，或 `--score-mode 0`。
+   若假峰分数从 0.9+ 掉到 0.5 附近 → 是评分定义问题，不是模型问题。
+2. 再查点数/散布比（`AnalyzeCase` 会打印）。本次实测把 `maxPoints` 提到 3303 点
+   （≈ Halcon 的 3207）**分数几乎不变**，可见点数不是主因。
+3. 最后才怀疑孔径/重复纹理，用 `minCoverage` 或收窄 ROI。
+
+### 对照工具（已入库）
+
+`tools/halcon_shape_contrast.cpp` + `tools/build-halcon-shape-contrast.bat`
+→ `build_x64/halcon_shape_contrast.exe`（x64，同进程链 Halcon 17 + GeoMatch.lib）
+
+```
+halcon_shape_contrast <template> <image> [--gt col,row] [--levels lo:hi,...] \
+    [--ours-score-mode 0|1|2|3] [--ours-max-points N] [--ours-min-chain N] \
+    [--ours-score-max ...] [--halcon-opt auto|point_reduction_high] [-v]
+```
+
+对比度量纲已校验：两边在 `33/39`（灰度差）同时归零 → GUI 的「灰度差」≈ Halcon `Contrast`。
+
+### 踩坑：Halcon 读密文图会直接 abort（不是抛异常）
+
+本机 python/`cv2.imwrite` 写出的 PNG 是密文，`HImage::ReadImage` 拿到密文后进程
+**abort（`0xC0000409`）**，stdout 被重定向时连进度都看不到。
+- 裁剪/生成给 Halcon 用的图片：用 **PowerShell + System.Drawing** 写，或写完用 `cat.exe` 解密。
+- 调试这类工具时给 `main` 加 `setvbuf(stdout, NULL, _IONBF, 0)`，崩溃前能看到走到哪一步。
+
+
+
+
+---
+
+## GUI 程序必须链接成 GUI 子系统，否则会弹一个黑窗口盖住界面（2026-11-13 实测）
+
+`add_executable(GeoGUIDemo ...)` 默认是**控制台子系统**：双击/被脚本拉起时会额外开一个
+`conhost` 黑窗口，它常常盖在 GUI 上面 → 鼠标点不到界面、用户以为程序卡住。
+
+```cmake
+set_target_properties(GeoGUIDemo PROPERTIES WIN32_EXECUTABLE TRUE)
+if(MSVC)
+    # 源码用的是 main()，把它指到 mainCRTStartup；否则 MSVC 找 WinMain，
+    # 报 "unresolved external symbol WinMain"
+    target_link_options(GeoGUIDemo PRIVATE /ENTRY:mainCRTStartup)
+endif()
+```
+
+校验方法（不用肉眼）：
+
+```python
+import struct
+d = open('build_x64/GeoGUIDemo.exe','rb').read()
+e = struct.unpack_from('<I', d, 0x3C)[0]
+print(struct.unpack_from('<H', d, e+0x5C)[0])   # 2 = WINDOWS/GUI, 3 = CONSOLE
+```
+
+另外：启动前后数一下 `Get-Process conhost` 的数量，GUI 子系统不应让它增加。
+
+## 自动化点 GUI：轮询就绪 + 等鼠标静止，不要固定 `Start-Sleep`
+
+三个数字（本机实测，`GeoGUIDemo --ncc`/全量 180 张图都一样）：
+
+| 里程碑 | 耗时 |
+|---|---|
+| 窗口句柄出现 | ~140 ms |
+| `autoInit` 完成（目录+缩略图+建模板） | ~590 ms |
+| 首帧控件/字体真正画完 | 再等 3 s 稳 |
+
+所以脚本不要写 `Start-Sleep -Seconds 10/12`（慢了 20 倍）。正确做法：
+
+1. 轮询 `MainWindowHandle != 0`；
+2. 让程序在关键节点写一行探针（`READY`），脚本轮询这个文件 —— 比"估时间"可靠；
+   探针要**只在显式设置环境变量时**才写（`if (!getenv("TPL_PROBE")) return;`），
+   否则正常使用会在目录里留垃圾；
+3. 就绪后**再等 3 秒**，让 ImGui 首帧、字体、缩略图纹理上传完；
+4. **每次动手前等鼠标连续 2 秒不动**（`GetCursorPos` 轮询）。脚本运行期间用户可能正握着
+   鼠标，抢鼠标会把他的点击/拖拽打断，表现为"程序不听话"。
+5. **窗口尺寸要显式固定**（`SetWindowPos`）。删掉 `imgui.ini` 会回到默认小窗口(993x519)，
+   所有按 1500x920 量出来的坐标会全部错位，而且症状是"点了没反应"，很难查。
+
+实现见 `_ai_tmp/gui_helper.ps1`（`Start-Gui` / `Wait-Ready` / `Save-Shot`）。
+
+## PowerShell：`@($a + $b[0], $c + $b[1])` 在函数里会报 op_Addition
+
+```powershell
+function At($p) { return @($L + $p[0], $T + $p[1]) }   # ❌ 报 "[System.Object[]] 不包含 op_Addition"
+function At($p) { $x = $L + $p[0]; $y = $T + $p[1]; return @($x, $y) }   # ✅
+```
+
+数组子表达式里直接做加法、且被加数是脚本作用域变量时，PS 5.1 会把整串当数组处理。
+**先算到中间变量再组装数组**即可。症状极具误导性：坐标变成 `$null`，点击打在 (0,0)，
+看起来像"GUI 没响应"。
+
+## 模板来源要"冻结"，不能每帧从当前显示的目标图重裁
+
+现象：在 A 图上框 ROI 当模板 → 切到 B 图（比如偏暗那张）→ 一调模板参数，
+**模板就变成 B 图上同一位置的区域**，用户以为"模板建到暗图上了"。
+
+根因：`templatePatch()` 每次都用「当前 `tgtGray` + `roi`」现裁。
+
+修法：在用户框定模板的那一刻把 **来源图整幅 + 那个 ROI** 存下来
+（`tplSrcGray / tplSrcRoi / tplSrcLabel / tplSrcValid`），之后**所有重建**
+（调参、点「创建模板」、自动重建）都从这份冻结来源裁；界面上显示
+「模板来源已锁定: 目标图 xxx ROI(...)」，让用户看得见。
+
+验证办法：给 `createTemplate()` 加临时探针打印 `tgt='当前图'` 与 `label/roi=来源`，
+执行"框 ROI → 切图 → 重建"，确认 `tgt` 变了而 `label/roi` 没变。
+
+## ImGui：可滚动的列表要放进独立的 `BeginChild`，别和固定按钮共用一个滚动区
+
+左侧缩略图栏原来把「上一张/下一张」和缩略图放在同一个滚动区域，
+列表滑到底部时按钮被顶出视野 → 点不到。
+
+```cpp
+ImGui::Button("上一张", ...);            // 固定在顶部
+ImGui::Button("下一张", ...);
+ImGui::Separator();
+ImGui::BeginChild("##thumbs_scroll", ImVec2(0, -1));   // -1 = 占满剩余高度
+for (...) ImGui::ImageButton(...);
+ImGui::EndChild();
+```
+
+验证：滚到底后截图 + 点一次按钮，检查"当前 N"是否真的变了
+（本机 case3 180 张：滚到 175 张后点「下一张」，`当前 1` → `当前 175`）。
+
+## `autoInit` 里"默认模板加载失败就 return"会连图片列表一起吞掉
+
+`GeoGUIDemo <dir>` 启动时如果 `<dir>/temp.jpg` 不存在（例如 `case3`），
+旧代码直接 `return`，导致**缩略图列表是空的**，用户必须先手动「选择图片目录」。
+正确顺序：**先 `loadTargetDir()`，再尝试默认模板**；模板失败只写日志。
+另外拼路径要统一分隔符（`dir + "/temp.jpg"` 遇到 `..\case1` 会拼出
+`..\case1/temp.jpg`，读图失败且**静默**）。
 

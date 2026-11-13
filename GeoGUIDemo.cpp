@@ -355,7 +355,9 @@ struct App
     bool  autoHi         = true;       // 高阈值跟随低阈值(见 hiFor())
     int   maxPoints      = 1200;
     int   numLevels      = 0;          // 0 = 自动
-    float minScore       = 0.55f;
+    float minScore       = 0.40f;       // 默认评分方式是 mean(与 Halcon 一致)，分数比旧的
+                                        // positive-mean 低 0.10~0.13，所以阈值同步下调。
+                                        // Halcon 的常用起点是 0.5，本工具留一点余量。
     int   maxMatches     = 12;
     float minDistance    = 30.f;
     float greediness     = 0.9f;
@@ -363,8 +365,11 @@ struct App
     int   metric         = 0;           // 0 = 要求极性一致, 1 = 忽略整体极性反转, 2 = 忽略逐点极性
     float maxOverlap     = 1.f;         // 1 = 关闭; 两个实例重叠超过这个比例只留高分那个
     bool  useOpenCL      = true;
-    int   scoreMode      = 1;           // 1 = positive-mean(默认), 0 = mean, 2 = trimmed-mean
-                                        // 3 = clipped-mean(只算正向但不缩分母, 部分匹配不上高分)
+    int   scoreMode      = 0;           // 0 = mean(默认, 与 Halcon 一致), 1 = positive-mean,
+                                        // 2 = trimmed-mean, 3 = clipped-mean。
+                                        // 注意 1 是「只在方向一致的点上取平均」，
+                                        // 错位置上只要有九成点方向一致就会报 0.95+，
+                                        // 所以不能当默认（实测同一位姿我们 0.946、Halcon 0.556）
     float minCoverage    = 0.f;         // 0 = 关闭。 模型点里"梯度方向一致"的最低占比,
                                         // 用来剔除调低最小分数后冒出来的相似位置
     int   boxMode        = 0;           // 结果框样式: 0 = 固定方框(默认), 1 = 旋转框, 2 = 模型凸包
@@ -412,6 +417,16 @@ struct App
 
     std::string tplPath, tgtPath;
     cv::Mat tplGray, tgtGray;
+
+    //---- 模板来源（冻结） ----
+    // 「用目标图的 ROI 当模板」/ 在目标图上框选后，这里存一份来源图 + 那个 ROI。
+    // 之后切换目标图、调模板参数重建模板，都从这里重新裁，而不是从"当前显示的目标图"裁
+    // —— 否则切到另一张（比如偏暗的）图后一调参数，模板就悄悄换成了那张图同一位置的内容，
+    // 用户看到的是"模板建到暗图上了"。
+    cv::Mat     tplSrcGray;                 // 来源图整幅
+    cv::Rect    tplSrcRoi;                  // 来源图上的 ROI（空 = 整幅）
+    std::string tplSrcLabel;                // 给界面/日志看
+    bool        tplSrcValid = false;
     cv::Mat modelVis, resultVis;
 
     //---- 目标图片目录 ----
@@ -568,9 +583,20 @@ static void ensureMask(App& a, int w, int h)
 //=======================================================================
 //  业务动作
 //=======================================================================
-// 取创建模板要用的那块图: 模板源图优先(ROI owner=2)，没有就用目标图(ROI owner=1)
+// 取创建模板要用的那块图。
+//
+// 优先用「冻结的模板来源」(tplSrcGray + tplSrcRoi)：它是在用户框定模板那一刻
+// 记下来的，之后切换目标图 / 调模板参数都不会变。没有冻结来源时才退回老逻辑
+// （模板源图优先，其次当前目标图 + ROI）。
 static cv::Mat templatePatch(const App& a)
 {
+    if (a.tplSrcValid && !a.tplSrcGray.empty())
+    {
+        const cv::Rect r = a.tplSrcRoi & cv::Rect(0, 0, a.tplSrcGray.cols, a.tplSrcGray.rows);
+        if (r.width > 4 && r.height > 4) return a.tplSrcGray(r);
+        return a.tplSrcGray;
+    }
+
     const cv::Mat* src = nullptr;
 
     if (!a.tplGray.empty())      { src = &a.tplGray; }
@@ -586,6 +612,17 @@ static cv::Mat templatePatch(const App& a)
     return *src;
 }
 
+// 冻结模板来源：label 只用于界面显示（"目标图 xxx 的 ROI(...)" 之类）
+static void freezeTplSource(App& a, const cv::Mat& src, const cv::Rect& roi,
+                            const std::string& label)
+{
+    if (src.empty()) { a.tplSrcValid = false; return; }
+    a.tplSrcGray  = src.clone();
+    a.tplSrcRoi   = roi & cv::Rect(0, 0, src.cols, src.rows);
+    a.tplSrcLabel = label;
+    a.tplSrcValid = true;
+}
+
 // 与 templatePatch() 返回的 patch 对齐的掩码。
 // 掩码是按「模板源图」画的，而 patch 可能是 ROI 裁出来的一块，所以要跟着裁；
 // 尺寸对不上时宁可不传掩码，也不要让 NccMatcher 去猜（它会把掩码 resize 成
@@ -594,6 +631,14 @@ static cv::Mat maskForPatch(const App& a, const cv::Size& patchSize)
 {
     if (a.mask.empty()) return cv::Mat();
     if (a.mask.size() == patchSize) return a.mask;
+
+    // 掩码是按冻结来源整幅画的 → 按同一个 ROI 裁
+    if (a.tplSrcValid && !a.tplSrcGray.empty() && a.mask.size() == a.tplSrcGray.size())
+    {
+        const cv::Rect r = a.tplSrcRoi & cv::Rect(0, 0, a.tplSrcGray.cols, a.tplSrcGray.rows);
+        if (r.width > 4 && r.height > 4) return a.mask(r).clone();
+        return cv::Mat();
+    }
 
     const cv::Mat* src = !a.tplGray.empty() ? &a.tplGray
                         : (!a.tgtGray.empty() ? &a.tgtGray : nullptr);
@@ -658,6 +703,21 @@ static void createNccTemplate(App& a)
              "已知角度就把它收窄", a.nccAngleExtentDeg);
 }
 
+static void probeLog(const char* fmt, ...)
+{
+    // 只在显式设置 TPL_PROBE 时才写文件：自动化测试用它判断"GUI 已就绪"，
+    // 正常使用不会在目录里留下任何杂物。
+    const char* pp = std::getenv("TPL_PROBE");
+    if (!pp || !*pp) return;
+    FILE* pf = std::fopen(pp, "a");
+    if (!pf) return;
+    va_list ap;
+    va_start(ap, fmt);
+    std::vfprintf(pf, fmt, ap);
+    va_end(ap);
+    std::fclose(pf);
+}
+
 static void createTemplate(App& a)
 {
     if (a.matchMode == 1) { createNccTemplate(a); return; }
@@ -672,6 +732,12 @@ static void createTemplate(App& a)
     const int64 t0 = cv::getTickCount();
     const bool ok = a.matcher.create(patch, a.toConfig());
     const double ms = (cv::getTickCount() - t0) * 1000.0 / cv::getTickFrequency();
+
+    // TEMP-PROBE-TPLSRC
+    probeLog("create patch=%dx%d srcValid=%d label='%s' roi=%d,%d,%dx%d tgt='%s'\n",
+             patch.cols, patch.rows, (int)a.tplSrcValid, a.tplSrcLabel.c_str(),
+             a.tplSrcRoi.x, a.tplSrcRoi.y, a.tplSrcRoi.width, a.tplSrcRoi.height,
+             a.tgtPath.c_str());
 
     if (!ok)
     {
@@ -862,6 +928,8 @@ static void loadTemplateImage(App& a, const std::wstring& path)
     a.tplPath = ws2s(path);
     refreshTplView(a);
     logf("模板源图: %s (%dx%d)", a.tplPath.c_str(), g.cols, g.rows);
+    // 显式选了模板图 → 来源就是这张整幅图（除非之后在这张图上再框 ROI）
+    freezeTplSource(a, g, cv::Rect(), "模板源图 " + a.tplPath);
 
     if (a.autoRun)          // 换图后直接把模型和结果刷出来
     {
@@ -1075,6 +1143,14 @@ static void drawImageView(const char* id, const char* info, Texture& tex, int ro
                 if (a.roiHas)
                 {
                     logf("框选 ROI: (%d,%d) %dx%d", x0, y0, a.roi.width, a.roi.height);
+                    // 在哪个视图上框的，就把那个视图的图 + 这个框冻结成模板来源。
+                    // 之后切到别的目标图、调模板参数重建，都从这份来源重新裁。
+                    if (roiOwner == 1 && !a.tgtGray.empty())
+                        freezeTplSource(a, a.tgtGray, a.roi,
+                                        "目标图 " + a.tgtPath);
+                    else if (roiOwner == 2 && !a.tplGray.empty())
+                        freezeTplSource(a, a.tplGray, a.roi,
+                                        "模板源图 " + a.tplPath);
                     a.roiDirty = true;      // 让右侧面板重建模板
                 }
             }
@@ -1171,9 +1247,18 @@ static void drawThumbList()
     }
 
     ImGui::Text("%d 张  当前 %d", (int)a.thumbs.size(), a.thumbSel + 1);
+
+    // 上/下一张、分隔线固定在顶部，不随缩略图列表滚动 ——
+    // 之前它们和缩略图在同一个滚动区域里，列表滑到底部时按钮被顶出视野，
+    // 就没法点"上一张/下一张"了。
     if (ImGui::Button("上一张", ImVec2(-1, 0))) selectThumb(a, a.thumbSel - 1);
     if (ImGui::Button("下一张", ImVec2(-1, 0))) selectThumb(a, a.thumbSel + 1);
     ImGui::Separator();
+
+    // 只有缩略图列表自己滚动。高度 -1 = 占满剩余空间，
+    // 这样不管有多少张图，上面两个按钮始终留在可视区。
+    ImGui::BeginChild("##thumbs_scroll", ImVec2(0, -1), ImGuiChildFlags_None,
+                      ImGuiWindowFlags_NoMove);
 
     // 缩略图按目录宽度缩放，避免出现横向滚动条
     const float availW = ImGui::GetContentRegionAvail().x;
@@ -1212,6 +1297,8 @@ static void drawThumbList()
         ImGui::SetItemTooltip("%s (%d/%d)", t.name.c_str(), i + 1, (int)a.thumbs.size());
         ImGui::PopID();
     }
+
+    ImGui::EndChild();
 }
 
 //=======================================================================
@@ -1340,6 +1427,18 @@ static void drawPanel()
         if (!p.empty()) loadTemplateImage(a, p);
     }
     ImGui::TextWrapped("模板源: %s", a.tplPath.empty() ? "(未选择，默认用整幅目标图)" : a.tplPath.c_str());
+    if (a.tplSrcValid)
+    {
+        const cv::Rect& r = a.tplSrcRoi;
+        if (r.width > 4 && r.height > 4)
+            textDimWrapped(("模板来源已锁定: " + a.tplSrcLabel + "  ROI(" +
+                            std::to_string(r.x) + "," + std::to_string(r.y) + ") " +
+                            std::to_string(r.width) + "x" + std::to_string(r.height) +
+                            "  —— 切换目标图 / 调参数都从这份来源重建").c_str());
+        else
+            textDimWrapped(("模板来源已锁定: " + a.tplSrcLabel +
+                            "（整幅）—— 切换目标图 / 调参数都从这份来源重建").c_str());
+    }
 
     if (ImGui::Button("用目标图的 ROI 当模板", ImVec2(-1, 0)))
     {
@@ -1359,6 +1458,10 @@ static void drawPanel()
                 a.tplPath = a.tgtPath + "  [ROI]";
                 refreshTplView(a);
                 logf("已截取模板: (%d,%d) %dx%d", r.x, r.y, r.width, r.height);
+                // 冻结来源：以后切图 / 调参数都从这张图的这个框重建，不会换到别的图上
+                freezeTplSource(a, a.tgtGray, r, "目标图 " + a.tgtPath);
+                logf("模板来源已锁定: %s  ROI(%d,%d) %dx%d（切换目标图或调参数都从这里重建）",
+                     a.tplSrcLabel.c_str(), r.x, r.y, r.width, r.height);
                 a.roiOwner = 0;                 // 截出来的是新图，ROI 不再是目标图上的框
                 a.roiHas   = false;
                 a.roiDirty = true;              // 立刻用它建模板
@@ -1374,6 +1477,8 @@ static void drawPanel()
         {
             a.roiHas   = false;
             a.roiOwner = 0;
+            // 冻结来源跟着回到「整幅」，用的是来源图本身，不是当前显示的目标图
+            if (a.tplSrcValid) { a.tplSrcRoi = cv::Rect(); }
             a.roiDirty = true;      // 回到整幅图，重建一次
         }
     }
@@ -1686,8 +1791,9 @@ static void drawPanel()
     {
         changedSearch |= sliderF("最小分数", &a.minScore, 0.05f, 1.f, "%.2f", commitSearch);
         {
-            const char* items[] = { "mean(原始)",
-                                    "positive-mean(方向一致点比例)",
+            // index == scoreMode，所以 0=mean 必须排第一（默认项）。
+            const char* items[] = { "mean(全部点平均, 与 Halcon 一致)",
+                                    "positive-mean(只在同向点上平均, 会虚高)",
                                     "trimmed-mean(去尾10%)",
                                     "clipped-mean(正向但不缩分母)" };
             itemWidthForLabel("评分方式");
@@ -1696,6 +1802,12 @@ static void drawPanel()
                 changedSearch = true;
                 commitSearch  = true;
             }
+            if (a.scoreMode == 1)
+                ImGui::TextColored(ImVec4(1.f, 0.65f, 0.15f, 1.f),
+                    "提示: positive-mean 只在\"方向一致\"的点上取平均，\n"
+                    "错位置上只要有九成点方向一致就会报 0.9+。\n"
+                    "实测同一假位姿: 本项 0.946 / mean 0.567 / Halcon 0.556。\n"
+                    "要和 Halcon 分数对比，请选 mean。");
         }
         changedSearch |= sliderF("最小覆盖率", &a.minCoverage, 0.f, 1.f, "%.2f", commitSearch);
         {
@@ -2057,21 +2169,34 @@ static void drawUI()
 //=======================================================================
 static void autoInit(App& a, const std::string& dir)
 {
-    const std::string tpl = dir + "/temp.jpg";
-    if (!loadGrayImage(s2ws(tpl), a.tplGray))
+    // 目录可能带反斜杠（例如命令行传 ..\case1），拼 "/temp.jpg" 时统一成正斜杠，
+    // 否则会拼出 "..\case1/temp.jpg" 这种混合分隔符，读图失败、默认模板静默不加载。
+    std::string d = dir;
+    for (size_t i = 0; i < d.size(); i++) if (d[i] == '\\') d[i] = '/';
+    const std::string tpl = d + "/temp.jpg";
+    probeLog("autoInit dir='%s' tpl='%s'\n", dir.c_str(), tpl.c_str());
+
+    // 先把目录读进来：即使没有默认模板，用户也应该看到图片列表。
+    // 之前这里一加载失败就 return，导致没有 temp.jpg 的目录（如 case3）
+    // 连缩略图列表都是空的，得手动"选择图片目录"才有东西。
+    loadTargetDir(a, s2ws(dir));
+
+    bool haveTpl = loadGrayImage(s2ws(tpl), a.tplGray);
+    probeLog("autoInit: template %s\n", haveTpl ? "loaded" : "MISSING");
+    if (!haveTpl)
     {
-        logf("没有默认模板 %s，请在右侧手动选择模板图片", tpl.c_str());
-        return;
+        logf("没有默认模板 %s，请在右侧手动选择模板图片（图片列表已载入）", tpl.c_str());
+    }
+    else
+    {
+        probeLog("autoInit: loaded %dx%d\n", a.tplGray.cols, a.tplGray.rows);
+        a.tplPath = tpl;
+        refreshTplView(a);
+        logf("模板源图: %s (%dx%d)", tpl.c_str(), a.tplGray.cols, a.tplGray.rows);
+        freezeTplSource(a, a.tplGray, cv::Rect(), "模板源图 " + a.tplPath);
+        createTemplate(a);
     }
 
-    a.tplPath = tpl;
-    refreshTplView(a);
-    logf("模板源图: %s (%dx%d)", tpl.c_str(), a.tplGray.cols, a.tplGray.rows);
-
-    createTemplate(a);
-
-    // 把整个目录读进来做成预览列表，并自动选中第一张跑一次
-    loadTargetDir(a, s2ws(dir));
     if (a.tgtGray.empty())
     {
         logf("%s 里没有可用于匹配的图片", dir.c_str());
@@ -2081,6 +2206,9 @@ static void autoInit(App& a, const std::string& dir)
     const std::string tplName = tpl.substr(tpl.find_last_of("\\/") + 1);
     if (a.thumbSel == 0 && a.thumbs.size() > 1 && a.thumbs[0].name == tplName)
         selectThumb(a, 1);
+
+    probeLog("autoInit: READY thumbs=%d sel=%d tgt=%dx%d\n",
+             (int)a.thumbs.size(), a.thumbSel, a.tgtGray.cols, a.tgtGray.rows);
 }
 
 //=======================================================================

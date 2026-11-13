@@ -151,6 +151,16 @@ target_link_libraries(imgui PUBLIC d3d11 dxgi d3dcompiler)
 #-----------------------------------------------------------------------
 #  GeoGUIDemo - imgui front end for quick template matching checks
 #-----------------------------------------------------------------------
+# 必须按 GUI 子系统链接（/SUBSYSTEM:WINDOWS）：
+# 默认的 add_executable 是控制台子系统，双击/被拉起时会额外开一个黑窗口，
+# 而且那个控制台常常盖在 GUI 上面，鼠标点不到界面。
+# 源码用的是 main()，所以显式把入口指到 mainCRTStartup，否则 MSVC 会找 WinMain
+# 并报 "unresolved external symbol WinMain"。
+set_target_properties(GeoGUIDemo PROPERTIES WIN32_EXECUTABLE TRUE)
+if(MSVC)
+    target_link_options(GeoGUIDemo PRIVATE /ENTRY:mainCRTStartup)
+endif()
+
 target_include_directories(GeoGUIDemo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${IMGUI_ROOT} ${IMGUI_ROOT}/backends)
 target_compile_definitions(GeoGUIDemo PRIVATE _USE_MATH_DEFINES)
 if(OpenCV_LIBS)
