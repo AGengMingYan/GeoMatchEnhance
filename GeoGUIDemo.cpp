@@ -585,71 +585,66 @@ static void ensureMask(App& a, int w, int h)
 //=======================================================================
 // 取创建模板要用的那块图。
 //
-// 优先用「冻结的模板来源」(tplSrcGray + tplSrcRoi)：它是在用户框定模板那一刻
-// 记下来的，之后切换目标图 / 调模板参数都不会变。没有冻结来源时才退回老逻辑
-// （模板源图优先，其次当前目标图 + ROI）。
+// a.tplGray 本身就是「模板」：要么是用户选的模板图（整幅），要么是 ROI 裁出来的块
+// （freezeTplSource 保证这一点）。所以这里直接返回它，不再做二次裁剪 ——
+// 之前这里按「当前目标图 + ROI」现裁，导致切换图片后模板跟着变。
+// 只有在完全没有模板来源时，才退回当前目标图 + ROI。
 static cv::Mat templatePatch(const App& a)
 {
-    if (a.tplSrcValid && !a.tplSrcGray.empty())
+    if (!a.tplGray.empty()) return a.tplGray;
+
+    if (!a.tgtGray.empty())
     {
-        const cv::Rect r = a.tplSrcRoi & cv::Rect(0, 0, a.tplSrcGray.cols, a.tplSrcGray.rows);
-        if (r.width > 4 && r.height > 4) return a.tplSrcGray(r);
-        return a.tplSrcGray;
+        if (a.roiHas && a.roiOwner == 1)
+        {
+            const cv::Rect r = a.roi & cv::Rect(0, 0, a.tgtGray.cols, a.tgtGray.rows);
+            if (r.width > 4 && r.height > 4) return a.tgtGray(r);
+        }
+        return a.tgtGray;
     }
-
-    const cv::Mat* src = nullptr;
-
-    if (!a.tplGray.empty())      { src = &a.tplGray; }
-    else if (!a.tgtGray.empty()) { src = &a.tgtGray; }
-    if (!src) return cv::Mat();
-
-    const int want = src == &a.tplGray ? 2 : 1;
-    if (a.roiHas && a.roiOwner == want)
-    {
-        const cv::Rect r = a.roi & cv::Rect(0, 0, src->cols, src->rows);
-        if (r.width > 4 && r.height > 4) return (*src)(r);
-    }
-    return *src;
+    return cv::Mat();
 }
 
-// 冻结模板来源：label 只用于界面显示（"目标图 xxx 的 ROI(...)" 之类）
+// 冻结模板来源，并让 a.tplGray 直接等于「模板本身」。
+//
+// 为什么要把 tplGray 也一起换掉：
+//   「模板源图」页渲染的是 a.tplGray，而实际建模用的是冻结来源 tplSrcGray+tplSrcRoi。
+//   如果只更新冻结来源，用户在目标图上拖完 ROI 后，模型是对的，
+//   但「模板源图」页还显示启动时那张固定的模板图 —— 看起来像"ROI 改了但模板没变"。
+//   所以这里让 tplGray 就是裁剪后的模板块：显示、掩码、建模三者用的是同一张图。
 static void freezeTplSource(App& a, const cv::Mat& src, const cv::Rect& roi,
                             const std::string& label)
 {
     if (src.empty()) { a.tplSrcValid = false; return; }
-    a.tplSrcGray  = src.clone();
-    a.tplSrcRoi   = roi & cv::Rect(0, 0, src.cols, src.rows);
+
+    // src 可能就是 a.tplGray / a.tplSrcGray 自己，先拷一份再改成员
+    const cv::Mat full = src.clone();
+    const cv::Rect  r    = roi & cv::Rect(0, 0, full.cols, full.rows);
+    const cv::Mat   patch = (r.width > 4 && r.height > 4) ? full(r).clone() : full;
+
+    a.tplSrcGray  = full;
+    a.tplSrcRoi   = r;
     a.tplSrcLabel = label;
     a.tplSrcValid = true;
+
+    a.tplGray = patch;
+    a.tplPath = label;
+
+    // 模板尺寸变了，旧掩码尺寸对不上，直接作废（否则会被 maskForPatch 丢弃）
+    a.mask.release();
+    a.maskPath.clear();
+    if (a.paintMask) ensureMask(a, patch.cols, patch.rows);
+
+    refreshTplView(a);
 }
 
 // 与 templatePatch() 返回的 patch 对齐的掩码。
-// 掩码是按「模板源图」画的，而 patch 可能是 ROI 裁出来的一块，所以要跟着裁；
-// 尺寸对不上时宁可不传掩码，也不要让 NccMatcher 去猜（它会把掩码 resize 成
-// 模板尺寸，那样 ROI 掩码会被整体缩放，位置全错）。
+// 现在 a.tplGray 就是模板块，掩码也是按它画的，所以尺寸一致时直接返回；
+// 对不上时宁可不传掩码，也不要让 NccMatcher 去 resize（那样 ROI 掩码会被整体缩放，位置全错）。
 static cv::Mat maskForPatch(const App& a, const cv::Size& patchSize)
 {
     if (a.mask.empty()) return cv::Mat();
     if (a.mask.size() == patchSize) return a.mask;
-
-    // 掩码是按冻结来源整幅画的 → 按同一个 ROI 裁
-    if (a.tplSrcValid && !a.tplSrcGray.empty() && a.mask.size() == a.tplSrcGray.size())
-    {
-        const cv::Rect r = a.tplSrcRoi & cv::Rect(0, 0, a.tplSrcGray.cols, a.tplSrcGray.rows);
-        if (r.width > 4 && r.height > 4) return a.mask(r).clone();
-        return cv::Mat();
-    }
-
-    const cv::Mat* src = !a.tplGray.empty() ? &a.tplGray
-                        : (!a.tgtGray.empty() ? &a.tgtGray : nullptr);
-    if (!src || src->empty() || a.mask.size() != src->size()) return cv::Mat();
-
-    const int want = (src == &a.tplGray) ? 2 : 1;
-    if (a.roiHas && a.roiOwner == want)
-    {
-        const cv::Rect r = a.roi & cv::Rect(0, 0, src->cols, src->rows);
-        if (r.width > 4 && r.height > 4) return a.mask(r).clone();
-    }
     return cv::Mat();
 }
 
@@ -703,21 +698,6 @@ static void createNccTemplate(App& a)
              "已知角度就把它收窄", a.nccAngleExtentDeg);
 }
 
-static void probeLog(const char* fmt, ...)
-{
-    // 只在显式设置 TPL_PROBE 时才写文件：自动化测试用它判断"GUI 已就绪"，
-    // 正常使用不会在目录里留下任何杂物。
-    const char* pp = std::getenv("TPL_PROBE");
-    if (!pp || !*pp) return;
-    FILE* pf = std::fopen(pp, "a");
-    if (!pf) return;
-    va_list ap;
-    va_start(ap, fmt);
-    std::vfprintf(pf, fmt, ap);
-    va_end(ap);
-    std::fclose(pf);
-}
-
 static void createTemplate(App& a)
 {
     if (a.matchMode == 1) { createNccTemplate(a); return; }
@@ -732,12 +712,6 @@ static void createTemplate(App& a)
     const int64 t0 = cv::getTickCount();
     const bool ok = a.matcher.create(patch, a.toConfig());
     const double ms = (cv::getTickCount() - t0) * 1000.0 / cv::getTickFrequency();
-
-    // TEMP-PROBE-TPLSRC
-    probeLog("create patch=%dx%d srcValid=%d label='%s' roi=%d,%d,%dx%d tgt='%s'\n",
-             patch.cols, patch.rows, (int)a.tplSrcValid, a.tplSrcLabel.c_str(),
-             a.tplSrcRoi.x, a.tplSrcRoi.y, a.tplSrcRoi.width, a.tplSrcRoi.height,
-             a.tgtPath.c_str());
 
     if (!ok)
     {
@@ -1143,14 +1117,22 @@ static void drawImageView(const char* id, const char* info, Texture& tex, int ro
                 if (a.roiHas)
                 {
                     logf("框选 ROI: (%d,%d) %dx%d", x0, y0, a.roi.width, a.roi.height);
-                    // 在哪个视图上框的，就把那个视图的图 + 这个框冻结成模板来源。
-                    // 之后切到别的目标图、调模板参数重建，都从这份来源重新裁。
+                    // 在哪个视图上框的，就用那个视图显示的内容裁出模板：
+                    //   目标图页   -> 目标图 + 这个框
+                    //   模板源图页 -> 当前模板块 + 这个框（再裁小一点）
+                    // freezeTplSource 会同时更新「模板源图」页显示的内容，
+                    // 所以拖完框立刻就能看到模板变了。
                     if (roiOwner == 1 && !a.tgtGray.empty())
-                        freezeTplSource(a, a.tgtGray, a.roi,
-                                        "目标图 " + a.tgtPath);
+                    {
+                        freezeTplSource(a, a.tgtGray, a.roi, "目标图 " + a.tgtPath);
+                    }
                     else if (roiOwner == 2 && !a.tplGray.empty())
-                        freezeTplSource(a, a.tplGray, a.roi,
-                                        "模板源图 " + a.tplPath);
+                    {
+                        freezeTplSource(a, a.tplGray, a.roi, "模板源图 " + a.tplPath);
+                        // 模板源图页上的框已经被"采纳"成新模板，再画就错位了
+                        a.roiHas   = false;
+                        a.roiOwner = 0;
+                    }
                     a.roiDirty = true;      // 让右侧面板重建模板
                 }
             }
@@ -1454,12 +1436,10 @@ static void drawPanel()
             if (r.width < 8 || r.height < 8) logLine("ROI 太小，先在目标图上拖一个框");
             else
             {
-                a.tplGray = a.tgtGray(r).clone();
-                a.tplPath = a.tgtPath + "  [ROI]";
-                refreshTplView(a);
                 logf("已截取模板: (%d,%d) %dx%d", r.x, r.y, r.width, r.height);
-                // 冻结来源：以后切图 / 调参数都从这张图的这个框重建，不会换到别的图上
-                freezeTplSource(a, a.tgtGray, r, "目标图 " + a.tgtPath);
+                // 冻结来源并同步「模板源图」页：以后切图 / 调参数都从这张图的这个框重建，
+                // 不会换到别的图上，界面上显示的也是这块模板本身。
+                freezeTplSource(a, a.tgtGray, r, a.tgtPath + "  [ROI]");
                 logf("模板来源已锁定: %s  ROI(%d,%d) %dx%d（切换目标图或调参数都从这里重建）",
                      a.tplSrcLabel.c_str(), r.x, r.y, r.width, r.height);
                 a.roiOwner = 0;                 // 截出来的是新图，ROI 不再是目标图上的框
@@ -1477,8 +1457,11 @@ static void drawPanel()
         {
             a.roiHas   = false;
             a.roiOwner = 0;
-            // 冻结来源跟着回到「整幅」，用的是来源图本身，不是当前显示的目标图
-            if (a.tplSrcValid) { a.tplSrcRoi = cv::Rect(); }
+            // 回到「来源整幅」当模板：优先用冻结的来源图，否则用当前目标图整幅
+            if (a.tplSrcValid && !a.tplSrcGray.empty())
+                freezeTplSource(a, a.tplSrcGray, cv::Rect(), a.tplSrcLabel);
+            else if (!a.tgtGray.empty())
+                freezeTplSource(a, a.tgtGray, cv::Rect(), "目标图 " + a.tgtPath);
             a.roiDirty = true;      // 回到整幅图，重建一次
         }
     }
@@ -2174,22 +2157,18 @@ static void autoInit(App& a, const std::string& dir)
     std::string d = dir;
     for (size_t i = 0; i < d.size(); i++) if (d[i] == '\\') d[i] = '/';
     const std::string tpl = d + "/temp.jpg";
-    probeLog("autoInit dir='%s' tpl='%s'\n", dir.c_str(), tpl.c_str());
 
     // 先把目录读进来：即使没有默认模板，用户也应该看到图片列表。
     // 之前这里一加载失败就 return，导致没有 temp.jpg 的目录（如 case3）
     // 连缩略图列表都是空的，得手动"选择图片目录"才有东西。
     loadTargetDir(a, s2ws(dir));
 
-    bool haveTpl = loadGrayImage(s2ws(tpl), a.tplGray);
-    probeLog("autoInit: template %s\n", haveTpl ? "loaded" : "MISSING");
-    if (!haveTpl)
+    if (!loadGrayImage(s2ws(tpl), a.tplGray))
     {
         logf("没有默认模板 %s，请在右侧手动选择模板图片（图片列表已载入）", tpl.c_str());
     }
     else
     {
-        probeLog("autoInit: loaded %dx%d\n", a.tplGray.cols, a.tplGray.rows);
         a.tplPath = tpl;
         refreshTplView(a);
         logf("模板源图: %s (%dx%d)", tpl.c_str(), a.tplGray.cols, a.tplGray.rows);
@@ -2206,9 +2185,6 @@ static void autoInit(App& a, const std::string& dir)
     const std::string tplName = tpl.substr(tpl.find_last_of("\\/") + 1);
     if (a.thumbSel == 0 && a.thumbs.size() > 1 && a.thumbs[0].name == tplName)
         selectThumb(a, 1);
-
-    probeLog("autoInit: READY thumbs=%d sel=%d tgt=%dx%d\n",
-             (int)a.thumbs.size(), a.thumbSel, a.tgtGray.cols, a.tgtGray.rows);
 }
 
 //=======================================================================

@@ -1,5 +1,19 @@
 # Cline 项目规则 — geo-match-enhance
 
+## 0. 发布策略（最高优先级）
+
+**只有用户明确说「发布」「发版」「出个版本」时才打 tag + 发 Gitee 发行版。**
+
+- 平时的改动：**只提交到 master 并 push**，不建 tag、不建发行版、不打包。
+- 用户的说法可能是「提交到 gitee」「整理代码提交」——这**只表示 commit + push**，
+  不等于发布。不要顺手打 tag 或上传附件。
+- 需要发布时，才执行：同步 `release_GeoGUIDemo_x64/` 的 exe → 打 tag →
+  `tools/make-release-zips.ps1` → `tools/publish-release.ps1`。
+- 每次发布前先问清楚版本号（或沿用 patch +1 的约定）。
+
+---
+
+
 ## 1. 加密图片/文件的解密规则（必须遵守）
 
 ### 背景
