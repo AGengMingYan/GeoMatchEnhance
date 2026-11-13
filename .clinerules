@@ -375,6 +375,25 @@ git push origin master 1.0.2
 **`.gitignore` 已忽略** `release_GeoGUIDemo_x64`、`build_x64`、`_ai_tmp`、`HalconDemo`，
 所以 zip 放在 `release_GeoGUIDemo_x64/` 里不会被误提交（可用 `git check-ignore -v <path>` 确认）。
 
+### 发布 1.0.4 时补的三个坑（2026-11-13 实测）
+
+1. **`CreateFromDirectory` 的源目录必须就是最终顶层目录**，否则包里会多一层。
+   写成 `CreateFromDirectory('release\pkg_104', $zip, ...)` → 顶层是
+   `pkg_104/GeoGUIDemo-1.0.4/...`；要传 `release\pkg_104\GeoGUIDemo-1.0.4`。
+   打完必须打印 `z.namelist()[0]` 确认。
+2. **提交信息 / tag 说明 / 包内 README.txt 的生成顺序**
+   （`editor` 直接写 `.txt` 会落盘成密文，git 读出来是乱码）：
+   ```
+   editor 写 _ai_tmp/xxx.md          # .md 由 editor 写是明文
+   → PowerShell ReadAllText(.md) → WriteAllText(目标 .txt, UTF8 无 BOM)
+   → 验头（应为 47 65 6F 47 之类的正常文本）→ git commit -F / git tag -F
+   ```
+3. **用 curl 调 Gitee API 做核验时，输出必须 `-o file`**：
+   `| Out-File -Encoding utf8` 会加 BOM 并把中文 body 转码，`json.load` 直接报错。
+   另外 PowerShell 里给 curl 传 header 要用数组形式
+   `& curl.exe @('-H', ("Authorization: token " + $tok), $url)`，
+   拼成一整个字符串容易把 URL 吃掉（表现为 `curl: (2) no URL specified`）。
+
 
 ## 加密软件是参照进程和扩展名来加密的
 例如 a.txt 对应的正常读取进程是cat.exe/cmd.exe/notepad.exe/code.exe...
