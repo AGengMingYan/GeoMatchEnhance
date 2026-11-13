@@ -20,6 +20,7 @@ build/*
 .cache
 _ai_tmp
 build_x64
+OpenCV455_MSVC32/
 HalconDemo/Halcon17/include/halconcpp/HSheetOfLightModel.h
 HalconDemo
 release_GeoGUIDemo_x64
