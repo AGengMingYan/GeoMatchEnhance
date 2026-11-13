@@ -18,6 +18,11 @@
 //    * scale search.  Halcon's NCC is rotation only - there is no
 //      ScaleMin/ScaleMax in create_ncc_model and no Scale output in
 //      find_ncc_model.  Same here.
+//
+//  Threading: createNccModel / readNccModel are not thread safe on the same
+//  object (they mutate it).  findNccModel() is const and only reads, so once a
+//  model is built the same object may be searched from several threads, and
+//  several NccMatcher objects may be searched in parallel.
 //***********************************************************************
 #pragma once
 #include <opencv2/opencv.hpp>

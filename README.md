@@ -14,6 +14,7 @@
 - [快速使用](#快速使用)
 - [GUI 工具使用说明](#gui-工具使用说明)
 - [API 概览](#api-概览)
+- [作为 SDK 集成](#作为-sdk-集成)
 - [测试报告](#测试报告)
 - [NCC 匹配（灰度相关）](#ncc-匹配灰度相关nccmatch)
 - [性能调优](#性能调优)
@@ -247,6 +248,64 @@ cfg.showGradients = false;
 > 这种情况下自动退回画采样点，结果图不会被留空。
 
 ---
+## 作为 SDK 集成
+
+发布包除了 GUI 程序，还提供**可直接集成的库**（32 位 + 64 位各一套）：
+
+```
+GeoMatch-1.1.0-win64/          GeoMatch-1.1.0-win32/
+├── include/                   ├── include/
+│   ├── GeoMatch/GeoMatch.h    │   （同上，头文件两套一致）
+│   ├── ShapeMatch/…           │
+│   └── NccMatch/…             │
+├── lib/GeoMatch.lib           ├── lib/GeoMatch.lib        # 静态库，/MD Release
+├── lib/opencv_world455.lib    ├── lib/opencv_world455.lib
+├── bin/opencv_world455.dll    ├── bin/opencv_world455.dll  # 运行时依赖
+├── lib/cmake/GeoMatch/        ├── …                       # find_package 支持
+├── examples/*.cpp             ├── …                       # 可编译的调用示例
+└── SDK.md                     └── …                       # 完整 API 手册
+```
+
+最小用法：
+
+```cpp
+#include "GeoMatch/GeoMatch.h"
+
+geomatch::Config cfg;           // 建模 + 搜索参数
+cfg.minScore = 0.45;
+
+geomatch::Matcher m;
+m.create(cv::imread("tpl.jpg", 0), cfg);      // 或 m.load("model.shm")
+auto dets = m.detect(cv::imread("scene.jpg", 0));
+```
+
+CMake 集成（推荐）：
+
+```cmake
+find_package(GeoMatch REQUIRED)   # GeoMatch_DIR = <sdk>/lib/cmake/GeoMatch
+target_link_libraries(app PRIVATE GeoMatch::GeoMatch ${OpenCV_LIBS})
+```
+
+手工集成：`-I<sdk>\include` + `<sdk>\lib\GeoMatch.lib` + `opencv_world455.lib`，
+运行时带 `opencv_world455.dll`。用 DLL 版还要定义 `GEOMATCH_SHARED`。
+
+要点（详见 [docs/SDK.md](docs/SDK.md)）：
+
+| 项 | 说明 |
+|---|---|
+| 编译器 | MSVC 2019+，**C++17**，**`/MD`** |
+| 静态库 | 定义 `GEOMATCH_STATIC`（可省略） |
+| DLL | 定义 `GEOMATCH_SHARED`，并部署 `GeoMatch.dll` |
+| Debug 工程 | SDK 只带 Release 库，Debug 会报 LNK2038；要么用 Release，要么自己编 Debug |
+| 32/64 位 | 两套 OpenCV 不通用，包也不能混链 |
+| 版本 | `geomatch::versionString()` 返回 `"1.1.0"` |
+
+生成 SDK 目录：`powershell tools\make-sdk.ps1 -Version 1.1.0`
+（会在 `release_GeoGUIDemo_x64/sdk/` 下产出 win64 与 win32 两套）。
+
+---
+
+
 
 ## 测试报告
 

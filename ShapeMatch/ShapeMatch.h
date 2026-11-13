@@ -1,6 +1,14 @@
 //***********************************************************************
 //  Halcon-like shape based template matching (edge/gradient based)
 //  createShapeModel == create_shape_model, findShapeModel == find_shape_model
+//
+//  This is the low level engine.  Most applications should use the facade in
+//  GeoMatch/GeoMatch.h instead; the only reason to include this header
+//  directly is the escape hatch geomatch::Matcher::core().
+//
+//  Threading: createShapeModel / readShapeModel mutate the object and are not
+//  thread safe.  findShapeModel() const only reads, so one built model may be
+//  searched from several threads.
 //***********************************************************************
 #pragma once
 #include <opencv2/opencv.hpp>

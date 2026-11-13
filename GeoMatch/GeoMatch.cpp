@@ -847,6 +847,17 @@ std::vector<Matcher::SelfTestResult> Matcher::runSelfTest(const cv::Mat& gray, c
 //=======================================================================
 //  free helpers
 //=======================================================================
+const char* versionString() { return GEOMATCH_VERSION_STRING; }
+
+bool isSharedBuild()
+{
+#if defined(GEOMATCH_EXPORTS) || defined(GEOMATCH_SHARED)
+    return true;
+#else
+    return false;
+#endif
+}
+
 std::vector<std::string> listImages(const std::string& dir,
                                     const std::vector<std::string>& exts)
 {

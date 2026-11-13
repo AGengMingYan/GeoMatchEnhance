@@ -1,10 +1,15 @@
 cmake_minimum_required(VERSION 3.10.0)
-project(GeoMatchDemo VERSION 0.1.0 LANGUAGES C CXX)
+project(GeoMatchDemo VERSION 1.1.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
+
+# 说明：Windows 下 32/64 位是两套 OpenCV，要靠 OPENCV_ROOT 区分。
+#   x64: -DCMAKE_GENERATOR_PLATFORM=x64 -DOPENCV_ROOT=D:/Develop/OpenCV455/opencv/build
+#   x86: -DCMAKE_GENERATOR_PLATFORM=Win32 -DOPENCV_ROOT=D:/Develop/OpenCV455_32
+# Ninja 生成器没有 PLATFORM，改用 vcvars64/vcvars32 决定目标架构。
 
 
 
@@ -85,7 +90,11 @@ else()
     target_compile_definitions(GeoMatch PUBLIC GEOMATCH_STATIC)
 endif()
 
-target_include_directories(GeoMatch PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+# BUILD_INTERFACE: 构建时用源码树；INSTALL_INTERFACE: 装好之后用 <sdk>/include。
+# 只写 ${CMAKE_CURRENT_SOURCE_DIR} 会让 CMake 拒绝导出（"prefixed in the source directory"）。
+target_include_directories(GeoMatch PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+    $<INSTALL_INTERFACE:include>)
 if(OpenCV_LIBS)
     target_link_libraries(GeoMatch PUBLIC ${OpenCV_LIBS})
 else()
@@ -181,3 +190,74 @@ if(MSVC)
 endif()
 
 target_compile_definitions(GeoMatchDemo PRIVATE _USE_MATH_DEFINES)
+
+#-----------------------------------------------------------------------
+#  最小调用示例（构建出来保证 SDK 文档里的代码是能编译的）
+#  GEOMATCH_BUILD_EXAMPLES=OFF 可以不编译它们
+#-----------------------------------------------------------------------
+option(GEOMATCH_BUILD_EXAMPLES "build the SDK examples" ON)
+if(GEOMATCH_BUILD_EXAMPLES AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/examples")
+    add_executable(example_shape_match examples/example_shape_match.cpp)
+    target_link_libraries(example_shape_match PRIVATE GeoMatch)
+    add_executable(example_ncc_match examples/example_ncc_match.cpp)
+    target_link_libraries(example_ncc_match PRIVATE GeoMatch)
+    if(MSVC)
+        target_compile_options(example_shape_match PRIVATE /utf-8)
+        target_compile_options(example_ncc_match PRIVATE /utf-8)
+    endif()
+endif()
+
+#-----------------------------------------------------------------------
+#  安装规则：gen 目录就是 SDK 的 layout
+#      include/GeoMatch/GeoMatch.h          (facade)
+#      include/ShapeMatch/ShapeMatch.h
+#      include/NccMatch/NccMatch.h
+#      lib/GeoMatch.lib  |  bin/GeoMatch.dll
+#      lib/cmake/GeoMatch/GeoMatchConfig.cmake
+#
+#  cmake --install . --prefix <sdk> 即可得到可交付目录。
+#-----------------------------------------------------------------------
+include(GNUInstallDirs)
+set(GEOMATCH_INSTALL_CMAKEDIR "${CMAKE_INSTALL_LIBDIR}/cmake/GeoMatch")
+
+install(TARGETS GeoMatch
+        EXPORT  GeoMatchTargets
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+
+# 头文件按原目录结构安装（头里用的是 "ShapeMatch/ShapeMatch.h" 这种带子目录的写法），
+# 消费方只需要 -I<sdk>/include。
+install(FILES GeoMatch/GeoMatch.h     DESTINATION include/GeoMatch    COMPONENT headers)
+install(FILES ShapeMatch/ShapeMatch.h DESTINATION include/ShapeMatch  COMPONENT headers)
+install(FILES NccMatch/NccMatch.h     DESTINATION include/NccMatch    COMPONENT headers)
+
+install(EXPORT GeoMatchTargets
+        FILE GeoMatchTargets.cmake
+        NAMESPACE GeoMatch::
+        DESTINATION ${GEOMATCH_INSTALL_CMAKEDIR})
+
+# 版本/目标文件，供 find_package(GeoMatch) 使用
+include(CMakePackageConfigHelpers)
+write_basic_package_version_file(
+    "${CMAKE_CURRENT_BINARY_DIR}/GeoMatchConfigVersion.cmake"
+    VERSION ${PROJECT_VERSION}
+    COMPATIBILITY SameMajorVersion)
+
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/GeoMatchConfig.cmake.in"
+"@PACKAGE_INIT@\n\ninclude(\"\${CMAKE_CURRENT_LIST_DIR}/GeoMatchTargets.cmake\")\n\n# 导出库的 include 目录，方便消费方直接 include_directories()\nget_target_property(_gm_inc GeoMatch::GeoMatch INTERFACE_INCLUDE_DIRECTORIES)\nset(GeoMatch_INCLUDE_DIRS \"\${_gm_inc}\")\nset(GeoMatch_LIBRARIES GeoMatch::GeoMatch)\nset(GeoMatch_VERSION \"@PROJECT_VERSION@\")\ncheck_required_components(GeoMatch)\n")
+configure_package_config_file(
+    "${CMAKE_CURRENT_BINARY_DIR}/GeoMatchConfig.cmake.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/GeoMatchConfig.cmake"
+    INSTALL_DESTINATION ${GEOMATCH_INSTALL_CMAKEDIR})
+
+install(FILES
+        "${CMAKE_CURRENT_BINARY_DIR}/GeoMatchConfig.cmake"
+        "${CMAKE_CURRENT_BINARY_DIR}/GeoMatchConfigVersion.cmake"
+        DESTINATION ${GEOMATCH_INSTALL_CMAKEDIR})
+
+# SDK 文档一起装进包（存在才装）
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/docs/SDK.md")
+    install(FILES docs/SDK.md DESTINATION . COMPONENT docs)
+endif()
+

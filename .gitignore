@@ -29,3 +29,10 @@ Gitee私人令牌.txt
 Gitee私人令牌.txt.txt
 *令牌*.txt
 *令牌*.txt.txt
+
+# SDK build outputs
+_sdk64
+_sdk64dll
+_sdk32
+build_dll64
+build_x86

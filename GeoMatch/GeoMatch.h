@@ -23,6 +23,17 @@
 #include "ShapeMatch/ShapeMatch.h"
 
 //-----------------------------------------------------------------------
+//  version.  Kept in sync with project(GLOB VERSION) in CMakeLists.txt and
+//  with the git tag; geoMatchVersion() returns the same string at runtime so
+//  an application can log what it actually linked against.
+//-----------------------------------------------------------------------
+#define GEOMATCH_VERSION_MAJOR 1
+#define GEOMATCH_VERSION_MINOR 1
+#define GEOMATCH_VERSION_PATCH 0
+#define GEOMATCH_VERSION_STRING "1.1.0"
+
+
+//-----------------------------------------------------------------------
 //  export decoration.  GEOMATCH_STATIC is defined when building/using the
 //  static library; otherwise the symbols come from the shared library.
 //-----------------------------------------------------------------------
@@ -67,7 +78,10 @@ struct Config
     int    minChainLen = 2;       // drop edge chains shorter than this (pixels)
 
     // ---- search ----
-    double minScore     = 0.55;
+    // 0.45: the default scoreMode is 0 (mean, Halcon-compatible), whose scores
+    // run ~0.10 lower than positive-mean for the same pose.  Raise it once you
+    // have measured your own data.
+    double minScore     = 0.45;
     int    maxMatches   = 12;
     double minDistance  = 30.0;
     // Halcon's MaxOverlap: instances whose model rectangles overlap by more
@@ -326,6 +340,12 @@ private:
 //-----------------------------------------------------------------------
 //  free helpers
 //-----------------------------------------------------------------------
+
+// "1.1.0" - the version this library was built from (see GEOMATCH_VERSION_STRING)
+GEOMATCH_API const char* versionString();
+
+// is this build a DLL (true) or a static library (false)?
+GEOMATCH_API bool isSharedBuild();
 
 // collect the images of a directory, sorted, with the given extensions
 GEOMATCH_API std::vector<std::string> listImages(
