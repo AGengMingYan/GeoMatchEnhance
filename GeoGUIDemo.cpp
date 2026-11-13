@@ -58,6 +58,7 @@ static ID3D11RenderTargetView* g_rtv       = nullptr;
 static bool                    g_occluded  = false;
 static UINT                    g_resizeW   = 0, g_resizeH = 0;
 static float                   g_scale     = 1.0f;
+static bool                    g_dirtyFrame = false;  // 本帧 drawUI 抛异常，跳过 Render
 static HWND                    g_hwnd      = nullptr;
 
 static bool    CreateDeviceD3D(HWND hwnd);
@@ -453,8 +454,15 @@ struct App
     //---- 掩码涂抹 ----
     bool  paintMask    = false;   // 涂抹模式开关
     bool  maskPainting = false;   // 正在按住涂抹
-    bool  maskDirty    = false;   // 涂抹结束，需要重建模板
+    bool  maskDirty    = false;   // 需要重建模板(已经可以动手了)
+    // 涂抹刚改完掩码，但用户可能还要接着涂 —— 先记下来，等"编辑完成"再重建+识别。
+    // 触发时机：切走「模板源图」页签 / 退出涂抹模式 / 点「创建模板」或「执行匹配」。
+    bool  maskPending  = false;
     float brushRadius  = 6.f;     // 画笔半径(图像像素)
+
+    // 当前选中的图像页签：0=匹配结果 1=目标图 2=模板源图 3=模板模型
+    // 仅用于判断"涂抹掩码时用户是否还在编辑"，不参与是否匹配的决策。
+    int   viewTab      = 0;
 
     // 高阈值的推荐值(灰度差)。滞后阈值必须有分离度才会"沿着弱边生长"，
     // 分离度太小就退化成纯阈值、线会被切碎；太大又会长出噪声。
@@ -770,6 +778,15 @@ static void createTemplate(App& a)
              "可适当减小「最大点数」", 100.0f * wm / sm);
 }
 
+// 带异常保护的包装：建模可能抛 cv::Exception（模板/掩码尺寸不匹配、内存不足等），
+// 这里兜住，避免把整个进程带走。
+static void createTemplateSafe(App& a)
+{
+    try { createTemplate(a); }
+    catch (const cv::Exception& e)  { logf("!! 创建模板异常: %s", e.what()); }
+    catch (const std::exception& e) { logf("!! 创建模板异常: %s", e.what()); }
+}
+
 //=======================================================================
 //  NCC 搜索 (find_ncc_model)
 //=======================================================================
@@ -783,6 +800,18 @@ static void runNccMatch(App& a, int loops)
     if (a.tgtGray.empty())
     {
         logLine("还没有匹配目标图片");
+        return;
+    }
+
+    // 模板比搜索图大：NCC 会直接 0 命中（不崩），但给用户一句明确提示更有用。
+    const cv::Size nmsz = a.ncc.modelSize();
+    if (nmsz.width > a.tgtGray.cols || nmsz.height > a.tgtGray.rows)
+    {
+        logf("NCC 模板 %dx%d 比搜索图 %dx%d 大，无法匹配",
+             nmsz.width, nmsz.height, a.tgtGray.cols, a.tgtGray.rows);
+        a.dets.clear();
+        a.nccDets.clear();
+        a.texResult.releaseDeferred();
         return;
     }
 
@@ -856,6 +885,18 @@ static void runMatch(App& a, int loops)
         return;
     }
 
+    // 模板比搜索图大时直接给出明确提示，不必进搜索（也避免触发异常）。
+    // 360 度模型/旋转还会把有效尺寸放大到对角线，这里用最简单的 bounding box 判断。
+    const cv::Size msz = a.matcher.modelSize();
+    if (msz.width > a.tgtGray.cols || msz.height > a.tgtGray.rows)
+    {
+        logf("模板 %dx%d 比搜索图 %dx%d 大，无法匹配（换一张大图，或把模板缩小）",
+             msz.width, msz.height, a.tgtGray.cols, a.tgtGray.rows);
+        a.dets.clear();
+        a.texResult.releaseDeferred();
+        return;
+    }
+
     a.matcher.setConfig(a.toConfig());
 
     const int loopsUsed = std::max(1, loops);
@@ -890,6 +931,23 @@ static void runMatch(App& a, int loops)
              loopsUsed, wallMs, wallMs / loopsUsed);
 }
 
+// 带异常保护的入口：搜图/画结果都可能抛 cv::Exception（模板比搜索图大、
+// 尺寸不匹配等）。兜住它，只写日志不退出进程 —— 这是"点某张小图偶尔崩溃"的根因。
+static void runMatchSafe(App& a, int loops)
+{
+    try { runMatch(a, loops); }
+    catch (const cv::Exception& e)
+    {
+        logf("!! 匹配异常（常见原因：模板比搜索图大）: %s", e.what());
+        a.dets.clear();
+    }
+    catch (const std::exception& e)
+    {
+        logf("!! 匹配异常: %s", e.what());
+        a.dets.clear();
+    }
+}
+
 static void loadTemplateImage(App& a, const std::wstring& path)
 {
     cv::Mat g;
@@ -907,8 +965,8 @@ static void loadTemplateImage(App& a, const std::wstring& path)
 
     if (a.autoRun)          // 换图后直接把模型和结果刷出来
     {
-        createTemplate(a);
-        if (!a.tgtGray.empty()) runMatch(a, 1);
+        createTemplateSafe(a);
+        if (!a.tgtGray.empty()) runMatchSafe(a, 1);
     }
 }
 
@@ -931,7 +989,7 @@ static void loadTargetImage(App& a, const std::wstring& path)
     for (size_t i = 0; i < a.thumbs.size(); i++)
         if (a.thumbs[i].path == utf8) { a.thumbSel = (int)i; break; }
 
-    if (a.autoRun && a.modelReady) runMatch(a, 1);
+    if (a.autoRun && a.modelReady) runMatchSafe(a, 1);
 }
 
 // 切换到列表里的第 idx 张(支持负数/越界回绕)
@@ -976,12 +1034,13 @@ static void loadTargetDir(App& a, const std::wstring& dir)
         // REDUCED_GRAYSCALE_4: 只解 1/4 尺寸，列几十张也不会卡
         cv::Mat small = cv::imdecode(buf, cv::IMREAD_REDUCED_GRAYSCALE_4);
         if (small.empty()) small = cv::imdecode(buf, cv::IMREAD_GRAYSCALE);
-        if (small.empty()) { bad++; continue; }
+        if (small.empty() || small.cols <= 0 || small.rows <= 0) { bad++; continue; }
 
         int tw = (int)((float)small.cols / (float)small.rows * (float)thumbH);
         tw = std::max(16, std::min(tw, thumbH * 3));
         cv::Mat thumb;
         cv::resize(small, thumb, cv::Size(tw, thumbH), 0, 0, cv::INTER_AREA);
+        if (thumb.empty()) { bad++; continue; }
 
         Thumb t;
         t.wpath = files[i];
@@ -1066,11 +1125,13 @@ static void drawImageView(const char* id, const char* info, Texture& tex, int ro
             a.maskPainting = true;
         }
 
-        // 松手 -> 触发一次模板重建
+        // 松手：只记录"掩码改过了"，**不要立刻重建+识别** ——
+        // 用户往往要连着涂很多笔，每笔都重建会打断编辑、也会卡。
+        // 真正的重建发生在切走「模板源图」页签 / 退出涂抹模式 / 点创建或执行时。
         if (a.maskPainting && !anyDown)
         {
             a.maskPainting = false;
-            a.maskDirty = true;
+            a.maskPending  = true;
         }
 
         // 画笔光标圆圈
@@ -1182,6 +1243,7 @@ static void drawViewPane()
             // 用同一个 ROI 裁出来的（尺寸完全相同、位置只差几十像素），于是看起来
             // 像"匹配出了好几个绿框"。同时也避免了在结果图上误拖鼠标改动模板 ROI。
             drawImageView("##area_result", info, a.texResult, 0);
+            a.viewTab = 0;
             ImGui::EndTabItem();
             a.showResultOnce = false;       // 只在这一次请求后清除
         }
@@ -1189,12 +1251,14 @@ static void drawViewPane()
         {
             snprintf(info, sizeof(info), "目标图  %dx%d", a.texTarget.w, a.texTarget.h);
             drawImageView("##area_target", info, a.texTarget, a.texTarget.valid() ? 1 : 0);
+            a.viewTab = 1;
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("模板源图"))
         {
             snprintf(info, sizeof(info), "模板源图  %dx%d", a.texTplSrc.w, a.texTplSrc.h);
             drawImageView("##area_tpl", info, a.texTplSrc, a.texTplSrc.valid() ? 2 : 0, a.paintMask);
+            a.viewTab = 2;
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("模板模型"))
@@ -1202,9 +1266,19 @@ static void drawViewPane()
             snprintf(info, sizeof(info), "模板模型(绿=轮廓 红=采样点 蓝=中心)  %dx%d",
                      a.texModel.w, a.texModel.h);
             drawImageView("##area_model", info, a.texModel, 0);
+            a.viewTab = 3;
             ImGui::EndTabItem();
         }
         ImGui::EndTabBar();
+    }
+
+    // 掩码涂抹完不当场重建：等用户"编辑完成"——也就是切走「模板源图」页签
+    // （例如去看匹配结果 / 模板模型），这时才用新掩码重建模板并重新识别。
+    if (a.maskPending && a.viewTab != 2)
+    {
+        a.maskPending = false;
+        a.maskDirty   = true;
+        logLine("掩码编辑完成（已切离模板源图页），按新掩码重建模板并识别");
     }
 }
 
@@ -1637,12 +1711,26 @@ static void drawPanel()
                 ensureMask(a, a.tplGray.cols, a.tplGray.rows);
                 refreshTplView(a);
             }
+            else if (!a.paintMask && a.maskPending)
+            {
+                // 退出涂抹模式 = 编辑完成，按新掩码重建并识别
+                a.maskPending = false;
+                a.maskDirty   = true;
+                logLine("已退出涂抹模式，按新掩码重建模板并识别");
+            }
         }
         if (a.paintMask)
         {
             itemWidthForLabel("画笔半径(px)");
             ImGui::SliderFloat("画笔半径(px)", &a.brushRadius, 1.f, 30.f, "%.0f");
             ImGui::TextWrapped("在左侧\"模板源图\"标签页: 左键涂抹=排除(红), 右键涂抹=恢复参与(绿)");
+            ImGui::TextWrapped("涂的过程中不会重新识别；涂完切到其他页签（如\"匹配结果\"）"
+                               "或取消勾选本项后才应用。");
+        }
+        if (a.maskPending)
+        {
+            ImGui::TextColored(ImVec4(1.f, 0.75f, 0.2f, 1.f),
+                "掩码已修改，尚未生效 —— 切到「匹配结果」等页签，或取消勾选涂抹模式即可应用。");
         }
         endGroup();
     }
@@ -1937,8 +2025,17 @@ static void drawPanel()
     {
     ImGui::SeparatorText("4. 执行匹配");
 
-    if (ImGui::Button("执行匹配", ImVec2(-1, 0))) needMatch = true;
-    if (ImGui::Button("重复 20 次计时", ImVec2(-1, 0))) runMatch(a, 20);
+    if (ImGui::Button("执行匹配", ImVec2(-1, 0)))
+    {
+        // 手动执行 = 明确的"编辑完成"，掩码一并用上
+        if (a.maskPending) { a.maskPending = false; needCreate = true; }
+        else               needMatch = true;
+    }
+    if (ImGui::Button("重复 20 次计时", ImVec2(-1, 0)))
+    {
+        if (a.maskPending) { a.maskPending = false; createTemplateSafe(a); }
+        runMatchSafe(a, 20);
+    }
     };
 
     //---- Tab ① 匹配: 结果 ----
@@ -2087,14 +2184,16 @@ static void drawPanel()
     if (needCreate || needMatch)
     {
         const int64 t0 = cv::getTickCount();
+        // 只要这一轮要重建，就说明掩码已经"被用上"了，待应用标记可以清掉
+        if (needCreate) a.maskPending = false;
         if (needCreate)
         {
-            createTemplate(a);
-            if (a.autoRun && !a.tgtGray.empty()) runMatch(a, 1);
+            createTemplateSafe(a);
+            if (a.autoRun && !a.tgtGray.empty()) runMatchSafe(a, 1);
         }
         else
         {
-            runMatch(a, 1);
+            runMatchSafe(a, 1);
         }
         a.lastOpMs = (cv::getTickCount() - t0) * 1000.0 / cv::getTickFrequency();
     }
@@ -2173,7 +2272,7 @@ static void autoInit(App& a, const std::string& dir)
         refreshTplView(a);
         logf("模板源图: %s (%dx%d)", tpl.c_str(), a.tplGray.cols, a.tplGray.rows);
         freezeTplSource(a, a.tplGray, cv::Rect(), "模板源图 " + a.tplPath);
-        createTemplate(a);
+        createTemplateSafe(a);
     }
 
     if (a.tgtGray.empty())
@@ -2185,6 +2284,12 @@ static void autoInit(App& a, const std::string& dir)
     const std::string tplName = tpl.substr(tpl.find_last_of("\\/") + 1);
     if (a.thumbSel == 0 && a.thumbs.size() > 1 && a.thumbs[0].name == tplName)
         selectThumb(a, 1);
+
+    // 启动后先跑一次匹配，否则「匹配结果」页是空的（窗口里显示"无图像"）。
+    if (a.modelReady && !a.tgtGray.empty())
+    {
+        runMatchSafe(a, 1);
+    }
 }
 
 //=======================================================================
@@ -2286,9 +2391,31 @@ int main(int argc, char** argv)
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
 
-        drawUI();
+        // 任何 cv::Exception（最常见的来源：模板比搜索图大、模型/掩码尺寸不匹配、
+        // 结果图绘制越界）都只写日志，不能让进程直接 terminate。
+        // 以前这里一点保护都没有，所以"点某张缩略图偶尔崩溃"。
+        try
+        {
+            drawUI();
+        }
+        catch (const cv::Exception& e)
+        {
+            logf("!! 界面绘制异常，本帧已跳过: %s", e.what());
+            // 帧已经开始，必须配对结束，否则下一帧会断言
+            ImGui::EndFrame();
+            g_dirtyFrame = true;
+        }
+        catch (const std::exception& e)
+        {
+            logf("!! 界面绘制异常，本帧已跳过: %s", e.what());
+            ImGui::EndFrame();
+            g_dirtyFrame = true;
+        }
 
-        ImGui::Render();
+        if (!g_dirtyFrame)
+            ImGui::Render();
+        else
+            g_dirtyFrame = false;
         const float clear[4] = { 0.08f, 0.09f, 0.11f, 1.0f };
         g_ctx->OMSetRenderTargets(1, &g_rtv, nullptr);
         g_ctx->ClearRenderTargetView(g_rtv, clear);
