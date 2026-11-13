@@ -592,6 +592,27 @@ static void createTemplate(App& a)
          patch.cols, patch.rows, a.matcher.modelPointCount(),
          a.matcher.numLevels(), ms);
 
+    // 模型几何质量：点太少、或者点几乎排成一条线时，得分退化成"只约束一个方向"，
+    // 会出现"错误位置也拿 95 分"的情况（孔径问题 + 均值证据不足）。
+    // 这里只写日志：createTemplate 也可能在 ImGui 帧之外被调用(autoInit)，
+    // 不能调用任何 ImGui 绘制函数。
+    {
+        const int   np    = a.matcher.modelPointCount();
+        const float ratio = a.matcher.pointSpreadRatio();
+        const float peak  = a.matcher.normalPeakShare();
+        logf("模型几何: 点散布比 %.2f (>2.5 偏一条线)  法线最集中方向占比 %.0f%%",
+             ratio, peak * 100.f);
+        if (np < 150)
+            logf("警告: 模型只有 %d 个点，证据太少，错误位置很容易拿到高分 —— "
+                 "请调低「最小对比度」或调大「最大点数」", np);
+        if (ratio > 2.5f)
+            logf("警告: 点几乎排成一条线 (散布比 %.2f)，只能约束一个方向，"
+                 "目标会沿线滑动并反复命中 —— 请扩大框选区域或调低「最小对比度」", ratio);
+        if (peak > 0.6f)
+            logf("提示: 模型法线集中在单一方向 (%.0f%%)，位置判别力偏弱 —— "
+                 "建议框选含多种走向结构(转角、字符、缺口)的区域", peak * 100.f);
+    }
+
     // 阈值到底有没有生效：候选像素远多于点数时，实际是"最大点数"在截断，
     // 此时拖动最小对比度不会改变点数(只是换了抽样对象)，很容易让人以为
     // 滑块坏了。候选像素更少时才是阈值在起作用。

@@ -169,6 +169,22 @@ public:
     int   candidatePixels()  const { return candCount_; }
     float strongestMag()     const { return strongestMag_; }
     float weakestMag()       const { return weakestMag_; }
+
+    //---- geometric quality of the point set (level 0) ---------------------
+    // A model can look fine (many points, high score on the template) and still
+    // be unable to discriminate position: if the points lie nearly on one line
+    // the model can slide along it (aperture problem), and if they are few the
+    // mean score is arithmetic over too little evidence.  Both show up when the
+    // contrast threshold is pushed until the point count collapses.
+    //
+    //   pointSpreadRatio()  std along the major axis / std along the minor axis
+    //                       of the point positions.  ~1 = a blob (good),
+    //                       > 2.5 = closer to a line (weak in one direction)
+    //   normalPeakShare()   fraction of points whose gradient direction falls in
+    //                       the single most populated 10 degree bin.  High means
+    //                       the model is dominated by one edge orientation.
+    float pointSpreadRatio() const { return spreadRatio_; }
+    float normalPeakShare()  const { return normalPeakShare_; }
     cv::Point2f modelCenter() const;   // centre of gravity of the level-0 model points
 
     // introspection for the demo / visualisation
@@ -216,6 +232,9 @@ private:
     mutable int   candCount_    = 0;
     mutable float strongestMag_ = 0;
     mutable float weakestMag_   = 0;
+    // level 0 geometry, see pointSpreadRatio()/normalPeakShare()
+    mutable float spreadRatio_     = 0;
+    mutable float normalPeakShare_ = 0;
     cv::Mat     modelGray0_;
     std::vector<LevelData> modelLevels_;
     Impl* impl_;
@@ -233,6 +252,9 @@ private:
 
     void buildAngleScaleGrids();
     void selectEdgePoints(LevelData& ld, const cv::Mat& grayLevel, const cv::Mat& mask, int level) const;
+    // level-0 diagnostics: point spread along the principal axes + how much the
+    // gradient directions concentrate in one bin (see the header)
+    void computeGeometryFacts(const LevelData& ld) const;
 
     void  buildXForm(int level, int aIdx, int sIdx, XForm& xf) const;
     void  buildKernel(XForm& xf) const;

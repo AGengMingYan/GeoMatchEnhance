@@ -292,6 +292,13 @@ public:
     float strongestMag()    const;   // |g| of the strongest kept point
     float weakestMag()      const;   // |g| of the weakest kept point
 
+    // geometric quality of the point set, see ShapeMatcher::pointSpreadRatio().
+    // spreadRatio > 2.5 or normalPeakShare > 0.6 means the model is dominated
+    // by one direction and may report high scores at wrong positions once the
+    // point count collapses (raise maxPoints / lower minContrast).
+    float pointSpreadRatio() const;
+    float normalPeakShare()  const;
+
     // replace the search settings of an already loaded model.
     // read a model first, then adjust only what the search needs:
     //     Config c = m.config();  c.minScore = 0.7;  m.setConfig(c);

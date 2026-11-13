@@ -138,6 +138,21 @@ void printModelInfo(const geomatch::Matcher& m, const std::string& file)
     printf("搜索参数    : minScore=%.2f  maxMatches=%d  minDist=%.0f  greedy=%.2f  subpixel=%d\n",
            c.minScore, c.maxMatches, c.minDistance, c.greediness, c.subpixel);
     printf("评分/过滤   : scoreMode=%d  minCoverage=%.2f\n", c.scoreMode, c.minCoverage);
+    {
+        const float ratio = m.pointSpreadRatio();
+        const float peak  = m.normalPeakShare();
+        printf("模型几何    : 点散布比 %.2f (>2.5 偏一条线)  法线最集中方向 %.0f%%\n",
+               ratio, peak * 100.f);
+        if (m.modelPointCount() < 150)
+            printf("  ! 点数 %d < 150：证据太少，错误位置容易拿到高分(调低 minContrast / 调大 maxPoints)\n",
+                   m.modelPointCount());
+        if (ratio > 2.5f)
+            printf("  ! 点几乎排成一条线(散布比 %.2f)：只能约束一个方向，目标会沿线滑动并反复命中\n",
+                   ratio);
+        if (peak > 0.6f)
+            printf("  提示: 法线过于集中(%.0f%%)，位置判别力偏弱(框选含多种走向结构的区域)\n",
+                   peak * 100.f);
+    }
     printf("==============================================\n\n");
 }
 

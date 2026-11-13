@@ -226,6 +226,8 @@ namespace
         cfg.debug      = (int)gArgD(a, "-debug", 0);
         cfg.scoreMode  = (int)gArgD(a, "-score-mode", 1);
         cfg.minCoverage = (float)gArgD(a, "-min-cover", 0.0);
+        // minDistance only when asked for, so the value stored in the model wins
+        if (gHas(a, "-min-dist")) cfg.minDistance = gArgD(a, "-min-dist", cfg.minDistance);
         cfg.metric     = (int)gArgD(a, "-metric", 0);
         cfg.maxOverlap = gArgD(a, "-max-overlap", 1.0);
         cfg.subpixel   = (int)gArgD(a, "-subpix", 1);
@@ -315,6 +317,7 @@ int main(int argc, char** argv)
     cfg.debug       = (int)gArgD(args, "-debug", 0);
     cfg.scoreMode   = (int)gArgD(args, "-score-mode", 1);
     cfg.minCoverage = (float)gArgD(args, "-min-cover", 0.0);
+    if (gHas(args, "-min-dist")) cfg.minDistance = gArgD(args, "-min-dist", cfg.minDistance);
     cfg.metric      = (int)gArgD(args, "-metric", 0);
     cfg.maxOverlap  = gArgD(args, "-max-overlap", 1.0);
     cfg.subpixel    = (int)gArgD(args, "-subpix", 1);
@@ -379,6 +382,9 @@ int main(int argc, char** argv)
             return -1;
         }
         const cv::Mat mg = matcher.modelGray();
+        // remember what the model itself searches, before the CLI overrides are
+        // merged in; the warning below must report the model's own range
+        const Config modelCfg = matcher.config();
         std::cout << "model loaded from " << loadModel
                   << "  (" << mg.cols << "x" << mg.rows
                   << ")  points = " << matcher.modelPointCount()
@@ -399,6 +405,7 @@ int main(int argc, char** argv)
         merged.debug       = cfg.debug;
         merged.scoreMode   = cfg.scoreMode;
         merged.minCoverage = cfg.minCoverage;
+        merged.minDistance = cfg.minDistance;
         merged.metric      = cfg.metric;
         merged.maxOverlap  = cfg.maxOverlap;
         merged.subpixel    = cfg.subpixel;
@@ -415,6 +422,20 @@ int main(int argc, char** argv)
         if (gHas(args, "-smin")) merged.scaleMin = cfg.scaleMin;
         if (gHas(args, "-smax")) merged.scaleMax = cfg.scaleMax;
         matcher.setConfig(merged);
+
+        // The angle/scale grids are fixed when the model is created, so asking
+        // for a different range after -load cannot take effect.  Say so instead
+        // of silently searching the model's own range.
+        if (gHas(args, "-angle") || gHas(args, "-smin") || gHas(args, "-smax"))
+        {
+            std::cerr << "[warn] -angle / -smin / -smax do not apply to a loaded model "
+                         "(the angle and scale grids are built when the model is created). "
+                         "Rebuild it with -t1 and the range you need.\n"
+                      << "       model currently searches angle "
+                      << (int)(modelCfg.angleStart * 180 / CV_PI) << ".."
+                      << (int)((modelCfg.angleStart + modelCfg.angleExtent) * 180 / CV_PI)
+                      << " deg, scale " << modelCfg.scaleMin << ".." << modelCfg.scaleMax << "\n";
+        }
     }
     else
     {

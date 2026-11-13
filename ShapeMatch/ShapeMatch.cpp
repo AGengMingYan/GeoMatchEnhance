@@ -560,6 +560,7 @@ void ShapeMatcher::selectEdgePoints(LevelData& ld, const cv::Mat& grayLevel, con
         candCount_    = cv::countNonZero(edge);
         strongestMag_ = pMag[idx.front()];
         weakestMag_   = pMag[idx.back()];
+        computeGeometryFacts(ld);
     }
 }
 
@@ -1356,6 +1357,62 @@ namespace
 //=======================================================================
 //  refine all candidates one level down
 //=======================================================================
+//=======================================================================
+//  level-0 geometry diagnostics
+//
+//  Two numbers explain the failure mode where a degraded model (few points,
+//  or points that ended up on one line) reports a very high score at a wrong
+//  position: the normalised dot product is a mean over the points, so with few
+//  points it is arithmetic over little evidence, and points lying along one
+//  line only constrain the direction across that line - the model can slide
+//  along it (aperture problem).  Both grow when the contrast threshold is
+//  pushed until almost all points disappear.
+//=======================================================================
+void ShapeMatcher::computeGeometryFacts(const LevelData& ld) const
+{
+    const int n = (int)ld.points.size();
+    spreadRatio_ = 0.f;
+    normalPeakShare_ = 0.f;
+    if (n <= 1) return;
+
+    // ---- gradient direction concentration (18 bins of 10 degrees) --------
+    int bins[18] = { 0 };
+    double cx = 0, cy = 0;
+    for (int k = 0; k < n; k++)
+    {
+        const ModelPoint& p = ld.points[(size_t)k];
+        int b = (int)std::floor((std::atan2(p.gy, p.gx) * 180.0 / CV_PI + 180.0) / 10.0);
+        if (b < 0) b = 0;
+        if (b > 17) b = 17;
+        bins[b]++;
+        cx += p.x;
+        cy += p.y;
+    }
+    int peak = 0;
+    for (int i = 0; i < 18; i++) peak = std::max(peak, bins[i]);
+    normalPeakShare_ = (float)peak / (float)n;
+
+    // ---- spread of the point positions along the principal axes ----------
+    cx /= n;
+    cy /= n;
+    double sxx = 0, syy = 0, sxy = 0;
+    for (int k = 0; k < n; k++)
+    {
+        const double dx = ld.points[(size_t)k].x - cx;
+        const double dy = ld.points[(size_t)k].y - cy;
+        sxx += dx * dx;
+        syy += dy * dy;
+        sxy += dx * dy;
+    }
+    sxx /= n; syy /= n; sxy /= n;
+    const double tr = sxx + syy;
+    const double det = sxx * syy - sxy * sxy;
+    const double disc = std::sqrt(std::max(0.0, tr * tr / 4.0 - det));
+    const double l1 = tr / 2.0 + disc;
+    const double l2 = std::max(1e-9, tr / 2.0 - disc);
+    spreadRatio_ = (float)std::sqrt(l1 / l2);
+}
+
 void ShapeMatcher::refineLevel(int level, std::vector<Candidate>& cands,
                                int maxKeep, double minScore, int metric)
 {
@@ -2890,6 +2947,9 @@ bool ShapeMatcher::deserializeShapeModel(const std::vector<uchar>& data)
     candCount_    = 0;
     strongestMag_ = levels[0].points.front().mag;
     weakestMag_   = levels[0].points.back().mag;
+    // geometry facts are derived from the points, so they can be rebuilt from
+    // the file even though they are not stored in it
+    computeGeometryFacts(levels[0]);
     angleStep_     = aStep;
     scaleStep_     = sStep;
     scaleMin_      = sMin;

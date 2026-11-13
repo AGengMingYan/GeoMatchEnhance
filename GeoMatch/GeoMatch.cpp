@@ -157,6 +157,8 @@ cv::Size    Matcher::modelSize()       const { return ready() ? core_->modelSize
 int         Matcher::candidatePixels() const { return ready() ? core_->candidatePixels() : 0; }
 float       Matcher::strongestMag()    const { return ready() ? core_->strongestMag() : 0.f; }
 float       Matcher::weakestMag()      const { return ready() ? core_->weakestMag() : 0.f; }
+float       Matcher::pointSpreadRatio() const { return ready() ? core_->pointSpreadRatio() : 0.f; }
+float       Matcher::normalPeakShare()  const { return ready() ? core_->normalPeakShare() : 0.f; }
 
 bool Matcher::create(const cv::Mat& gray, const Config& cfg)
 {
