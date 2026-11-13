@@ -302,6 +302,38 @@ $env:GITEE_TOKEN = '你的令牌'
 `ParseFile` 报「字符串缺少终止符」「`[` 后面缺少类型名称」等一串假错误——
 其实是 PS 5.1 把 UTF-8 字节按 GBK 解码，多字节汉字吞掉了后面的引号。
 
+### 严重：源码文件（.cpp/.h）绝不能用 PowerShell 写（2026-11-13 踩坑）
+
+我为了做批量文本替换，用了：
+
+```powershell
+$t = [System.IO.File]::ReadAllText('ShapeMatch/ShapeMatch.cpp')
+$t = $t.Replace(...)
+[System.IO.File]::WriteAllText('ShapeMatch/ShapeMatch.cpp', $t, UTF8)
+```
+
+结果 **`.cpp` 被写成了双层加密的垃圾**（100433 → 211255 字节，头 `E0 A8 91 ... Esafenet`）：
+
+- `cl.exe` 本来能透过驱动读明文（所以之前一直能编译），但双层加密后编译器也读不了
+- `read_files` 也读不出来（返回乱码）
+- `cat.exe x.cpp > tmp.json` 也解不出来（cat.exe 不在 `.cpp` 的白名单里）
+- **`git checkout -- x.cpp` 也救不回明文**（落盘仍是 `E0 A8 91`，但 git 恢复后的那份是"单层加密"，
+  编译器能读 —— 所以 git checkout 仍然是正确的第一步救援动作，只是不能用 PS 去读它验证）
+
+**结论：**
+
+1. **改源码只用 `editor` 工具**（它的读写进程在白名单内，能拿到明文，也会写成编译器可读的形式）。
+   全项目 700+ 次源码编辑都是 `editor` 干的，一次没坏过。
+2. 需要批量替换时，**拆成多个 `editor` 调用**（每次 ≤6000 字符），不要图省事用 PS/sed/python。
+3. `.cpp/.h` 用 PS 改坏后：`git checkout -- <file>` 先恢复成可编译状态，然后用 `editor` 重放改动。
+4. 判断源码是否被写坏：`[IO.File]::ReadAllBytes()` 的头如果是 `E0 A8 91` 且**字节数明显变大**，
+   就是被二次加密了；正常的源码文件 PS 读出来同样是密文，但**大小等于明文大小**，两者要区分开。
+5. 对比：文本类**产物**（提交信息 txt、README、tag 说明）用 PS 写是明文（见上文实测表），
+   因为它们走 `powershell.exe` 白名单；但 `.cpp` 的白名单是另一批进程，规则不同。
+
+**一句话：源码用 editor，产物用 PowerShell，二进制用 cat.exe。**
+
+
 **结论：含中文的 `.ps1` 必须存成 UTF-8 带 BOM（`EF BB BF`）。**
 （普通 .txt/.md 反而要不带 BOM，否则某些工具会显示多余字符；这里只针对 PowerShell 脚本。）
 
