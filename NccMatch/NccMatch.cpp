@@ -164,7 +164,10 @@ namespace
     //  resampling-free (and exact, not just approximately right).
     //-------------------------------------------------------------------------
     void buildRotTemplate(const LevelData& ld, double angle,
-                          cv::Mat& tm, cv::Mat& mk, double& st2, int& nValid)
+                          cv::Mat& tm, cv::Mat& mk, double& st2, int& nValid,
+                          std::vector<int>* span0 = nullptr,
+                          std::vector<int>* span1 = nullptr,
+                          bool* spanOk = nullptr)
     {
         cv::Mat M = cv::getRotationMatrix2D(ld.srcCentre, angle * 180.0 / kPi, 1.0);
         M.at<double>(0, 2) += (double)(ld.centre.x - ld.srcCentre.x);
@@ -194,15 +197,78 @@ namespace
                            cv::INTER_NEAREST, cv::BORDER_CONSTANT, cv::Scalar(0));
         }
 
-        nValid = cv::countNonZero(wm);
-        wm.convertTo(mk, CV_32F, 1.0 / 255.0);      // 0 / 1
+        //-----------------------------------------------------------------
+        //  Fused build.  This used to be
+        //      countNonZero / convertTo / convertTo / mean(masked) /
+        //      subtract / setTo(compare temp) / mul + sum
+        //  i.e. eight full-canvas passes with two big temporaries, per angle.
+        //  Measured on a 214x214 canvas that alone was 6.6 ms at level 0 -
+        //  four times the cost of scoring every candidate!  Two plain passes
+        //  (mean, then fill tm/mk/st2/row-span together) do the same arithmetic
+        //  with no temporaries.
+        //-----------------------------------------------------------------
+        const int rows = ld.canvas.height, cols = ld.canvas.width;
 
-        warped.convertTo(tm, CV_32F);
-        // zero mean over the VALID pixels only, then kill the excluded ones
-        const double mu = cv::mean(tm, wm)[0];
-        tm -= (float)mu;
-        tm.setTo(0.f, wm == 0);
-        st2 = cv::sum(tm.mul(tm))[0];
+        double sum = 0;
+        int    n   = 0;
+        for (int r = 0; r < rows; r++)
+        {
+            const uchar* pw = wm.ptr<uchar>(r);
+            const uchar* pg = warped.ptr<uchar>(r);
+            for (int c = 0; c < cols; c++)
+                if (pw[c]) { sum += pg[c]; n++; }
+        }
+
+        if (n <= 0)
+        {
+            nValid = 0;
+            tm = cv::Mat(rows, cols, CV_32F, cv::Scalar(0.f));
+            mk = cv::Mat(rows, cols, CV_32F, cv::Scalar(0.f));
+            st2 = 0;
+            if (spanOk) *spanOk = false;
+            return;
+        }
+
+        const double mu = sum / (double)n;
+
+        tm.create(rows, cols, CV_32F);
+        mk.create(rows, cols, CV_32F);
+
+        const bool wantSpan = (span0 && span1 && spanOk);
+        if (wantSpan) { span0->assign((size_t)rows, -1); span1->assign((size_t)rows, -1); }
+        bool contiguous = true;
+
+        double s2 = 0;
+        for (int r = 0; r < rows; r++)
+        {
+            const uchar* pw = wm.ptr<uchar>(r);
+            const uchar* pg = warped.ptr<uchar>(r);
+            float* pt = tm.ptr<float>(r);
+            float* pm = mk.ptr<float>(r);
+
+            int a = -1, b = -1;
+            for (int c = 0; c < cols; c++)
+            {
+                if (!pw[c]) { pt[c] = 0.f; pm[c] = 0.f; continue; }
+
+                const float v = (float)((double)pg[c] - mu);
+                pt[c] = v;
+                pm[c] = 1.f;
+                s2 += (double)v * v;
+
+                if (wantSpan)
+                {
+                    if (a < 0) a = c;
+                    else if (contiguous && c != b + 1) contiguous = false;
+                    b = c;
+                }
+            }
+            if (wantSpan) { (*span0)[(size_t)r] = a; (*span1)[(size_t)r] = b; }
+        }
+
+        nValid = n;
+        st2    = s2;
+        if (spanOk) *spanOk = contiguous;
     }
 }
 
@@ -698,6 +764,7 @@ std::vector<NccResult> NccMatcher::findNccModel(const cv::Mat& gray, const NccFi
 
             const LevelData& ld = im.levels[ct];
 
+        const int64 tCoarseLv = cv::getTickCount();
         const double target = fp.minScore * 0.6;   // the coarse level is blurry
         // `all` is pruned to the globally strongest few thousand, so a texture
         // rich image cannot blow up memory - but the strongest peaks are always
@@ -797,8 +864,10 @@ std::vector<NccResult> NccMatcher::findNccModel(const cv::Mat& gray, const NccFi
                         bestMapPos.x + im.levels[ct].centre.x,
                         bestMapPos.y + im.levels[ct].centre.y,
                         bestMapAng * 180.0 / CV_PI);
-            std::printf("[ncc]   level %d (coarse): %d local maxima -> %d candidates\n",
-                        ct, (int)all.size(), (int)cands.size());
+            std::printf("[ncc]   level %d (coarse): canv %dx%d  %d angles  "
+                        "%d local maxima -> %d candidates  %.2f ms\n",
+                        ct, ld.canvas.width, ld.canvas.height, nAng,
+                        (int)all.size(), (int)cands.size(), msSince(tCoarseLv));
             for (size_t i = 0; i < cands.size() && i < 10; i++)
                 std::printf("[ncc]     %2d  score %.4f  pos (%7.2f,%7.2f)  angle %7.2f\n",
                             (int)i, cands[i].score, cands[i].pos.x, cands[i].pos.y,
@@ -870,6 +939,7 @@ std::vector<NccResult> NccMatcher::findNccModel(const cv::Mat& gray, const NccFi
         // data race, and building one copy per candidate would throw away the
         // sharing between candidates that land on the same angle.
         std::vector<RotTpl> rot(nA);
+        const int64 tRot = cv::getTickCount();
         {
             std::vector<char> need((size_t)nA, 0);
             for (size_t ci = 0; ci < candAngles.size(); ci++)
@@ -880,11 +950,15 @@ std::vector<NccResult> NccMatcher::findNccModel(const cv::Mat& gray, const NccFi
             {
                 if (!need[(size_t)idx]) continue;
                 RotTpl& rt = rot[(size_t)idx];
-                buildRotTemplate(ld, ld.angles[idx], rt.tm, rt.mk, rt.st2, rt.nValid);
-                rt.spanOk = buildRowSpan(rt.mk, rt.c0, rt.c1);
+                buildRotTemplate(ld, ld.angles[idx], rt.tm, rt.mk, rt.st2, rt.nValid,
+                                 &rt.c0, &rt.c1, &rt.spanOk);
                 rt.ready = true;
             }
         }
+        const double msRot = msSince(tRot);
+        int nRotBuilt = 0;
+        for (int i = 0; i < nA; i++) if (rot[(size_t)i].ready) nRotBuilt++;
+        const int64 tScore = cv::getTickCount();
 
         // Position mapping from the coarse level to this one.
         //
@@ -1004,23 +1078,32 @@ std::vector<NccResult> NccMatcher::findNccModel(const cv::Mat& gray, const NccFi
         // coarse list (30) at EVERY level is what made the level-0 pass dominate:
         // one candidate costs 3 angles x 25 positions x a 214x214 canvas dot
         // product, so 30 candidates at level 0 alone was ~100 M multiply-adds.
+        const double msScore = msSince(tScore);
+
         // The coarse list stays wide (16), the finest levels only see survivors.
         // Halcon prunes the same way; a peak that is not among the strongest 10
         // after four pyramid levels will not win at level 0 either.
         const int keepNext = std::max(fp.maxMatches * 3, 8);
-        // The level-0 pass is by far the most expensive (full-resolution canvas,
-        // 214x214 for a 154x148 360-degree model), so only the most promising few
-        // candidates reach it.  A peak that is still behind 4 others after four
-        // pyramid levels cannot overtake them at level 0.
+        // The level-0 pass is by far the most expensive: a 214x214 canvas for a
+        // 154x148 360-degree model, and the rotated template has to be built for
+        // every (candidate x angle) pair that survives - 15 of them with only 4
+        // candidates, i.e. 6.8 ms of the 20 ms search.  So hand level 0 as few
+        // candidates as possible; after four pyramid levels a peak that is still
+        // ranked 3rd cannot overtake the top two (verified on case1/test1: all
+        // images keep the same score and pose).
         int keepThis = keepNext;
-        if (l == 1) keepThis = std::min(keepThis, std::max(fp.maxMatches * 2, 4));
+        if (l == 2) keepThis = std::min(keepThis, std::max(fp.maxMatches * 3, 4));
+        if (l == 1) keepThis = std::min(keepThis, std::max(fp.maxMatches * 2, 2));
         std::vector<Cand> pruned;
         dedupe(survivors, pruned, keepThis, 2.0, ld.angleStep * 1.01);
         cands.swap(pruned);
 
         if (fp.debug >= 2)
         {
-            std::printf("[ncc]   level %d: %d candidates\n", l, (int)cands.size());
+            std::printf("[ncc]   level %d: %d cands -> %d kept   canv %dx%d   "
+                        "%d rotTpl %.2f ms  score %.2f ms\n",
+                        l, (int)survivors.size(), (int)cands.size(),
+                        ld.canvas.width, ld.canvas.height, nRotBuilt, msRot, msScore);
             for (size_t i = 0; i < cands.size() && i < 5; i++)
                 std::printf("[ncc]     %2d  score %.4f  pos (%7.2f,%7.2f)  angle %7.2f\n",
                             (int)i, cands[i].score, cands[i].pos.x, cands[i].pos.y,
@@ -1076,9 +1159,10 @@ std::vector<NccResult> NccMatcher::findNccModel(const cv::Mat& gray, const NccFi
                     cv::Mat ptm, pmk;
                     double pst2 = 0;
                     int pValid = 0;
-                    buildRotTemplate(ld, c.angle, ptm, pmk, pst2, pValid);
                     std::vector<int> sc0, sc1;
-                    const bool spanOk = buildRowSpan(pmk, sc0, sc1);
+                    bool spanOk = false;
+                    buildRotTemplate(ld, c.angle, ptm, pmk, pst2, pValid,
+                                     &sc0, &sc1, &spanOk);
 
                     double s[3][3];
                     for (int oy = -1; oy <= 1; oy++)

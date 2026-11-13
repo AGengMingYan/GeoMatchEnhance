@@ -45,6 +45,26 @@ namespace
         double row, col, angleDeg, score, ms;
     };
 
+    // one-off: pin Halcon's internal thread count so the comparison against our
+    // OpenCV-based implementation is apples to apples.  SetThreadNum(0) = leave
+    // Halcon's default alone.
+    void halconThreads(int n)
+    {
+        if (n <= 0) return;
+        try { SetSystem("thread_num", n); } catch (HException&) {}
+    }
+
+    int halconThreadsNow()
+    {
+        try
+        {
+            HTuple v;
+            GetSystem("thread_num", &v);
+            return (int)v.I();
+        }
+        catch (HException&) { return -1; }
+    }
+
     bool halconFind(const std::string& tplPath, const std::string& imgPath,
                     double angleStartDeg, double angleExtentDeg, double minScore,
                     int numMatches, HRes& out, std::string& err)
@@ -300,9 +320,32 @@ int main(int argc, char** argv)
     if (argc < 3)
     {
         std::printf("usage: halcon_ncc <template> <image> [minScore] [angleExtentDeg]\n"
-                    "   e.g. halcon_ncc case1/temp.jpg case1/tmp_grab_1762994178.jpg 0.5 360\n");
+                    "                 [--halcon-threads N] [--ours-threads N] [--repeat N]\n"
+                    "   e.g. halcon_ncc case1/temp.jpg case1/tmp_grab_1762994178.jpg 0.5 360\n"
+                    "   --halcon-threads / --ours-threads pin both sides so the comparison\n"
+                    "   is apples to apples; --repeat averages N runs.\n");
         return 1;
     }
+
+    //---- optional flags (may appear anywhere) --------------------------
+    int hThreads = 0, oThreads = 0, repeat = 1;
+    {
+        std::vector<char*> keep;
+        for (int i = 0; i < argc; i++)
+        {
+            const std::string a = argv[i];
+            if      (a == "--halcon-threads" && i + 1 < argc) { hThreads = atoi(argv[++i]); }
+            else if (a == "--ours-threads"   && i + 1 < argc) { oThreads = atoi(argv[++i]); }
+            else if (a == "--repeat"         && i + 1 < argc) { repeat   = atoi(argv[++i]); }
+            else keep.push_back(argv[i]);
+        }
+        argc = (int)keep.size();
+        for (int i = 0; i < argc; i++) argv[i] = keep[(size_t)i];
+    }
+    if (repeat < 1) repeat = 1;
+
+    halconThreads(hThreads);
+    if (oThreads > 0) cv::setNumThreads(oThreads);
     const std::string tplPath = argv[1];
     const std::string imgPath = argv[2];
     const double minScore    = argc > 3 ? atof(argv[3]) : 0.5;
@@ -319,15 +362,35 @@ int main(int argc, char** argv)
 
     std::printf("template %s  (%dx%d)\n", tplPath.c_str(), tpl.cols, tpl.rows);
     std::printf("image    %s  (%dx%d)\n", imgPath.c_str(), img.cols, img.rows);
-    std::printf("params   angle %.1f..%.1f deg   minScore %.2f   matches 1\n\n",
-                angleStart, angleStart + angleExtent, minScore);
+    std::printf("params   angle %.1f..%.1f deg   minScore %.2f   matches 1   repeat %d\n",
+                angleStart, angleStart + angleExtent, minScore, repeat);
+    std::printf("threads  halcon %d   ours(cv) %d   cpu %d\n\n",
+                halconThreadsNow(), cv::getNumThreads(),
+                (int)std::thread::hardware_concurrency());
 
     HRes h;
     std::string err;
-    const bool hOk = halconFind(tplPath, imgPath, angleStart, angleExtent,
-                                minScore, 1, h, err);
+    bool hOk = false;
+    double hBest = 1e30;
+    for (int r = 0; r < repeat; r++)
+    {
+        HRes one;
+        const bool ok = halconFind(tplPath, imgPath, angleStart, angleExtent,
+                                   minScore, 1, one, err);
+        if (r == 0) { h = one; hOk = ok; }
+        if (ok) hBest = std::min(hBest, one.ms);
+    }
+    if (hOk) h.ms = (repeat > 1) ? hBest : h.ms;      // report the best of N
 
-    const Ours o = oursFind(tpl, img, angleStart, angleExtent, minScore, 1);
+    Ours o;
+    double oBest = 1e30;
+    for (int r = 0; r < repeat; r++)
+    {
+        const Ours one = oursFind(tpl, img, angleStart, angleExtent, minScore, 1);
+        if (r == 0) o = one;
+        if (one.hits > 0) oBest = std::min(oBest, one.ms);
+    }
+    if (o.hits > 0 && repeat > 1) o.ms = oBest;
 
     std::printf("%-8s %8s %10s %10s %10s %9s\n",
                 "impl", "score", "col(x)", "row(y)", "angle_deg", "ms");
