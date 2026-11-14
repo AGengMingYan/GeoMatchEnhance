@@ -15,7 +15,24 @@
 > Halcon 17 本机只有 32 位库，所以本 Demo 是独立的 Win32 程序；与主项目 x64 的
 > `GeoMatchDemo` **分别运行**，再比对两者输出。
 
-## 构建
+## 两个对比程序
+
+| 程序 | Halcon API | 本项目对应 | 尺度 |
+|---|---|---|---|
+| `halcon_shape_compare.exe` | `create_scaled_shape_model` / `find_scaled_shape_model` | `GeoMatchDemo`（`.shm`） | 支持 |
+| `halcon_ncc_compare.exe` | `create_ncc_model` / `find_ncc_model` | `NccDemo`（`.ncm`） | 不支持（NCC 双方都只有旋转） |
+
+构建：
+
+```bat
+cmd /c tools\build-halcon-compare.bat        rem 形状匹配
+cmd /c tools\build-halcon-ncc-compare.bat    rem NCC 匹配
+```
+
+> NCC 的 Halcon 算子要求单通道图像，`halcon_ncc_compare` 读入后会自动
+> `Rgb1ToGray`，因此直接传彩色 JPG 模板也可以。
+
+## 构建（形状匹配版）
 
 ```bat
 cmd /c tools\build-halcon-compare.bat
