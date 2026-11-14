@@ -44,6 +44,7 @@
 #include <cstring>
 #include <fstream>
 #include <limits>
+#include <unordered_map>
 
 namespace geomatch
 {
@@ -93,12 +94,40 @@ struct LevelData
     int      mapW = 0, mapH = 0;
 };
 
+// A template rotated into canvas space.  Built once per (level, angle index)
+// and, because rotation depends only on the MODEL (not the search image),
+// cached across findNccModel() calls inside Impl::rotCache.  On a video stream
+// whose angle barely moves, the second frame onward reuses every entry and the
+// warpAffine work (the dominant refine cost) drops to ~zero.
+struct RotTpl
+{
+    cv::Mat tm, mk;
+    double  st2 = 0;
+    int     nValid = 0;
+    bool    ready = false;
+    // per-row valid column interval [c0, c1] of the rotated mask; only used
+    // when spanOk (a user-painted mask may have holes)
+    std::vector<int> c0, c1;
+    bool    spanOk = false;
+};
+
 struct NccMatcher::Impl
 {
     std::vector<LevelData> levels;
     cv::Mat    gray0;
     double     angleStep0 = 0;
     mutable double lastPre = 0, lastSearch = 0;
+
+    // Cross-call LRU of rotated templates.  Key packs (level, angle index).
+    // findNccModel() is const and promises concurrent reads, so the cache is
+    // only ever MUTATED from the serial pre-build section of refine (never
+    // from a parallel_for_ worker); the parallel scoring below only reads the
+    // pointers handed out here.  When it fills up it is cleared wholesale,
+    // the same no-lock policy the shape matcher uses (an eviction mid-search
+    // could invalidate a reference a worker is about to read).
+    mutable std::unordered_map<uint64_t, RotTpl> rotCache;
+    size_t   rotCacheLimit = 256;
+    mutable int rotCacheHits = 0, rotCacheMiss = 0;
 };
 
 namespace
@@ -381,6 +410,16 @@ bool NccMatcher::createNccModel(const cv::Mat& gray, const NccParams& p)
         for (int i = 0; i < nA; i++) ld.angles[i] = a0 + i * step;
     }
 
+    // A new model invalidates every cached rotation.  Size the LRU to hold the
+    // union of all levels' angle grids, so a steady stream on ONE model never
+    // overflows (the clear-on-overflow path only matters if the same matcher is
+    // repointed at wildly different angle ranges without re-creating the model).
+    size_t totalAng = 0;
+    for (const LevelData& ld : impl_->levels) totalAng += ld.angles.size();
+    impl_->rotCacheLimit = std::max<size_t>(64, totalAng);
+    impl_->rotCache.clear();
+    impl_->rotCacheHits = impl_->rotCacheMiss = 0;
+
     created_ = true;
     return true;
 }
@@ -551,19 +590,31 @@ namespace
         double      score = -2;
     };
 
-    // a template rotated into canvas space, cached so the level-0 refinement
-    // rotates each angle once instead of once per candidate
-    struct RotTpl
+    // keep the strongest candidates, dropping ones that sit on the same pose
+    void dedupe(std::vector<Cand>& in, std::vector<Cand>& out, int keep,
+                double posTol, double angTol)
     {
-        cv::Mat tm, mk;
-        double  st2 = 0;
-        int     nValid = 0;
-        bool    ready = false;
-        // per-row valid column interval [c0, c1] of the rotated mask; only used
-        // when spanOk (a user-painted mask may have holes)
-        std::vector<int> c0, c1;
-        bool    spanOk = false;
-    };
+        std::sort(in.begin(), in.end(),
+                  [](const Cand& a, const Cand& b) { return a.score > b.score; });
+        out.clear();
+        for (size_t i = 0; i < in.size(); i++)
+        {
+            const Cand& c = in[i];
+            bool dup = false;
+            for (size_t j = 0; j < out.size(); j++)
+            {
+                const Cand& o = out[j];
+                if (std::fabs(c.pos.x - o.pos.x) <= posTol &&
+                    std::fabs(c.pos.y - o.pos.y) <= posTol &&
+                    angleDiff(c.angle, o.angle) <= angTol)
+                {
+                    dup = true; break;
+                }
+            }
+            if (!dup) out.push_back(c);
+            if ((int)out.size() >= keep) break;
+        }
+    }
 
     //---------------------------------------------------------------------
     //  Per-row valid column interval of the rotated mask.
@@ -596,6 +647,42 @@ namespace
             c1[r] = b;
         }
         return true;
+    }
+
+    // Pack (level, angle index) into the LRU key.  Angle index fits in 32 bits
+    // even for a 360-degree / 0.25-degree model, level in the high word.
+    inline uint64_t rotKey(int level, int angleIdx)
+    {
+        return (uint64_t)(uint32_t)level << 32 | (uint32_t)angleIdx;
+    }
+
+    // Return the rotated template for (level, angleIdx), building it on a miss.
+    // SERIAL ONLY: the cache is a plain member map with no lock, so this must be
+    // called from the serial pre-build section, never from a parallel_for_ body.
+    // On overflow the whole cache is dropped (cheaper and safer than evicting an
+    // entry a concurrent reader might still hold a pointer to).
+    RotTpl& getRotTpl(std::unordered_map<uint64_t, RotTpl>& cache, size_t limit,
+                      int& nHits, int& nMiss,
+                      const LevelData& ld, int level, int angleIdx)
+    {
+        const uint64_t key = rotKey(level, angleIdx);
+        auto it = cache.find(key);
+        if (it != cache.end())
+        {
+            nHits++;
+            return it->second;
+        }
+
+        nMiss++;
+        if (cache.size() >= limit)
+            cache.clear();
+
+        RotTpl rt;
+        buildRotTemplate(ld, ld.angles[angleIdx], rt.tm, rt.mk,
+                         rt.st2, rt.nValid, &rt.c0, &rt.c1, &rt.spanOk);
+        rt.ready = true;
+        auto res = cache.emplace(key, std::move(rt));
+        return res.first->second;
     }
 
     //---------------------------------------------------------------------
@@ -639,32 +726,6 @@ namespace
         const double varI = n * si2 - si * si;
         if (varI <= 1e-6) return 0.0;
         return n * sit / (std::sqrt(varI) * std::sqrt(n * st2));
-    }
-
-    // keep the strongest candidates, dropping ones that sit on the same pose
-    void dedupe(std::vector<Cand>& in, std::vector<Cand>& out, int keep,
-                double posTol, double angTol)
-    {
-        std::sort(in.begin(), in.end(),
-                  [](const Cand& a, const Cand& b) { return a.score > b.score; });
-        out.clear();
-        for (size_t i = 0; i < in.size(); i++)
-        {
-            const Cand& c = in[i];
-            bool dup = false;
-            for (size_t j = 0; j < out.size(); j++)
-            {
-                const Cand& o = out[j];
-                if (std::fabs(c.pos.x - o.pos.x) <= posTol &&
-                    std::fabs(c.pos.y - o.pos.y) <= posTol &&
-                    angleDiff(c.angle, o.angle) <= angTol)
-                {
-                    dup = true; break;
-                }
-            }
-            if (!dup) out.push_back(c);
-            if ((int)out.size() >= keep) break;
-        }
     }
 
     cv::Mat toGray8(const cv::Mat& src)
@@ -933,12 +994,17 @@ std::vector<NccResult> NccMatcher::findNccModel(const cv::Mat& gray, const NccFi
         // needs, with the template rotated once per angle - the same numbers as
         // the map, for a fraction of the work.
         //
-        // The rotated templates are built HERE, serially, for every angle index a
-        // candidate needs: the loop below runs in parallel and must only READ
-        // them.  Building them lazily inside that loop (the previous design) is a
-        // data race, and building one copy per candidate would throw away the
-        // sharing between candidates that land on the same angle.
-        std::vector<RotTpl> rot(nA);
+        // The rotated templates are resolved HERE, serially, for every angle
+        // index a candidate needs: the loop below runs in parallel and must only
+        // READ them.  getRotTpl serves each (level, angle) from the cross-call LRU
+        // (a video stream reuses every entry after the first frame) and only builds
+        // on a miss, so the warpAffine work - the dominant refine cost - is paid once
+        // per angle for the whole stream rather than once per image.
+        //
+        // We hold raw pointers, not Mat copies: the parallel section must not mutate
+        // the cache (no lock), and pointers are re-resolved every call, so a cache
+        // clear on an overflow can never leave a dangling reference across frames.
+        std::vector<const RotTpl*> rot(nA, nullptr);
         const int64 tRot = cv::getTickCount();
         {
             std::vector<char> need((size_t)nA, 0);
@@ -949,15 +1015,14 @@ std::vector<NccResult> NccMatcher::findNccModel(const cv::Mat& gray, const NccFi
             for (int idx = 0; idx < nA; idx++)
             {
                 if (!need[(size_t)idx]) continue;
-                RotTpl& rt = rot[(size_t)idx];
-                buildRotTemplate(ld, ld.angles[idx], rt.tm, rt.mk, rt.st2, rt.nValid,
-                                 &rt.c0, &rt.c1, &rt.spanOk);
-                rt.ready = true;
+                rot[(size_t)idx] = &getRotTpl(im.rotCache, im.rotCacheLimit,
+                                               im.rotCacheHits, im.rotCacheMiss,
+                                               ld, l, idx);
             }
         }
         const double msRot = msSince(tRot);
         int nRotBuilt = 0;
-        for (int i = 0; i < nA; i++) if (rot[(size_t)i].ready) nRotBuilt++;
+        for (int i = 0; i < nA; i++) if (rot[(size_t)i] && rot[(size_t)i]->ready) nRotBuilt++;
         const int64 tScore = cv::getTickCount();
 
         // Position mapping from the coarse level to this one.
@@ -1019,8 +1084,8 @@ std::vector<NccResult> NccMatcher::findNccModel(const cv::Mat& gray, const NccFi
             for (int ti = rng.start; ti < rng.end; ti++)
             {
                 const AngTask& t = tasks[(size_t)ti];
-                const RotTpl& rt = rot[(size_t)t.idx];
-                if (!rt.ready) continue;
+                const RotTpl* rt = rot[(size_t)t.idx];
+                if (!rt || !rt->ready) continue;
 
                 const int cx = cvRound(mapped[t.ci].x - ld.centre.x);
                 const int cy = cvRound(mapped[t.ci].y - ld.centre.y);
@@ -1035,11 +1100,11 @@ std::vector<NccResult> NccMatcher::findNccModel(const cv::Mat& gray, const NccFi
                         const int x = cx + dx;
                         if (x < 0 || x >= ld.mapW) continue;
                         const cv::Point2f p(x + ld.centre.x, y + ld.centre.y);
-                        double v = rt.spanOk
-                            ? scoreAtSpan(ld, py[l], fpy[l], rt.tm, rt.c0, rt.c1,
-                                          rt.st2, rt.nValid, p)
-                            : scoreAtPrepared(ld, py[l], fpy[l], rt.tm, rt.mk,
-                                              rt.st2, rt.nValid, p);
+                        double v = rt->spanOk
+                            ? scoreAtSpan(ld, py[l], fpy[l], rt->tm, rt->c0, rt->c1,
+                                          rt->st2, rt->nValid, p)
+                            : scoreAtPrepared(ld, py[l], fpy[l], rt->tm, rt->mk,
+                                              rt->st2, rt->nValid, p);
                         if (params_.metric == 1) v = std::fabs(v);
                         if (v > best.score) { best.score = v; best.pos = p; }
                     }
@@ -1216,12 +1281,22 @@ std::vector<NccResult> NccMatcher::findNccModel(const cv::Mat& gray, const NccFi
     }
 
     if (fp.debug >= 1)
+    {
+        size_t cacheBytes = 0;
+        for (const auto& kv : im.rotCache)
+            cacheBytes += kv.second.tm.total() * kv.second.tm.elemSize()
+                        + kv.second.mk.total() * kv.second.mk.elemSize();
         std::printf("[ncc] levels=%d top=%d scanned=%d topAngles=%d cands=%d kept=%d  "
                     "pre=%.2f  search=%.2f ms  [coarse %.2f | refine %.2f | subpix %.2f]\n",
                     maxLev, top, coarseTop, (int)im.levels[coarseTop].angles.size(),
                     (int)cands.size(), (int)results.size(),
                     (double)im.lastPre, (double)im.lastSearch,
                     tCoarse, tRefine, tSub);
+        if (fp.debug >= 2)
+            std::printf("[ncc] rotCache: %zu entries, %.2f MB (hits %d / miss %d)\n",
+                        im.rotCache.size(), cacheBytes / (1024.0 * 1024.0),
+                        im.rotCacheHits, im.rotCacheMiss);
+    }
 
     return results;
 }
@@ -1426,6 +1501,10 @@ bool NccMatcher::deserializeNccModel(const std::vector<uchar>& data)
     {
         for (size_t l = 0; l < impl_->levels.size() && l < masks.size(); l++)
             impl_->levels[l].mask = masks[l];
+        // the mask feeds buildRotTemplate, so rotations built inside the
+        // createNccModel() call above are stale now.
+        impl_->rotCache.clear();
+        impl_->rotCacheHits = impl_->rotCacheMiss = 0;
     }
     params_ = p;
     return true;
