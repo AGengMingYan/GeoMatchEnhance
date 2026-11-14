@@ -10,7 +10,8 @@
 |---|---|
 | Halcon SDK | `HalconDemo/Halcon17/`（32 位：`x86sse2-win32/halconcpp.lib` + `bin/*.dll` + `include/`） |
 | 编译器 | MSVC **x86**（`vcvars32.bat`），不能与主项目 x64 构建混链 |
-| 运行时 | `PATH` 需含 `HalconDemo/Halcon17/bin`，`HALCONARCH=x86sse2-win32` |
+| 运行时 | 命令行对比程序：`PATH` 需含 `HalconDemo/Halcon17/bin`，`HALCONARCH=x86sse2-win32` |
+| GUI Demo 产物 | `HalconDemo/bin/HalconGUIDemo.exe`，构建脚本会把 `halcon*.dll` + `opencv_world455.dll` 拷到同目录，可直接双击 |
 
 > Halcon 17 本机只有 32 位库，所以本 Demo 是独立的 Win32 程序；与主项目 x64 的
 > `GeoMatchDemo` **分别运行**，再比对两者输出。
