@@ -113,16 +113,56 @@ static inline float f16ToF32(uint16_t h)
 #define CV_PI 3.1415926535897932384626433832795
 #endif
 
+//-----------------------------------------------------------------------
+//  8-bit quantised coarse scan (see ScanInvoker8).
+//
+//  image gradient:  q  = round(g * 127)      |g| <= 1  ->  q in [-127, 127]
+//  model normal  :  nq = round(n * 258)      |n| = 1   ->  nq in [-258, 258]
+//
+//  one vpmaddwd of the interleaved (qx,qy) pairs with the broadcast (nqx,nqy)
+//  pattern gives int32 dots that are exactly
+//
+//      qx*nqx + qy*nqy = 127*258 * (gx*nx + gy*ny)
+//
+//  so the float score is sum/(127*258*cnt).  |one point| <= 32766, which keeps
+//  the int32 accumulator safe for up to ~65000 model points.
+//-----------------------------------------------------------------------
+enum { kQ8 = 127, kN16 = 258 };
+static const float kQ8Dot = (float)(kQ8 * kN16);      // 32766
+// guard: int32 accumulator (n*32766) and the int16 kept-count (n) both fit
+static const int   kQ8MaxPoints = 30000;
+
 struct XForm
 {
     std::vector<int16_t> ox, oy;   // cvRound of the rotated offset (coarse scan)
     std::vector<float>   fx, fy;   // exact rotated offset (sub-pixel sampling)
     std::vector<float>   nx, ny;
+    // Normal of every point quantised for the integer (vpmaddwd) scan:
+    //   np[k] = (int16)(ny*258) << 16 | (uint16)(int16)(nx*258)
+    // so a broadcast of np[k] is exactly the [nx,ny,nx,ny,...] int16 pattern
+    // the interleaved int8 gradient pairs need.  258 keeps |n| <= 258, hence
+    // one point contributes at most 127*258 = 32766 to the int32 accumulator.
+    std::vector<int32_t> np;
     int  R = 0;
     int  n = 0;
     cv::Mat kx, ky;
     bool hasKernel = false;
 };
+
+// (re)build the integer normal packets of an XForm from its float normals.
+// Called by buildXForm and whenever the normals are negated (global polarity
+// scan), so the 8-bit kernel can never use a stale packet.
+inline void quantizeNormals(XForm& xf)
+{
+    const int n = (int)xf.nx.size();
+    xf.np.resize(n);
+    for (int k = 0; k < n; k++)
+    {
+        const int32_t nqx = (int32_t)cvRound(xf.nx[k] * (float)kN16);
+        const int32_t nqy = (int32_t)cvRound(xf.ny[k] * (float)kN16);
+        xf.np[k] = (int32_t)((int16_t)nqy << 16) | (int32_t)(uint16_t)(int16_t)nqx;
+    }
+}
 
 namespace
 {
@@ -323,6 +363,7 @@ namespace
     // walk the thinned edges into chains and take the points at equal arc
     // length, so the model follows the texture instead of clustering on the
     // few strongest ridges (this is what Halcon's model contours look like).
+    // maxPts <= 0 = no budget: every chain pixel is kept (see noCap below).
     // fullChains, when not null, receives every kept chain's pixels in
     // arc-length order - that is the contour the model is drawn with.
     std::vector<int> sampleAlongContours(const cv::Mat& edge, const cv::Mat& mag, int maxPts,
@@ -386,7 +427,13 @@ namespace
             if (pe[i] && !used[i]) trace(i);
 
         std::vector<int> out;
-        if (chains.empty() || maxPts <= 0) return out;
+        if (chains.empty()) return out;
+
+        // maxPts <= 0 means "no budget": every pixel of the hysteresis result
+        // becomes a model point.  This is what create_shape_model does (it has
+        // no point cap), and it keeps the strong-edge coverage of a large or
+        // dense template intact instead of thinning it down to a skeleton.
+        const bool noCap = (maxPts <= 0);
 
         // the budget goes to a chain by its contrast (length x strength), not
         // by its length alone, otherwise a long faint chain eats the points
@@ -401,7 +448,7 @@ namespace
         }
         if (total <= 0.0) total = 1.0;
 
-        if ((int)chains.size() > maxPts)
+        if (!noCap && (int)chains.size() > maxPts)
         {
             std::vector<int> order(chains.size());
             for (size_t k = 0; k < order.size(); k++) order[k] = (int)k;
@@ -418,41 +465,54 @@ namespace
 
         std::vector<int> quota(chains.size());
         int assigned = 0;
-        for (size_t k = 0; k < chains.size(); k++)
+        if (noCap)
         {
-            const int len = (int)chains[k].size();
-            quota[k] = std::min(len, std::max(1, (int)std::llround((double)maxPts * weight[k] / total)));
-            assigned += quota[k];
-        }
-        while (assigned > maxPts)
-        {
-            size_t big = 0;
-            for (size_t k = 1; k < chains.size(); k++)
-                if (quota[k] > quota[big]) big = k;
-            if (quota[big] <= 1) break;
-            quota[big]--;
-            assigned--;
-        }
-        // a chain cannot spend more points than it has pixels, so the rest
-        // moves on to the chains that still have room
-        for (int pass = 0; pass < 4 && assigned < maxPts; pass++)
-        {
-            double freeW = 0.0;
+            // keep the whole chain, arc length included
             for (size_t k = 0; k < chains.size(); k++)
-                if (quota[k] < (int)chains[k].size()) freeW += weight[k];
-            if (freeW <= 0.0) break;
-            for (size_t k = 0; k < chains.size() && assigned < maxPts; k++)
             {
-                const int room = (int)chains[k].size() - quota[k];
-                if (room <= 0) continue;
-                const int rest = maxPts - assigned;
-                const int add = std::min(room, (int)std::llround((double)rest * weight[k] / freeW));
-                quota[k] += add;
-                assigned += add;
+                quota[k] = (int)chains[k].size();
+                assigned += quota[k];
+            }
+        }
+        else
+        {
+            for (size_t k = 0; k < chains.size(); k++)
+            {
+                const int len = (int)chains[k].size();
+                quota[k] = std::min(len, std::max(1, (int)std::llround((double)maxPts * weight[k] / total)));
+                assigned += quota[k];
+            }
+            while (assigned > maxPts)
+            {
+                size_t big = 0;
+                for (size_t k = 1; k < chains.size(); k++)
+                    if (quota[k] > quota[big]) big = k;
+                if (quota[big] <= 1) break;
+                quota[big]--;
+                assigned--;
+            }
+            // a chain cannot spend more points than it has pixels, so the rest
+            // moves on to the chains that still have room
+            for (int pass = 0; pass < 4 && assigned < maxPts; pass++)
+            {
+                double freeW = 0.0;
+                for (size_t k = 0; k < chains.size(); k++)
+                    if (quota[k] < (int)chains[k].size()) freeW += weight[k];
+                if (freeW <= 0.0) break;
+                for (size_t k = 0; k < chains.size() && assigned < maxPts; k++)
+                {
+                    const int room = (int)chains[k].size() - quota[k];
+                    if (room <= 0) continue;
+                    const int rest = maxPts - assigned;
+                    const int add = std::min(room, (int)std::llround((double)rest * weight[k] / freeW));
+                    quota[k] += add;
+                    assigned += add;
+                }
             }
         }
 
-        out.reserve((size_t)maxPts);
+        out.reserve((size_t)std::max(assigned, 0));
+
         for (size_t k = 0; k < chains.size(); k++)
         {
             const std::vector<int>& ch = chains[k];
@@ -491,10 +551,16 @@ void ShapeMatcher::selectEdgePoints(LevelData& ld, const cv::Mat& grayLevel, con
     const float* pGx = gx.ptr<float>();
     const float* pGy = gy.ptr<float>();
 
-    // the number of model points is kept roughly constant over the levels
+    // the number of model points is kept roughly constant over the levels.
+    // maxPoints <= 0 means "no budget": the finest level keeps every hysteresis
+    // pixel (Halcon's create_shape_model has no point cap either) and the
+    // coarser levels scale down from that natural count by 2^level, so their
+    // share of the points stays the same as with an explicit budget.
     int maxPts = params_.maxPoints;
-    if (level > 0)
-        maxPts = std::max(64, params_.maxPoints / (1 << level));
+    if (maxPts <= 0)
+        maxPts = (level == 0) ? 0 : std::max(64, (int)modelLevels_[0].points.size() / (1 << level));
+    else if (level > 0)
+        maxPts = std::max(64, maxPts / (1 << level));
 
     // origin = centre of the model image, mapped to this pyramid level and
     // snapped to a full pixel (otherwise the rounding of the offsets and the
@@ -636,6 +702,7 @@ void ShapeMatcher::buildXForm(int level, int aIdx, int sIdx, XForm& xf) const
     xf.ox.resize(n); xf.oy.resize(n);
     xf.fx.resize(n); xf.fy.resize(n);
     xf.nx.resize(n); xf.ny.resize(n);
+    xf.np.resize(n);
     int R = 0;
     for (int k = 0; k < n; k++)
     {
@@ -659,6 +726,8 @@ void ShapeMatcher::buildXForm(int level, int aIdx, int sIdx, XForm& xf) const
     }
     xf.R = R;
     xf.n = n;
+    // integer counterpart of the normals for the 8-bit scan
+    quantizeNormals(xf);
     xf.hasKernel = false;
 }
 
@@ -784,12 +853,15 @@ namespace
     }
 
     void gradientHalves(const cv::Mat& gray8, cv::Mat& gx16, cv::Mat& gy16,
-                        double minContrast)
+                        double minContrast, float w0, cv::Mat& q8, cv::Mat& m8)
     {
         CV_Assert(gray8.type() == CV_8U);
         const int h = gray8.rows, w = gray8.cols;
         gx16.create(h, w, CV_16F);
         gy16.create(h, w, CV_16F);
+        // 8-bit mirror of the same normalised gradients (coarse scan kernel)
+        q8.create(h, w, CV_8SC2);
+        m8.create(h, w, CV_8U);
 
         // one padding element on each side holds the BORDER_REFLECT_101 value,
         // so the inner loop never needs a branch for x == 0 or x == w-1
@@ -798,9 +870,19 @@ namespace
         short* D = dbuf.data() + 1;
 
         const float mc = (float)minContrast;
+        // a point may be scored when the sampled gradient length, i.e. the soft
+        // weight, reaches w0 - exactly the test the scalar / half paths do
+        // (|grad| >= w0).  w0 = 0 keeps everything; w0 > 1 keeps nothing, which
+        // is also what the half path yields (|grad| <= 1), so do NOT clamp the
+        // upper end: that would keep the |grad| == 1 pixels the half path drops.
+        const float w0c = std::max(0.f, w0);
+        const float w0sq = w0c * w0c;
 #if SM_USE_AVX2
         const __m256 vmc = _mm256_set1_ps(mc);
         const __m256 one = _mm256_set1_ps(1.f);
+        const __m256 vW02 = _mm256_set1_ps(w0sq);
+        const __m256 v127 = _mm256_set1_ps((float)kQ8);
+        const __m256i vOne32 = _mm256_set1_epi32(1);
 #endif
 
         for (int y = 0; y < h; y++)
@@ -834,6 +916,8 @@ namespace
             // horizontal difference / smoothing + normalization + half store
             unsigned short* gxr = gx16.ptr<unsigned short>(y);
             unsigned short* gyr = gy16.ptr<unsigned short>(y);
+            signed char* qr = q8.ptr<signed char>(y);
+            uchar* mr = m8.ptr<uchar>(y);
             x = 0;
 #if SM_USE_AVX2
             for (; x + 8 <= w; x += 8)
@@ -857,48 +941,126 @@ namespace
                 const __m256 wt = _mm256_min_ps(_mm256_div_ps(mag, vmc), one);
                 const __m256 ox = _mm256_mul_ps(_mm256_div_ps(gx, den), wt);
                 const __m256 oy = _mm256_mul_ps(_mm256_div_ps(gy, den), wt);
-                _mm_storeu_si128((__m128i*)(gxr + x), _mm256_cvtps_ph(ox, _MM_FROUND_TO_NEAREST_INT));
-                _mm_storeu_si128((__m128i*)(gyr + x), _mm256_cvtps_ph(oy, _MM_FROUND_TO_NEAREST_INT));
+                const __m128i hx = _mm256_cvtps_ph(ox, _MM_FROUND_TO_NEAREST_INT);
+                const __m128i hy = _mm256_cvtps_ph(oy, _MM_FROUND_TO_NEAREST_INT);
+                _mm_storeu_si128((__m128i*)(gxr + x), hx);
+                _mm_storeu_si128((__m128i*)(gyr + x), hy);
+
+                // ---- 8-bit mirror: mask = |half grad| >= w0 (same test the
+                // half paths run on the sampled values) + a 1/0 count plane.
+                const __m256 fx = _mm256_cvtph_ps(hx);
+                const __m256 fy = _mm256_cvtph_ps(hy);
+                const __m256i keep = _mm256_castps_si256(_mm256_cmp_ps(
+                    _mm256_add_ps(_mm256_mul_ps(fx, fx), _mm256_mul_ps(fy, fy)),
+                    vW02, _CMP_GE_OQ));
+                __m256i qxi = _mm256_cvtps_epi32(_mm256_mul_ps(fx, v127));
+                __m256i qyi = _mm256_cvtps_epi32(_mm256_mul_ps(fy, v127));
+                qxi = _mm256_and_si256(qxi, keep);
+                qyi = _mm256_and_si256(qyi, keep);
+                // interleave (qx,qy) per pixel: 32 -> 16 -> 8 bit, one 16B store
+                const __m256i il = _mm256_unpacklo_epi32(qxi, qyi);
+                const __m256i ih = _mm256_unpackhi_epi32(qxi, qyi);
+                const __m256i i16 = _mm256_packs_epi32(il, ih);
+                _mm_storeu_si128((__m128i*)(qr + 2 * x),
+                                 _mm_packs_epi16(_mm256_castsi256_si128(i16),
+                                                 _mm256_extracti128_si256(i16, 1)));
+                const __m256i m1 = _mm256_and_si256(_mm256_srli_epi32(keep, 31), vOne32);
+                const __m128i m16 = _mm_packs_epi32(_mm256_castsi256_si128(m1),
+                                                    _mm256_extracti128_si256(m1, 1));
+                _mm_storel_epi64((__m128i*)(mr + x), _mm_packs_epi16(m16, m16));
             }
-            if (x < w)
-            {
-                // tail: same arithmetic, one vector conversion for the halves
-                float fx[8], fy[8];
-                for (int t = 0; t < 8; t++)
-                {
-                    const int xx = std::min(x + t, w - 1);
-                    const float gx = (float)(V[xx + 1] - V[xx - 1]);
-                    const float gy = (float)(D[xx - 1] + 2 * D[xx] + D[xx + 1]);
-                    const float mag = std::sqrt(gx * gx + gy * gy);
-                    const float den = std::max(mag, mc);
-                    const float m = std::min(mag / mc, 1.f);
-                    fx[t] = gx / den * m;
-                    fy[t] = gy / den * m;
-                }
-                unsigned short hx[8], hy[8];
-                _mm_storeu_si128((__m128i*)hx, _mm256_cvtps_ph(_mm256_loadu_ps(fx),
-                                                              _MM_FROUND_TO_NEAREST_INT));
-                _mm_storeu_si128((__m128i*)hy, _mm256_cvtps_ph(_mm256_loadu_ps(fy),
-                                                              _MM_FROUND_TO_NEAREST_INT));
-                for (int t = 0; x + t < w; t++)
-                {
-                    gxr[x + t] = hx[t];
-                    gyr[x + t] = hy[t];
-                }
-            }
-#else
-            // scalar reference (no AVX2 build): same arithmetic, one pixel at a time
+#endif
+            // tail (and the whole row on a non-AVX2 build): same arithmetic,
+            // one pixel at a time, so the 8-bit mirror needs no special case
             for (; x < w; x++)
             {
                 const float gx = (float)(V[x + 1] - V[x - 1]);
                 const float gy = (float)(D[x - 1] + 2 * D[x] + D[x + 1]);
-                const float mag = std::sqrt(gx * gx + gy * gy);
-                const float den = std::max(mag, mc);
-                const float m = std::min(mag / mc, 1.f);
-                gxr[x] = f32ToF16(gx / den * m);
-                gyr[x] = f32ToF16(gy / den * m);
+                const float magf = std::sqrt(gx * gx + gy * gy);
+                const float denf = std::max(magf, mc);
+                const float mf = std::min(magf / mc, 1.f);
+                float ox = gx / denf * mf;
+                float oy = gy / denf * mf;
+#if SM_USE_AVX2
+                // keep the 8-bit mirror identical to the vector loop: it sees
+                // the half-rounded value, not the float one
+                const __m128i hx1 = _mm256_cvtps_ph(_mm256_set1_ps(ox), _MM_FROUND_TO_NEAREST_INT);
+                const __m128i hy1 = _mm256_cvtps_ph(_mm256_set1_ps(oy), _MM_FROUND_TO_NEAREST_INT);
+                gxr[x] = (unsigned short)_mm_extract_epi16(hx1, 0);
+                gyr[x] = (unsigned short)_mm_extract_epi16(hy1, 0);
+                ox = _mm_cvtss_f32(_mm_cvtph_ps(hx1));
+                oy = _mm_cvtss_f32(_mm_cvtph_ps(hy1));
+#else
+                gxr[x] = f32ToF16(ox);
+                gyr[x] = f32ToF16(oy);
+                ox = f16ToF32(gxr[x]);
+                oy = f16ToF32(gyr[x]);
+#endif
+                const bool keep = (ox * ox + oy * oy) >= w0sq;
+                qr[2 * x]     = keep ? (signed char)cvRound(ox * (float)kQ8) : (signed char)0;
+                qr[2 * x + 1] = keep ? (signed char)cvRound(oy * (float)kQ8) : (signed char)0;
+                mr[x] = keep ? (uchar)1 : (uchar)0;
+            }
+        }
+    }
+
+    // fallback for the levels the fused pass cannot handle (OpenCL build or an
+    // image too small for the padded rows): derive the 8-bit mirror from the
+    // already normalised halves, with exactly the same rule
+    //     keep = |half grad| >= w0,   q = round(half grad * 127)
+    void quantizeHalves(const cv::Mat& gx16, const cv::Mat& gy16, float w0,
+                        cv::Mat& q8, cv::Mat& m8)
+    {
+        const int h = gx16.rows, w = gx16.cols;
+        q8.create(h, w, CV_8SC2);
+        m8.create(h, w, CV_8U);
+        // same rule as the fused pass in gradientHalves: no upper clamp
+        const float w0c = std::max(0.f, w0);
+        const float w0sq = w0c * w0c;
+#if SM_USE_AVX2
+        const __m256 vW02 = _mm256_set1_ps(w0sq);
+        const __m256 v127 = _mm256_set1_ps((float)kQ8);
+        const __m256i vOne32 = _mm256_set1_epi32(1);
+#endif
+        for (int y = 0; y < h; y++)
+        {
+            const unsigned short* xr = gx16.ptr<unsigned short>(y);
+            const unsigned short* yr = gy16.ptr<unsigned short>(y);
+            signed char* qr = q8.ptr<signed char>(y);
+            uchar* mr = m8.ptr<uchar>(y);
+            int x = 0;
+#if SM_USE_AVX2
+            for (; x + 8 <= w; x += 8)
+            {
+                const __m256 fx = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)(xr + x)));
+                const __m256 fy = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)(yr + x)));
+                const __m256i keep = _mm256_castps_si256(_mm256_cmp_ps(
+                    _mm256_add_ps(_mm256_mul_ps(fx, fx), _mm256_mul_ps(fy, fy)),
+                    vW02, _CMP_GE_OQ));
+                __m256i qxi = _mm256_cvtps_epi32(_mm256_mul_ps(fx, v127));
+                __m256i qyi = _mm256_cvtps_epi32(_mm256_mul_ps(fy, v127));
+                qxi = _mm256_and_si256(qxi, keep);
+                qyi = _mm256_and_si256(qyi, keep);
+                const __m256i i16 = _mm256_packs_epi32(_mm256_unpacklo_epi32(qxi, qyi),
+                                                       _mm256_unpackhi_epi32(qxi, qyi));
+                _mm_storeu_si128((__m128i*)(qr + 2 * x),
+                                 _mm_packs_epi16(_mm256_castsi256_si128(i16),
+                                                 _mm256_extracti128_si256(i16, 1)));
+                const __m256i m1 = _mm256_and_si256(_mm256_srli_epi32(keep, 31), vOne32);
+                const __m128i m16 = _mm_packs_epi32(_mm256_castsi256_si128(m1),
+                                                    _mm256_extracti128_si256(m1, 1));
+                _mm_storel_epi64((__m128i*)(mr + x), _mm_packs_epi16(m16, m16));
             }
 #endif
+            for (; x < w; x++)
+            {
+                const float ox = f16ToF32(xr[x]);
+                const float oy = f16ToF32(yr[x]);
+                const bool keep = (ox * ox + oy * oy) >= w0sq;
+                qr[2 * x]     = keep ? (signed char)cvRound(ox * (float)kQ8) : (signed char)0;
+                qr[2 * x + 1] = keep ? (signed char)cvRound(oy * (float)kQ8) : (signed char)0;
+                mr[x] = keep ? (uchar)1 : (uchar)0;
+            }
         }
     }
 }
@@ -1229,6 +1391,182 @@ namespace
             }
         }
     };
+
+    //-------------------------------------------------------------------
+    //  Integer coarse scan ("8 bit" kernel).
+    //
+    //  Same greedy early exit as ScanInvoker, but the inner loop is integer
+    //  only:
+    //    gradient  CV_8SC2 (qx,qy)   q  = round(grad*127)   |grad| <= 1
+    //    normal    int32 packed       nq = round(n*258)      |n|    = 1
+    //    count     CV_8U 1/0         (skipWeight already folded in)
+    //  Per model point and per 8 positions that is
+    //    vpmovsxbw (16 interleaved bytes -> 16 int16)
+    //    vpmaddwd (8 int32 dots) + vpaddd
+    //    vpmovsxbw + vpaddw (mask bytes -> 16 kept counts)
+    //  ~5 uops instead of 2 vcvtph2ps + 6 mul/add + 2 cmp/and in the half
+    //  path, and the two planes are 3 bytes/pixel instead of 4.
+    //
+    //  Result = sum / (127*258 * keptCount), i.e. the same score quantised to
+    //  8 bit (difference ~2e-3).  It is therefore only used for the coarse
+    //  ranking: every reported score is recomputed from the halves
+    //  (refine / subpixel / rescore), so no output value depends on it.
+    //-------------------------------------------------------------------
+    class ScanInvoker8 : public cv::ParallelLoopBody
+    {
+    public:
+        const cv::Mat* q8;   // CV_8SC2, 0 where the point may not be scored
+        const cv::Mat* m8;   // CV_8U, 1 where the point may be scored
+        const XForm* xf;
+        cv::Mat* out;
+        float target;        // min score to survive
+        float slope;         // greediness slope
+
+        ScanInvoker8(const cv::Mat& _q8, const cv::Mat& _m8, const XForm& _xf,
+                     cv::Mat& _out, float _target, float _slope)
+            : q8(&_q8), m8(&_m8), xf(&_xf), out(&_out), target(_target), slope(_slope) {}
+
+        void operator()(const cv::Range& range) const CV_OVERRIDE
+        {
+            const int R = xf->R;
+            const int n = xf->n;
+            const int K = 2 * R + 1;
+            const int w = q8->cols;
+            const int16_t* SM_RESTRICT pox = xf->ox.data();
+            const int16_t* SM_RESTRICT poy = xf->oy.data();
+            const int32_t* SM_RESTRICT pnp = xf->np.data();
+
+            const int   minKept = std::max(8, n / 4);
+            const float invN = 1.f / n;
+            const int xEnd = w - R;
+            const float qdot = kQ8Dot;
+
+            std::vector<const signed char*> qr(K);
+            std::vector<const uchar*>       mr(K);
+            // the interleaved plane is addressed in bytes: twice the pixel offset
+            std::vector<int> qoff(n), moff(n);
+            for (int k = 0; k < n; k++)
+            {
+                qoff[k] = 2 * (int)pox[k];
+                moff[k] = (int)pox[k];
+            }
+
+            for (int yi = range.start; yi < range.end; yi++)
+            {
+                const int y = yi + R;
+                for (int i = 0; i < K; i++)
+                {
+                    qr[i] = q8->ptr<signed char>(y - R + i);
+                    mr[i] = m8->ptr<uchar>(y - R + i);
+                }
+                float* SM_RESTRICT orow = out->ptr<float>(yi);
+                int x = R;
+                // ---- AVX2 body: 16 positions per iteration ----------------
+#if SM_USE_AVX2
+                const __m256 vQDot = _mm256_set1_ps(qdot);
+                const __m256 vDead = _mm256_set1_ps(-1.f);
+                const __m256 vMinK = _mm256_set1_ps((float)minKept);
+                // 16 positions per iteration: two int32 accumulators for the
+                // dots (8 positions each) and one int16 accumulator that holds
+                // the kept count of all 16 positions at once.
+                for (; x + 16 <= xEnd; x += 16)
+                {
+                    __m256i sum0 = _mm256_setzero_si256();
+                    __m256i sum1 = _mm256_setzero_si256();
+                    __m256i cnt  = _mm256_setzero_si256();
+                    bool dead0 = false, dead1 = false;
+                    for (int k = 0; k < n; k++)
+                    {
+                        const int ri = poy[k] + R;
+                        const signed char* pq = qr[ri] + 2 * x + qoff[k];
+                        const uchar*       pm = mr[ri] + x + moff[k];
+                        const __m256i vn = _mm256_set1_epi32(pnp[k]);
+                        if (!dead0)
+                        {
+                            const __m256i g = _mm256_cvtepi8_epi16(
+                                _mm_loadu_si128((const __m128i*)pq));
+                            sum0 = _mm256_add_epi32(sum0, _mm256_madd_epi16(g, vn));
+                        }
+                        if (!dead1)
+                        {
+                            const __m256i g = _mm256_cvtepi8_epi16(
+                                _mm_loadu_si128((const __m128i*)(pq + 16)));
+                            sum1 = _mm256_add_epi32(sum1, _mm256_madd_epi16(g, vn));
+                        }
+                        // each point adds 0/1 to every position's kept count
+                        cnt = _mm256_add_epi16(cnt, _mm256_cvtepi8_epi16(
+                                  _mm_loadu_si128((const __m128i*)pm)));
+                        int m = k + 1;
+                        if (((m & 7) == 0) || m == n)
+                        {
+                            float x1 = (target - 1.f) + slope * m;
+                            float x2 = target * invN * m;
+                            float lim = (x1 < x2 ? x1 : x2) * m;
+                            // the accumulator holds the score scaled by 127*258,
+                            // so the bound moves to that scale as well (|lim| and
+                            // its product stay far inside int32)
+                            const __m256i vlim = _mm256_set1_epi32((int)(lim * qdot));
+                            if (!dead0 && _mm256_movemask_ps(_mm256_castsi256_ps(
+                                    _mm256_cmpgt_epi32(vlim, sum0))) == 0xFF)
+                                dead0 = true;
+                            if (!dead1 && _mm256_movemask_ps(_mm256_castsi256_ps(
+                                    _mm256_cmpgt_epi32(vlim, sum1))) == 0xFF)
+                                dead1 = true;
+                            if (dead0 && dead1)
+                                break;
+                        }
+                    }
+                    const __m256 fc0 = _mm256_cvtepi32_ps(
+                        _mm256_cvtepi16_epi32(_mm256_castsi256_si128(cnt)));
+                    const __m256 fc1 = _mm256_cvtepi32_ps(
+                        _mm256_cvtepi16_epi32(_mm256_extracti128_si256(cnt, 1)));
+                    const __m256 ok0 = _mm256_cmp_ps(fc0, vMinK, _CMP_GE_OQ);
+                    const __m256 ok1 = _mm256_cmp_ps(fc1, vMinK, _CMP_GE_OQ);
+                    const __m256 sc0 = _mm256_div_ps(_mm256_cvtepi32_ps(sum0),
+                                                     _mm256_mul_ps(fc0, vQDot));
+                    const __m256 sc1 = _mm256_div_ps(_mm256_cvtepi32_ps(sum1),
+                                                     _mm256_mul_ps(fc1, vQDot));
+                    _mm256_storeu_ps(orow + x - R,
+                                     dead0 ? vDead : _mm256_blendv_ps(vDead, sc0, ok0));
+                    _mm256_storeu_ps(orow + x - R + 8,
+                                     dead1 ? vDead : _mm256_blendv_ps(vDead, sc1, ok1));
+                }
+#endif
+                // ---- tail, and the whole row on a non-AVX2 build ----
+                for (; x < xEnd; x++)
+                {
+                    int  sum = 0;
+                    int  cnt = 0;
+                    bool dead = false;
+                    for (int k = 0; k < n; k++)
+                    {
+                        const int ri = poy[k] + R;
+                        const signed char* pq = qr[ri] + 2 * (x + pox[k]);
+                        const int32_t packed = pnp[k];
+                        const int32_t nqx = (int16_t)(packed & 0xFFFF);
+                        const int32_t nqy = (int16_t)(packed >> 16);
+                        sum += (int)pq[0] * nqx + (int)pq[1] * nqy;
+                        cnt += (int)mr[ri][x + pox[k]];
+                        int m = k + 1;
+                        if (((m & 7) == 0) || m == n)
+                        {
+                            float x1 = (target - 1.f) + slope * m;
+                            float x2 = target * invN * m;
+                            float lim = (x1 < x2 ? x1 : x2) * m;
+                            if ((float)sum < lim * qdot)
+                            {
+                                dead = true;
+                                break;
+                            }
+                        }
+                    }
+                    orow[x - R] = (dead || cnt < minKept)
+                                      ? -1.f
+                                      : (float)sum / (qdot * (float)cnt);
+                }
+            }
+        }
+    };
 }
 
 void ShapeMatcher::correlateSparse(int level, int aIdx, int sIdx, cv::Mat& scoreMap,
@@ -1248,11 +1586,32 @@ void ShapeMatcher::correlateSparseX(int level, const XForm& xf, cv::Mat& scoreMa
     double g = std::min(std::max(greed, 0.0), 0.98);
     float slope = (float)((1.0 - g * target) / ((1.0 - g) * std::max(1, xf.n)));
 
-    ScanInvoker inv(srcGx_[level], srcGy_[level], xf, scoreMap, (float)target, slope,
-                    skipWeight_);
+    // The 8-bit kernel is only a ranking shortcut: it must produce the same
+    // local maxima as the half path, which is why it is enabled only when the
+    // quantised planes exist for this level and the point count keeps the
+    // int32 accumulator (n*32766) and the int16 kept-count (n) in range.
+    // SM_NO_Q8=1 in the environment forces the half path, so the two kernels
+    // can be compared on the same data (results must match to ~2e-3).
+    static const bool q8Disabled = (std::getenv("SM_NO_Q8") != nullptr);
+    const bool useQ8 = !q8Disabled && SM_USE_AVX2 && xf.n > 0 && xf.n <= kQ8MaxPoints &&
+                       (int)xf.np.size() == xf.n &&
+                       level < (int)srcQ8_.size() && !srcQ8_[level].empty() &&
+                       !srcM8_[level].empty() &&
+                       srcM8_[level].rows == srcGx_[level].rows &&
+                       srcM8_[level].cols == srcGx_[level].cols;
     // when we are already inside a parallel loop the rows must be scanned
     // serially: nested parallel_for_ corrupts the OpenCV thread pool
     double stripes = nested ? 1.0 : (double)std::max(1, scoreMap.rows / 4);
+
+    if (useQ8)
+    {
+        ScanInvoker8 inv8(srcQ8_[level], srcM8_[level], xf, scoreMap, (float)target, slope);
+        cv::parallel_for_(cv::Range(0, scoreMap.rows), inv8, stripes);
+        return;
+    }
+
+    ScanInvoker inv(srcGx_[level], srcGy_[level], xf, scoreMap, (float)target, slope,
+                    skipWeight_);
     cv::parallel_for_(cv::Range(0, scoreMap.rows), inv, stripes);
 }
 
@@ -1931,6 +2290,9 @@ void ShapeMatcher::scanPose(int level, const XForm& xf, cv::Mat& scoreMap, int& 
         XForm nxf = xf;                       // copies the offsets too
         for (size_t i = 0; i < nxf.nx.size(); i++) nxf.nx[i] = -nxf.nx[i];
         for (size_t i = 0; i < nxf.ny.size(); i++) nxf.ny[i] = -nxf.ny[i];
+        // the integer packets must follow the negated normals, otherwise the
+        // 8-bit kernel would score with the original direction
+        quantizeNormals(nxf);
         cv::Mat negMap;
         int R2 = R;
         correlateSparseX(level, nxf, negMap, R2, target, greed, nested);
@@ -2482,10 +2844,14 @@ void ShapeMatcher::prepareSource(const cv::Mat& gray, int levels, bool useOCL)
 
     srcGx_.resize(levels);
     srcGy_.resize(levels);
+    srcQ8_.resize(levels);
+    srcM8_.resize(levels);
     uGx_.resize(levels);
     uGy_.resize(levels);
 
     const double mc = params_.minContrast;
+    // the 8-bit mirror has to carry the same skipWeight mask the scan uses
+    const float w0 = skipWeight_;
 
     if (useOCL)
     {
@@ -2498,6 +2864,7 @@ void ShapeMatcher::prepareSource(const cv::Mat& gray, int levels, bool useOCL)
         {
             uGx_[i].copyTo(srcGx_[i]);
             uGy_[i].copyTo(srcGy_[i]);
+            quantizeHalves(srcGx_[i], srcGy_[i], w0, srcQ8_[i], srcM8_[i]);
         }
     }
     else
@@ -2507,9 +2874,9 @@ void ShapeMatcher::prepareSource(const cv::Mat& gray, int levels, bool useOCL)
             const cv::Mat& g8 = srcPyramid_[i];
             if (g8.cols > 8 && g8.rows > 8)
             {
-                // one fused pass (sobel + normalize + CV_16F) instead of ten
-                // full image passes followed by two format conversions
-                gradientHalves(g8, srcGx_[i], srcGy_[i], mc);
+                // one fused pass (sobel + normalize + CV_16F + 8-bit mirror)
+                // instead of ten full image passes + two format conversions
+                gradientHalves(g8, srcGx_[i], srcGy_[i], mc, w0, srcQ8_[i], srcM8_[i]);
             }
             else
             {
@@ -2518,6 +2885,7 @@ void ShapeMatcher::prepareSource(const cv::Mat& gray, int levels, bool useOCL)
                 normGradients<cv::Mat>(g8, gx32, gy32, mc);
                 gx32.convertTo(srcGx_[i], CV_16F);
                 gy32.convertTo(srcGy_[i], CV_16F);
+                quantizeHalves(srcGx_[i], srcGy_[i], w0, srcQ8_[i], srcM8_[i]);
             }
         }
     }

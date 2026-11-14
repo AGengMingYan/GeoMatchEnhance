@@ -45,6 +45,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <cwctype>
 #include <fstream>
 #include <iterator>
@@ -82,21 +83,39 @@ static void    CleanupRenderTarget();
 static LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
 //=======================================================================
-//  日志
+//  日志: 界面显示 + 落盘到复现目录(带时间戳)，崩溃后也能回看完整过程
 //=======================================================================
 static std::vector<std::string> g_log;
 static bool                     g_logDirty = false;
+static std::string              g_reproDir;        // 复现目录: logs/<app>_<启动时间>
+static std::string              g_reproTarget;     // target.jpg 已保存过的目标图，避免反复落盘
 
-// 同时落盘一份，便于崩了之后回看日志（日志里含建模/匹配耗时，正好用来对比算法差异）
+static std::string timeStamp()
+{
+    using namespace std::chrono;
+    const auto    now = system_clock::now();
+    std::time_t   t   = system_clock::to_time_t(now);
+    const int     ms  = (int)(duration_cast<milliseconds>(now.time_since_epoch()).count() % 1000);
+    std::tm tmv;
+    localtime_s(&tmv, &t);
+    char buf[48];
+    std::strftime(buf, sizeof(buf), "%H:%M:%S", &tmv);
+    char out[56];
+    std::snprintf(out, sizeof(out), "%s.%03d", buf, ms);
+    return out;
+}
+
+// 同时落盘一份(带时间戳)，便于崩了之后回看日志（日志里含建模/匹配耗时，正好用来对比算法差异）
 static void logToFile(const std::string& s)
 {
     static FILE* f = nullptr;
     if (!f)
     {
-        f = std::fopen("HalconGUIDemo.log", "w");
+        if (g_reproDir.empty()) return;
+        f = std::fopen((g_reproDir + "/log.txt").c_str(), "w");
         if (!f) return;
     }
-    std::fprintf(f, "%s\n", s.c_str());
+    std::fprintf(f, "[%s] %s\n", timeStamp().c_str(), s.c_str());
     std::fflush(f);
 }
 
@@ -127,6 +146,32 @@ static void logf(const char* fmt, ...)
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
     logLine(buf);
+}
+
+//=======================================================================
+//  复现留痕: 启动时建 logs/<app>_<时间> 目录，日志和关键图片都存进去
+//  图片文件名固定(覆盖写)，与 log.txt 的时间戳对应即可复现
+//=======================================================================
+static void reproSave(const char* name, const cv::Mat& img)
+{
+    if (g_reproDir.empty() || img.empty()) return;
+    const std::string path = g_reproDir + "/" + name;
+    if (cv::imwrite(path, img))
+        logf("[复现] 保存 %s (%dx%d)", name, img.cols, img.rows);
+    else
+        logf("[复现] 保存失败: %s", path.c_str());
+}
+
+static void initReproLog(const char* app)
+{
+    char buf[64];
+    const std::time_t t = std::time(nullptr);
+    std::tm tmv;
+    localtime_s(&tmv, &t);
+    std::strftime(buf, sizeof(buf), "%Y%m%d_%H%M%S", &tmv);
+    g_reproDir = std::string("logs/") + app + "_" + buf;
+    cv::utils::fs::createDirectories(g_reproDir);
+    logf("复现目录: %s  (log.txt + template*/target/result 图片)", g_reproDir.c_str());
 }
 
 //=======================================================================
@@ -902,6 +947,10 @@ static void freezeTplSource(App& a, const cv::Mat& src, const cv::Rect& roi,
     a.maskPath.clear();
     if (a.paintMask) ensureMask(a, patch.cols, patch.rows);
 
+    // 复现留痕: 模板来源整幅图 + ROI 裁出来的模板块
+    reproSave("template_source.png", full);
+    if (r.width > 4 && r.height > 4) reproSave("template_roi.png", patch);
+
     refreshTplView(a);
 }
 
@@ -959,6 +1008,16 @@ static void createNccTemplate(App& a)
 
         buildNccModelVis(a);
         a.texModel.set(toBGRA(a.modelVis));
+
+        reproSave("template.png", patch);
+        reproSave("template_model.png", a.modelVis);
+        if (maskOn) reproSave("template_mask.png", a.mask);
+        logf("建模参数: 角度 %.1f..%.1f 步长 %.2f° 层数 %d Metric %d 掩码=%s 来源=%s ROI=(%d,%d) %dx%d",
+             a.nccAngleStartDeg, a.nccAngleStartDeg + a.nccAngleExtentDeg,
+             a.nccAngleStepDeg, a.nccModelLevels, a.nccMetric,
+             maskOn ? "有" : "无",
+             a.tplSrcValid ? a.tplSrcLabel.c_str() : "(无)",
+             a.tplSrcRoi.x, a.tplSrcRoi.y, a.tplSrcRoi.width, a.tplSrcRoi.height);
 
         double as = 0, ae = 0, astep = 0;
         HString metric;
@@ -1041,6 +1100,18 @@ static void createTemplate(App& a)
         buildShapeModelVis(a);
         a.texModel.set(toBGRA(a.modelVis));
 
+        reproSave("template.png", patch);
+        reproSave("template_model.png", a.modelVis);
+        if (maskOn) reproSave("template_mask.png", a.mask);
+        logf("建模参数: 角度 %.1f..%.1f 步长 %.2f° 缩放 %.2f..%.2f Contrast %d MinContrast %d "
+             "层数 %d Metric %s 掩码=%s 来源=%s ROI=(%d,%d) %dx%d",
+             a.angleStartDeg, a.angleStartDeg + a.angleExtentDeg, rad2deg(aStep),
+             std::min(a.scaleMin, a.scaleMax), std::max(a.scaleMin, a.scaleMax),
+             (int)hi, (int)lo, (int)a.numLevels, shapeMetricName(a.metric),
+             maskOn ? "有" : "无",
+             a.tplSrcValid ? a.tplSrcLabel.c_str() : "(无)",
+             a.tplSrcRoi.x, a.tplSrcRoi.y, a.tplSrcRoi.width, a.tplSrcRoi.height);
+
         double as = 0, ae = 0, astep = 0, smin = 0, smax = 0, sstep = 0;
         HString metric;
         Hlong minc = 0;
@@ -1100,6 +1171,14 @@ static void runNccMatch(App& a, int loops)
     const int n = std::max(1, loops);
     try
     {
+        // 复现留痕: 原图只在换图时落盘一次，参数/结果每次都记
+        if (a.tgtPath != g_reproTarget) { g_reproTarget = a.tgtPath; reproSave("target.jpg", a.tgtGray); }
+        logf("NCC 搜索参数: 最小分数 %.2f 最大匹配 %d 最大重叠 %.2f 亚像素 %d "
+             "角度 %.1f..%.1f 次数 %d 目标=%s",
+             a.nccMinScore, a.nccMaxMatches, a.nccMaxOverlap, a.nccSubpixel,
+             a.nccAngleStartDeg, a.nccAngleStartDeg + a.nccAngleExtentDeg,
+             n, a.tgtPath.c_str());
+
         HImage img = toHImage(a.tgtGray);
         HTuple row, col, angle, score;
 
@@ -1140,6 +1219,7 @@ static void runNccMatch(App& a, int loops)
         a.resultVis = drawResult(a, a.tgtGray, a.dets);
         a.texResult.set(toBGRA(a.resultVis));
         a.showResultOnce = true;
+        reproSave("result.jpg", a.resultVis);
 
         logf("Halcon NCC 匹配: %d 个结果  预处理 0.00 ms  搜索 %.2f ms  "
              "搜索总耗时 %.2f ms (%d 次)  合计 %.2f ms",
@@ -1204,6 +1284,15 @@ static void runMatch(App& a, int loops)
     const int n = std::max(1, loops);
     try
     {
+        // 复现留痕: 原图只在换图时落盘一次，参数/结果每次都记
+        if (a.tgtPath != g_reproTarget) { g_reproTarget = a.tgtPath; reproSave("target.jpg", a.tgtGray); }
+        logf("搜索参数: 最小分数 %.2f 最大匹配 %d 最大重叠 %.2f 贪婪 %.2f 亚像素 %d 层数 %d "
+             "角度 %.1f..%.1f 缩放 %.2f..%.2f 次数 %d 目标=%s",
+             a.minScore, a.maxMatches, a.maxOverlap, a.greediness, a.subpixelMode, a.numLevels,
+             a.angleStartDeg, a.angleStartDeg + a.angleExtentDeg,
+             std::min(a.scaleMin, a.scaleMax), std::max(a.scaleMin, a.scaleMax),
+             n, a.tgtPath.c_str());
+
         HImage img = toHImage(a.tgtGray);
         HTuple row, col, angle, scale, score;
 
@@ -1247,6 +1336,7 @@ static void runMatch(App& a, int loops)
         a.resultVis = drawResult(a, a.tgtGray, a.dets);
         a.texResult.set(toBGRA(a.resultVis));
         a.showResultOnce = true;
+        reproSave("result.jpg", a.resultVis);
 
         logf("Halcon 匹配: %d 个结果  预处理 0.00 ms  搜索 %.2f ms  "
              "搜索总耗时 %.2f ms (%d 次)  合计 %.2f ms",
@@ -1265,7 +1355,7 @@ static void runMatch(App& a, int loops)
                                          deg2rad(a.angleStartDeg), deg2rad(a.angleExtentDeg),
                                          std::min(a.scaleMin, a.scaleMax),
                                          std::max(a.scaleMin, a.scaleMax),
-                                         0.05, 1, 1.0, "true", 0, 0.0,
+                                         0.05, 1, 1.0, "true", 0, 0.9,
                                          &r2, &c2, &ang2, &sc2, &sco2);
             if (sco2.Length())
                 logf("  诊断: 最高候选分 %.4f < 最小分数 %.2f  (row=%.1f col=%.1f 角度 %.2f°)"
@@ -2603,6 +2693,7 @@ int main(int argc, char** argv)
     }
 
     ::SetUnhandledExceptionFilter(crashFilter);
+    initReproLog("HalconGUIDemo");
     logf("启动: cwd=%s  目录=%s", cv::utils::fs::getcwd().c_str(), dir.c_str());
 
     //---------------- 窗口 + D3D11 ----------------

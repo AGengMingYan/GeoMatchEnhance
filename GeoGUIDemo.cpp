@@ -29,10 +29,12 @@
 #include <shobjidl_core.h>      // IFileDialog / 文件夹选择框
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <cwctype>
 #include <fstream>
 #include <iterator>
@@ -68,10 +70,27 @@ static void    CleanupRenderTarget();
 static LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
 //=======================================================================
-//  日志
+//  日志: 界面显示 + 落盘到复现目录(带时间戳)，崩溃后也能回看完整过程
 //=======================================================================
 static std::vector<std::string> g_log;
 static bool                     g_logDirty = false;
+static std::string              g_reproDir;        // 复现目录: logs/<app>_<启动时间>
+static std::string              g_reproTarget;     // target.jpg 已保存过的目标图，避免反复落盘
+
+static std::string timeStamp()
+{
+    using namespace std::chrono;
+    const auto    now = system_clock::now();
+    std::time_t   t   = system_clock::to_time_t(now);
+    const int     ms  = (int)(duration_cast<milliseconds>(now.time_since_epoch()).count() % 1000);
+    std::tm tmv;
+    localtime_s(&tmv, &t);
+    char buf[48];
+    std::strftime(buf, sizeof(buf), "%H:%M:%S", &tmv);
+    char out[56];
+    std::snprintf(out, sizeof(out), "%s.%03d", buf, ms);
+    return out;
+}
 
 static void logLine(const std::string& s)
 {
@@ -79,6 +98,15 @@ static void logLine(const std::string& s)
         g_log.erase(g_log.begin(), g_log.begin() + 100);
     g_log.push_back(s);
     g_logDirty = true;
+
+    static FILE* f = nullptr;
+    if (!f && !g_reproDir.empty())
+        f = std::fopen((g_reproDir + "/log.txt").c_str(), "w");
+    if (f)
+    {
+        std::fprintf(f, "[%s] %s\n", timeStamp().c_str(), s.c_str());
+        std::fflush(f);
+    }
 }
 
 static void logf(const char* fmt, ...)
@@ -89,6 +117,32 @@ static void logf(const char* fmt, ...)
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
     logLine(buf);
+}
+
+//=======================================================================
+//  复现留痕: 启动时建 logs/<app>_<时间> 目录，日志和关键图片都存进去
+//  图片文件名固定(覆盖写)，与 log.txt 的时间戳对应即可复现
+//=======================================================================
+static void reproSave(const char* name, const cv::Mat& img)
+{
+    if (g_reproDir.empty() || img.empty()) return;
+    const std::string path = g_reproDir + "/" + name;
+    if (cv::imwrite(path, img))
+        logf("[复现] 保存 %s (%dx%d)", name, img.cols, img.rows);
+    else
+        logf("[复现] 保存失败: %s", path.c_str());
+}
+
+static void initReproLog(const char* app)
+{
+    char buf[64];
+    const std::time_t t = std::time(nullptr);
+    std::tm tmv;
+    localtime_s(&tmv, &t);
+    std::strftime(buf, sizeof(buf), "%Y%m%d_%H%M%S", &tmv);
+    g_reproDir = std::string("logs/") + app + "_" + buf;
+    cv::utils::fs::createDirectories(g_reproDir);
+    logf("复现目录: %s  (log.txt + template*/target/result 图片)", g_reproDir.c_str());
 }
 
 //=======================================================================
@@ -643,6 +697,10 @@ static void freezeTplSource(App& a, const cv::Mat& src, const cv::Rect& roi,
     a.maskPath.clear();
     if (a.paintMask) ensureMask(a, patch.cols, patch.rows);
 
+    // 复现留痕: 模板来源整幅图 + ROI 裁出来的模板块
+    reproSave("template_source.png", full);
+    if (r.width > 4 && r.height > 4) reproSave("template_roi.png", patch);
+
     refreshTplView(a);
 }
 
@@ -695,6 +753,16 @@ static void createNccTemplate(App& a)
     a.modelVis = a.ncc.drawModelFeatures(2.0);
     a.texModel.set(toBGRA(a.modelVis));
 
+    reproSave("template.png", patch);
+    reproSave("template_model.png", a.modelVis);
+    if (!p.mask.empty()) reproSave("template_mask.png", p.mask);
+    logf("建模参数: 角度 %.1f..%.1f 步长 %.2f° 层数 %d Metric %d 掩码=%s 来源=%s ROI=(%d,%d) %dx%d",
+         a.nccAngleStartDeg, a.nccAngleStartDeg + a.nccAngleExtentDeg,
+         a.nccAngleStepDeg, a.nccModelLevels, a.nccMetric,
+         p.mask.empty() ? "无" : "有",
+         a.tplSrcValid ? a.tplSrcLabel.c_str() : "(无)",
+         a.tplSrcRoi.x, a.tplSrcRoi.y, a.tplSrcRoi.width, a.tplSrcRoi.height);
+
     logf("NCC 模型已创建: %dx%d  像素=%d  层数=%d  %d 个角度(步长 %.2f 度)  用时 %.1f ms",
          patch.cols, patch.rows, a.ncc.modelPixelCount(), a.ncc.numLevels(),
          a.ncc.angleCount(), a.ncc.angleStep() * 180.0 / CV_PI, ms);
@@ -734,6 +802,20 @@ static void createTemplate(App& a)
     a.modelVis = a.matcher.drawModelFeatures(2.0);
     a.texModel.set(toBGRA(a.modelVis));
 
+    reproSave("template.png", patch);
+    reproSave("template_model.png", a.modelVis);
+    if (!a.mask.empty()) reproSave("template_mask.png", a.mask);
+    const std::string ptsTxt = (a.maxPoints > 0) ? std::to_string(a.maxPoints)
+                                                 : std::string("不限制");
+    logf("建模参数: 角度 %.1f..%.1f 步长 %.2f° 缩放 %.2f..%.2f minContrast %.1f contrast %.1f "
+         "最大点数 %s 层数 %d Metric %d 评分 %d 掩码=%s 来源=%s ROI=(%d,%d) %dx%d",
+         a.angleStartDeg, a.angleStartDeg + a.angleExtentDeg, a.angleStepDeg,
+         std::min(a.scaleMin, a.scaleMax), std::max(a.scaleMin, a.scaleMax),
+         a.minContrast, a.contrast, ptsTxt.c_str(), a.numLevels,
+         a.metric, a.scoreMode, a.mask.empty() ? "无" : "有",
+         a.tplSrcValid ? a.tplSrcLabel.c_str() : "(无)",
+         a.tplSrcRoi.x, a.tplSrcRoi.y, a.tplSrcRoi.width, a.tplSrcRoi.height);
+
     logf("模板已创建: %dx%d  点数=%d  层数=%d  用时 %.1f ms",
          patch.cols, patch.rows, a.matcher.modelPointCount(),
          a.matcher.numLevels(), ms);
@@ -768,7 +850,7 @@ static void createTemplate(App& a)
     {
         if (cand > np * 2)
             logf("提示: 过阈值像素 %d 个 > 点数 %d 的两倍，当前是「最大点数」在截断，"
-                 "调最小对比度只会改变取点位置", cand, np);
+                 "调最小对比度只会改变取点位置；把「最大点数」拉到 0 可取消截断", cand, np);
         else
             logf("过阈值像素 %d 个，点数 %d（阈值在起作用）", cand, np);
     }
@@ -822,6 +904,13 @@ static void runNccMatch(App& a, int loops)
     fp.subpixel   = a.nccSubpixel;
     fp.numLevels  = 0;              // 0 = 用模型自己的层数
 
+    // 复现留痕: 原图只在换图时落盘一次，参数/结果每次都记
+    if (a.tgtPath != g_reproTarget) { g_reproTarget = a.tgtPath; reproSave("target.jpg", a.tgtGray); }
+    logf("NCC 搜索参数: 最小分数 %.2f 最大匹配 %d 最大重叠 %.2f 亚像素 %d Metric %d "
+         "角度 %.1f..%.1f 次数 %d 目标=%s",
+         a.nccMinScore, a.nccMaxMatches, a.nccMaxOverlap, a.nccSubpixel, a.nccMetric,
+         a.nccAngleStartDeg, a.nccAngleStartDeg + a.nccAngleExtentDeg, loops, a.tgtPath.c_str());
+
     const int loopsUsed = std::max(1, loops);
     std::vector<geomatch::NccResult> res;
     double preMs = 0, searchMs = 0;
@@ -860,6 +949,7 @@ static void runNccMatch(App& a, int loops)
     a.resultVis = a.ncc.drawResult(a.tgtGray, res);
     a.texResult.set(toBGRA(a.resultVis));
     a.showResultOnce = true;        // 自动切到「匹配结果」页，否则画面上看不到框
+    reproSave("result.jpg", a.resultVis);
 
     logf("NCC 匹配: %d 个结果  预处理 %.2f ms  搜索 %.2f ms  搜索总耗时 %.2f ms (%d 次)  "
          "合计 %.2f ms",
@@ -899,6 +989,14 @@ static void runMatch(App& a, int loops)
 
     a.matcher.setConfig(a.toConfig());
 
+    // 复现留痕: 原图只在换图时落盘一次，参数/结果每次都记
+    if (a.tgtPath != g_reproTarget) { g_reproTarget = a.tgtPath; reproSave("target.jpg", a.tgtGray); }
+    logf("搜索参数: 最小分数 %.2f 最大匹配 %d 最小间距 %.0f 最大重叠 %.2f 贪婪 %.2f 亚像素 %d "
+         "Metric %d 评分 %d 最小覆盖率 %.2f OpenCL %d 次数 %d 目标=%s",
+         a.minScore, a.maxMatches, a.minDistance, a.maxOverlap, a.greediness,
+         a.subpixelMode, a.metric, a.scoreMode, a.minCoverage,
+         (int)a.useOpenCL, loops, a.tgtPath.c_str());
+
     const int loopsUsed = std::max(1, loops);
 
     geomatch::Timing tm;
@@ -922,6 +1020,7 @@ static void runMatch(App& a, int loops)
     const double drawMs = (cv::getTickCount() - tDraw) * 1000.0 / cv::getTickFrequency();
     a.texResult.set(toBGRA(a.resultVis));
     a.showResultOnce = true;        // 自动切到「匹配结果」页，否则画面上看不到框
+    reproSave("result.jpg", a.resultVis);
 
     logf("匹配: %d 个结果  预处理 %.2f ms  搜索 %.2f ms  搜索总耗时 %.2f ms (%d 次)  合计 %.2f ms  绘图 %.1f ms",
          (int)dets.size(), tm.preprocessMs, tm.searchMs, a.searchTotalMs, loopsUsed,
@@ -1614,7 +1713,7 @@ static void drawPanel()
             commitModel  = true;
         }
 
-        changedModel |= sliderI("最大点数", &a.maxPoints, 100, 4000, commitModel);
+        changedModel |= sliderI("最大点数(0=不限)", &a.maxPoints, 0, 4000, commitModel);
         changedModel |= sliderI("金字塔层数(0=自动)", &a.numLevels, 0, 8, commitModel);
         if (a.numLevels == 1)
         {
@@ -2304,6 +2403,8 @@ int main(int argc, char** argv)
         if (std::strcmp(argv[i], "--ncc") == 0) { g_app.matchMode = 1; continue; }
         if (argv[i][0] != '-') { dir = argv[i]; }
     }
+
+    initReproLog("GeoGUIDemo");
 
     //---------------- 窗口 + D3D11 ----------------
     ImGui_ImplWin32_EnableDpiAwareness();

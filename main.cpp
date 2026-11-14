@@ -332,6 +332,12 @@ int main(int argc, char** argv)
     cfg.debug       = (int)gArgD(args, "-debug", 0);
     cfg.scoreMode   = (int)gArgD(args, "-score-mode", 0);
     cfg.minCoverage = (float)gArgD(args, "-min-cover", 0.0);
+    // -skip-w / -cell-miss 原来只在 t2 路径解析，默认路径被静默忽略 ——
+    // 于是 `-skip-w 0` 的 A/B 会得到"分数完全不变"的假结论（2026-11-15 排查
+    // 多结果高分时踩到）。这里补上，且只在显式给出时覆盖，未指定就沿用
+    // Config 的默认值（默认值只应有一处定义，所以回落值直接取 cfg 当前值）。
+    if (gHas(args, "-skip-w"))    cfg.skipWeight  = (float)gArgD(args, "-skip-w", cfg.skipWeight);
+    if (gHas(args, "-cell-miss")) cfg.cellMissMax = (float)gArgD(args, "-cell-miss", cfg.cellMissMax);
     if (gHas(args, "-min-dist")) cfg.minDistance = gArgD(args, "-min-dist", cfg.minDistance);
     cfg.metric      = (int)gArgD(args, "-metric", 0);
     cfg.maxOverlap  = gArgD(args, "-max-overlap", 1.0);

@@ -72,7 +72,9 @@ struct Config
     double scaleMax     = 1.0;
     double contrast     = 30.0;  // high edge threshold (hysteresis seed), Halcon Contrast
     double minContrast  = 12.0;  // low edge threshold (hysteresis link), Halcon MinContrast
-    int    maxPoints    = 1200;
+    int    maxPoints    = 1200;   // model points kept at the finest level; 0 = no
+                                  // cap (every hysteresis pixel becomes a point),
+                                  // which is what Halcon's create_shape_model does
     int    numLevels    = 0;      // 0 = auto
     cv::Mat mask;                 // CV_8U, non-zero = region that may contribute edge points
     int    minChainLen = 2;       // drop edge chains shorter than this (pixels)
@@ -316,9 +318,10 @@ public:
     //---- how the point set was built (level 0), for tuning --------------
     // candidatePixels() = pixels that survived the hysteresis thresholds.
     // When it is far larger than modelPointCount() the thresholds did nothing
-    // and maxPoints alone decided the cut; when it is smaller the thresholds
-    // are the active limit.  0 means "unknown" (model read from an older
-    // file, where the value is not stored).
+    // and maxPoints alone decided the cut (set maxPoints = 0 to keep them all);
+    // when it is smaller the thresholds are the active limit, and the two values
+    // are equal.  0 means "unknown" (model read from an older file, where the
+    // value is not stored).
     int   candidatePixels() const;
     float strongestMag()    const;   // |g| of the strongest kept point
     float weakestMag()      const;   // |g| of the weakest kept point

@@ -80,3 +80,8 @@ dataset/
 # （case1 已入库，约 5 MB，保留以便 clone 后立即可跑）
 case2/
 case3/
+
+# GUI「复现留痕」目录：运行期落盘 logs/<app>_<时间>/{log.txt, template*.png, target, result}
+# 每次启动新建一个，含数百 KB 截图，属于运行产物，不入库（详见 docs 与 .clinerules）
+logs/
+

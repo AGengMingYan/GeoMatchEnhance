@@ -69,7 +69,11 @@ struct MatchParams
     double scaleStep   = 0;    // 0 = auto
     double contrast    = 30;   // high threshold: a ridge must reach it to become a seed
     double minContrast = 12;   // low threshold: weaker edges are kept while they touch a seed
-    int    maxPoints   = 1200; // model points kept at the finest level
+    int    maxPoints   = 1200; // model points kept at the finest level.
+                               // 0 = no budget: keep every hysteresis pixel (the
+                               // coarse levels then scale down by 2^level), which
+                               // is what Halcon does; a large / dense template
+                               // needs it, 1200 only covers ~150x150 px templates.
     cv::Mat mask;              // CV_8U, non-zero = region that may contribute edge points.
                                // empty = the whole template is used (default behaviour).
     int    minChainLen = 2;    // drop edge chains shorter than this (pixels); suppresses
@@ -311,6 +315,14 @@ private:
     std::vector<int>    levelAngleCount_, levelScaleCount_;
 
     std::vector<cv::Mat>  srcPyramid_, srcGx_, srcGy_;
+    // 8-bit copy of the same normalized gradients, for the coarse scan kernel:
+    //   srcQ8_[i]  CV_8SC2, per pixel (qx,qy) = round(grad*127), 0 where the
+    //              point may not be scored (skipWeight mask already folded in)
+    //   srcM8_[i]  CV_8U,   1 = this pixel may be scored, 0 = skipped
+    // The interleaved pair lets one vpmaddwd turn 8 pixel positions into 8
+    // integer dots (see ScanInvoker8).  The halves stay the reference for
+    // refine / sub-pixel / re-scoring, so only the coarse ranking uses this.
+    std::vector<cv::Mat>  srcQ8_, srcM8_;
     std::vector<cv::UMat> uGx_, uGy_;
     bool useOCL_;
     double lastPreprocessTime_, lastSearchTime_;
