@@ -117,6 +117,9 @@ struct Config
     // 图像梯度幅值低于 minContrast 的模型点不计入分数、分母用有效点数。
     // 默认 0.9；设 0 恢复旧语义（全部点按软权重参与，模糊帧分数会系统性低 ~0.3）。
     float  skipWeight   = 0.9f;
+    // 与 skipWeight 配合：0 = 关闭；>0 = 允许的"模板缺失面积比例"上限
+    // （重复纹理里"只对上模板一部分"的位置会被 skipWeight 抬到高分，靠这个拒掉）。
+    float  cellMissMax  = 0.35f;
 
     // 注：软门限梯度归一化与亚像素梯度采样已内建为默认行为（见 ShapeMatch
     // 的 prepareSource / subpixelRefine），不再提供 Config 开关。

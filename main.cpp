@@ -229,6 +229,8 @@ namespace
         cfg.minCoverage = (float)gArgD(a, "-min-cover", 0.0);
         // -skip-w 0 关闭"跳过弱梯度点"；默认 0.9（对齐 Halcon，见 FindParams::skipWeight）
         cfg.skipWeight = (float)gArgD(a, "-skip-w", 0.9);
+        // -cell-miss 0 关闭"模板局部缺失"拒绝；默认 0.35（见 FindParams::cellMissMax）
+        cfg.cellMissMax = (float)gArgD(a, "-cell-miss", 0.35);
         // minDistance only when asked for, so the value stored in the model wins
         if (gHas(a, "-min-dist")) cfg.minDistance = gArgD(a, "-min-dist", cfg.minDistance);
         cfg.metric     = (int)gArgD(a, "-metric", 0);
@@ -259,8 +261,6 @@ namespace
             const Detection& d = dets[k];
             std::cout << "        #" << k
                       << "  score=" << std::setprecision(3) << d.score;
-            if (d.coverage > 0.f)
-                std::cout << "  cover=" << std::setprecision(2) << d.coverage;
             // pos is sub-pixel (the sub-pixel refinement returns fractions), so it
             // must not be truncated to int here - that hid the whole point of
             // subpixel=2.
@@ -270,7 +270,12 @@ namespace
                       // setprecision(1) 只有 1 位有效数字，14.77 会被打成
                       // "1e+01"、45 会被打成 "5e+01"，看起来像几度的误差。
                       << "  angle=" << std::setprecision(2) << (d.angle * 180.0 / CV_PI)
-                      << "deg  scale=" << std::setprecision(3) << d.scale << "\n";
+                      << "deg  scale=" << std::setprecision(3) << d.scale;
+            // cover 放在**行尾**：中间插入会打断所有既有脚本的正则
+            // （`#0 score=... pos=(...;...) angle=...deg`）。
+            if (d.coverage > 0.f)
+                std::cout << "  cover=" << std::fixed << std::setprecision(2) << d.coverage;
+            std::cout << "\n";
         }
         if (dets.empty()) std::cout << "        (nothing found)\n";
 

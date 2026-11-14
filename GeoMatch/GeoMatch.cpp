@@ -121,6 +121,7 @@ FindParams Config::toFindParams() const
     p.scoreMode  = scoreMode;
     p.minCoverage = minCoverage;
     p.skipWeight = skipWeight;
+    p.cellMissMax = cellMissMax;
     return p;
 }
 

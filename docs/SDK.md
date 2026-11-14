@@ -207,6 +207,7 @@ find_package(GeoMatch REQUIRED)
 | `scoreMode` | `0` | `0` mean（**与 Halcon 一致**）/ `2` trimmed / `1` positive-mean（**会虚高**）/ `3` clipped |
 | `minCoverage` | `0` | 最小覆盖率，`0` = 关闭 |
 | `skipWeight` | `0.9` | 评分时跳过图像梯度幅值低于 `minContrast` 的模型点（**对齐 Halcon 语义**），分母用有效点数；`0` = 关闭。修复前模糊/弱对比帧分数会系统性低 ~0.3 |
+| `cellMissMax` | `0.35` | 与 `skipWeight` 配套：把模板分 4×4 格，若"图像上几乎没梯度的格"占比超过此值则拒绝该匹配。**防止"只对上模板一部分"的错位实例被 skipWeight 抬到 0.9+**；`0` = 关闭 |
 | `useOpenCL` | `true` | 是否尝试 GPU 预处理 |
 | `debug` | `0` | >0 打印调试信息 |
 

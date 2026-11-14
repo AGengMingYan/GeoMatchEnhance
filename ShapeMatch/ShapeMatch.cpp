@@ -1459,95 +1459,145 @@ namespace
 
     // one pass over the model points, returning everything the final
     // verification needs:
-    //   mean     - the plain score the search used (n in the denominator)
-    //   clipped  - sum of the positive terms / n  (mode 3)
-    //   coverage - fraction of points with dot > 0
-    // mode 1 (positive-mean) is clipped/coverage; it is kept as a separate
-    // function because the search and the refine path compare against it.
-    struct PoseScore { float mean, clipped, coverage; };
+    //   mean         - the score the search used, averaged over the *kept* points
+    //                  (skipWeight) or over all n points (skipWeight = 0)
+    //   clipped      - sum of the positive terms / kept count  (mode 3)
+    //   coverage     - fraction of ALL model points whose direction agrees.
+    //                  Deliberately relative to n, not to the kept count: a
+    //                  position where the image only has gradient on part of the
+    //                  model must NOT look fully covered (that was the bug that
+    //                  let skipWeight inflate partial matches to 0.97).
+    //   missShare    - share of the template's 4x4 cells that are effectively
+    //                  empty in the image (kept share < 0.2).  Distinguishes the
+    //                  two cases skipWeight has to survive:
+    //                    * blur / weak lighting -> weak points are spread out,
+    //                      every cell keeps a decent share (measured 0.65~0.86,
+    //                      at most 1-2 cells drop) -> missShare 0.06~0.13;
+    //                    * the template is only partly present (repetitive
+    //                      texture / wrong instance) -> whole rows of cells go
+    //                      empty (measured: half the template pasted -> 8 of 16
+    //                      cells at 0.00..0.16) -> missShare 0.5.
+    //                  cellMissMax rejects the second kind and keeps the first.
+    struct PoseScore { float mean, clipped, coverage, missShare; };
 
     inline PoseScore scorePoseDetail(const cv::Mat& sx, const cv::Mat& sy, const XForm& xf,
                                      int ay, int ax, int metric = POL_USE,
                                      float w0 = 0.f)
     {
         const int n = xf.n;
-        std::vector<float> dots;
-        dots.resize((size_t)n);
+        const int R = std::max(1, xf.R);
+        const int GRID = 4;                 // 4x4 template cells
+        const int CELLS = GRID * GRID;
+        int cellTot[CELLS];
+        int cellKept[CELLS];
+        for (int c = 0; c < CELLS; c++) { cellTot[c] = 0; cellKept[c] = 0; }
+
+        std::vector<float> dots((size_t)n);
+        std::vector<unsigned char> strong((size_t)n);
         double total = 0;
+        int keptAll = 0;
         for (int k = 0; k < n; k++)
         {
             // 亚像素梯度采样（内建）：在真实旋转位置双线性插值，消除整数取整抖动
             const float gx = sampleF16Bilinear(sx, (float)ay + xf.fy[k], (float)ax + xf.fx[k]);
             const float gy = sampleF16Bilinear(sy, (float)ay + xf.fy[k], (float)ax + xf.fx[k]);
+            const float len2 = gx * gx + gy * gy;         // = w^2 (soft weight)
+            const bool st = (w0 <= 0.f) || (len2 >= w0 * w0);
+            strong[(size_t)k] = st ? 1 : 0;
             dots[(size_t)k] = xf.nx[k] * gx + xf.ny[k] * gy;
             total += dots[(size_t)k];
+            if (st) keptAll++;
+
+            {
+                const int cx = std::min(GRID - 1, std::max(0, (int)((xf.ox[k] + R) * GRID / (2 * R + 1))));
+                const int cy = std::min(GRID - 1, std::max(0, (int)((xf.oy[k] + R) * GRID / (2 * R + 1))));
+                const int c = cy * GRID + cx;
+                cellTot[c]++;
+                if (st) cellKept[c]++;
+            }
         }
 
-        // metric 1 flips every dot when the total is negative, so the score and
-        // the coverage both describe the globally inverted interpretation.
-        // metric 2 uses |dot| for the score but keeps the signed dots for the
-        // coverage, because "which points disagree" is still the useful signal.
         const bool flip = (metric == POL_GLOBAL && total < 0.0);
 
-        // skipWeight（对齐 Halcon）：先按"图像侧软权重"筛掉弱幅值点，
-        // mean/clipped/coverage 全部只对保留点计算，分母 = 保留点数。
-        // w0 <= 0 时保持旧语义（全部点、n 作分母）。
-        std::vector<float> use;
-        use.reserve((size_t)n);
-        if (w0 > 0.f)
+        // skipWeight（对齐 Halcon）：mean/clipped 只对"有效点"取平均。
+        // coverage 仍以全部 n 为分母（见上面的说明）。
+        const int minKept = std::max(8, n / 4);
+        double sum = 0.0, posSum = 0.0, absSum = 0.0;
+        int cnt = 0;
+        for (int k = 0; k < n; k++)
         {
-            const int minKept = std::max(8, n / 4);
-            for (int k = 0; k < n; k++)
-            {
-                const float gx = sampleF16Bilinear(sx, (float)ay + xf.fy[k], (float)ax + xf.fx[k]);
-                const float gy = sampleF16Bilinear(sy, (float)ay + xf.fy[k], (float)ax + xf.fx[k]);
-                if (gx * gx + gy * gy < w0 * w0) continue;    // weak: not scored
-                float d = dots[(size_t)k];
-                if (flip) d = -d;
-                use.push_back(d);
-            }
-            if ((int)use.size() < minKept)
-            {
-                PoseScore bad;
-                bad.mean = bad.clipped = -1.f;
-                bad.coverage = (float)use.size() / (float)n;
-                return bad;
-            }
+            if (w0 > 0.f && !strong[(size_t)k]) continue;
+            float d = dots[(size_t)k];
+            if (flip) d = -d;
+            absSum += std::fabs(d);
+            sum += d;
+            if (d > 0.f) { posSum += d; cnt++; }
+        }
+
+        PoseScore ps;
+        const int nk = (w0 > 0.f) ? keptAll : n;
+        const float invK = nk > 0 ? 1.f / (float)nk : 0.f;
+        const float invN = n > 0 ? 1.f / (float)n : 0.f;
+
+        if (metric == POL_LOCAL)
+        {
+            ps.mean = (float)(absSum * invK);
+            ps.clipped = ps.mean;
         }
         else
         {
+            ps.mean = (float)(sum * invK);
+            ps.clipped = (float)(posSum * invK);
+        }
+
+        // coverage: agreeing points over ALL model points
+        {
+            int agree = 0;
             for (int k = 0; k < n; k++)
             {
                 float d = dots[(size_t)k];
                 if (flip) d = -d;
-                use.push_back(d);
+                if (d > 0.f) agree++;
+            }
+            ps.coverage = n > 0 ? (float)agree * invN : 0.f;
+        }
+
+        // share of template cells that are effectively empty in this image
+        {
+            int judged = 0, missing = 0;
+            for (int c = 0; c < CELLS; c++)
+            {
+                if (cellTot[c] < 4) continue;              // too few points to judge
+                judged++;
+                const float share = (float)cellKept[c] / (float)cellTot[c];
+                if (share < 0.2f) missing++;
+            }
+            ps.missShare = judged > 0 ? (float)missing / (float)judged : 0.f;
+        }
+        // diagnostics: SM_DUMP_CELLS=1 prints the 4x4 table for every scored pose,
+        // which is what the cellMissMax default has to be calibrated against.
+        if (std::getenv("SM_DUMP_CELLS") != nullptr)
+        {
+            std::cout << "  [cells] score=" << ps.mean << " cover=" << ps.coverage
+                      << " missShare=" << ps.missShare << "\n";
+            for (int cy = 0; cy < GRID; cy++)
+            {
+                std::cout << "  [cells]  ";
+                for (int cx = 0; cx < GRID; cx++)
+                {
+                    const int c = cy * GRID + cx;
+                    if (cellTot[c] == 0) { printf("   -   "); continue; }
+                    printf(" %5.2f ", (float)cellKept[c] / (float)cellTot[c]);
+                }
+                printf("\n");
             }
         }
 
-        const int nk = (int)use.size();
-        const float inv = nk > 0 ? 1.f / (float)nk : 0.f;
-        PoseScore ps;
-        if (metric == POL_LOCAL)
+        if (w0 > 0.f && nk < minKept)
         {
-            double a = 0;
-            for (int k = 0; k < nk; k++) a += std::fabs(use[(size_t)k]);
-            ps.mean    = (float)a * inv;
-            ps.clipped = (float)a * inv;
-            ps.coverage = 1.f;
-        }
-        else
-        {
-            double sum = 0.0, posSum = 0.0;
-            int    cnt = 0;
-            for (int k = 0; k < nk; k++)
-            {
-                const float d = use[(size_t)k];
-                sum += d;
-                if (d > 0.f) { posSum += d; cnt++; }
-            }
-            ps.mean    = (float)sum * inv;
-            ps.clipped = (float)posSum * inv;
-            ps.coverage = (float)cnt / (float)nk;    // share of kept points that agree
+            // not enough usable gradient anywhere -> the position is not believable
+            ps.mean = -1.f;
+            ps.clipped = -1.f;
         }
         return ps;
     }
@@ -2787,6 +2837,33 @@ std::vector<MatchResult> ShapeMatcher::findShapeModel(const cv::Mat& gray, const
     const bool useOverlap = (fp.maxOverlap < 0.999);
 
     const float minD = (float)std::max(1.0, fp.minDistance);
+
+    // Pose detail (coverage + 4x4 missShare) at an arbitrary found pose.
+    // Used twice: while collecting the result list (so a rejected candidate is
+    // replaced by the next one instead of leaving a hole) and in the final
+    // re-scoring pass.
+    auto poseDetailAt = [&](const cv::Point2f& pos, float angle, float scale) -> PoseScore
+    {
+        int ai = 0, si = 0;
+        double best = 1e9;
+        for (int i = 0; i < (int)angleGrid_.size(); i++)
+        {
+            double d = std::abs(angleGrid_[i] - (double)angle);
+            if (d < best) { best = d; ai = i; }
+        }
+        best = 1e9;
+        for (int i = 0; i < (int)scaleGrid_.size(); i++)
+        {
+            double d = std::abs(scaleGrid_[i] - (double)scale);
+            if (d < best) { best = d; si = i; }
+        }
+        XForm& xf = getXForm(0, ai, si);
+        int ax = cvRound(pos.x), ay = cvRound(pos.y);
+        ax = std::min(std::max(ax, xf.R), srcGx_[0].cols - 1 - xf.R);
+        ay = std::min(std::max(ay, xf.R), srcGx_[0].rows - 1 - xf.R);
+        return scorePoseDetail(srcGx_[0], srcGy_[0], xf, ay, ax, fp.metric, skipWeight_);
+    };
+
     for (size_t i = 0; i < cands.size() && (int)results.size() < fp.maxMatches; i++)
     {
         const Candidate& c = cands[i];
@@ -2808,15 +2885,24 @@ std::vector<MatchResult> ShapeMatcher::findShapeModel(const cv::Mat& gray, const
                 if (overlapOf(candRes, o) > fp.maxOverlap) { dup = true; break; }
             }
         }
-        if (!dup)
+        if (dup) continue;
+
+        // 模板缺失面积过大 -> 不是真目标（重复纹理里"只对上模板一部分"的错位
+        // 实例）。必须在这里就拒，而不是等 results 收满再过滤：那样被拒的 top-1
+        // 会让整张图变成 0 命中，后面的真实候选永远没有机会（实测 data2 有一帧
+        // 就是这样从"能检出"退化成"漏检"）。
+        if (fp.cellMissMax > 0.f)
         {
-            MatchResult m;
-            m.pos = c.pos;
-            m.angle = c.angle;
-            m.scale = c.scale;
-            m.score = c.score;
-            results.push_back(m);
+            const PoseScore ps = poseDetailAt(c.pos, c.angle, c.scale);
+            if (ps.missShare > fp.cellMissMax) continue;
         }
+
+        MatchResult m;
+        m.pos = c.pos;
+        m.angle = c.angle;
+        m.scale = c.scale;
+        m.score = c.score;
+        results.push_back(m);
     }
 
     //---- optional robust re-scoring of the final matches ------------------
@@ -2826,34 +2912,40 @@ std::vector<MatchResult> ShapeMatcher::findShapeModel(const cv::Mat& gray, const
     // minCoverage rides along: the same pass also yields the fraction of
     // model points that agree, which is what separates a real instance from a
     // look-alike spot on a repetitive pattern.
-    if ((fp.scoreMode != 0 || fp.minCoverage > 0.f) && !results.empty())
+    //
+    // The "template cell missing" verdict (missShare) is already applied while
+    // collecting the results (see above), so every match reaching this pass has
+    // passed cellMissMax.
+    if ((fp.scoreMode != 0 || fp.minCoverage > 0.f || fp.skipWeight > 0.f)
+        && !results.empty())
     {
         int64 trs0 = cv::getTickCount();
-        for (MatchResult& r : results)
+        for (size_t ri = 0; ri < results.size(); ri++)
         {
-            int ai = 0, si = 0;
-            double best = 1e9;
-            for (int i = 0; i < (int)angleGrid_.size(); i++)
-            {
-                double d = std::abs(angleGrid_[i] - (double)r.angle);
-                if (d < best) { best = d; ai = i; }
-            }
-            best = 1e9;
-            for (int i = 0; i < (int)scaleGrid_.size(); i++)
-            {
-                double d = std::abs(scaleGrid_[i] - (double)r.scale);
-                if (d < best) { best = d; si = i; }
-            }
-            XForm& xf = getXForm(0, ai, si);
-            int ax = cvRound(r.pos.x), ay = cvRound(r.pos.y);
-            ax = std::min(std::max(ax, xf.R), srcGx_[0].cols - 1 - xf.R);
-            ay = std::min(std::max(ay, xf.R), srcGx_[0].rows - 1 - xf.R);
-
-            const PoseScore ps = scorePoseDetail(srcGx_[0], srcGy_[0], xf, ay, ax, fp.metric,
-                                                 skipWeight_);
+            MatchResult& r = results[ri];
+            const PoseScore ps = poseDetailAt(r.pos, r.angle, r.scale);
             r.coverage = ps.coverage;
             if (fp.scoreMode == 2)          // trimmed-mean needs the sorted dots
+            {
+                int ai = 0, si = 0;
+                double best = 1e9;
+                for (int i = 0; i < (int)angleGrid_.size(); i++)
+                {
+                    double d = std::abs(angleGrid_[i] - (double)r.angle);
+                    if (d < best) { best = d; ai = i; }
+                }
+                best = 1e9;
+                for (int i = 0; i < (int)scaleGrid_.size(); i++)
+                {
+                    double d = std::abs(scaleGrid_[i] - (double)r.scale);
+                    if (d < best) { best = d; si = i; }
+                }
+                XForm& xf = getXForm(0, ai, si);
+                int ax = cvRound(r.pos.x), ay = cvRound(r.pos.y);
+                ax = std::min(std::max(ax, xf.R), srcGx_[0].cols - 1 - xf.R);
+                ay = std::min(std::max(ay, xf.R), srcGx_[0].rows - 1 - xf.R);
                 r.score = scorePosMode(srcGx_[0], srcGy_[0], xf, ay, ax, 2, fp.metric);
+            }
             else if (fp.scoreMode == 0)     // mean: identical to the search score
                 r.score = ps.mean;
             else if (fp.scoreMode == 1)     // positive-mean
@@ -2867,6 +2959,7 @@ std::vector<MatchResult> ShapeMatcher::findShapeModel(const cv::Mat& gray, const
             else                            // any other mode, i.e. 3 = clipped-mean
                 r.score = ps.clipped;
         }
+
         std::sort(results.begin(), results.end(),
                   [](const MatchResult& a, const MatchResult& b)
                   { return a.score > b.score; });
