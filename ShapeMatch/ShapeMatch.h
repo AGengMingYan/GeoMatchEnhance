@@ -156,6 +156,27 @@ struct FindParams
     //    轻微模糊/光照变化下分数不再塌到 0.4~0.7（见 prepareSource）。
     //  - 亚像素梯度采样：精化/复评在模型点真实旋转位置双线性插值，消除整数
     //    取整的 <=0.5px 抖动，降低斜角误差（粗扫仍用整数卷积核保速度）。
+
+    //----
+    // skipWeight（对齐 Halcon 语义，2026-11-14）：评分时跳过"图像梯度幅值 <
+    // minContrast"的模型点，分母改用有效点数。
+    //
+    // 原因（与 Halcon 的 ~0.30 分数差的根因）：归一化梯度平面存的是
+    //   w * 单位方向        w = min(|grad|/minContrast, 1)
+    // 旧做法把这些点的 dot 按 w 等比衰减后计入 mean，于是模糊/弱对比帧上
+    // 约 1/3 的点掉到 cos≈0.1，分数从 0.98 衰减到 0.61（data1 实测）；
+    // 而 Halcon 在同样帧上仍报 0.96 —— 它等效于"弱幅值点不参加评分"。
+    //
+    // 实测（data1 前 12 张 + 负样本集 data1 模板配 data2 图）：
+    //   ours mean 0.713 -> 0.909（Halcon 0.973，gap 0.26 -> 0.06）
+    //   负样本 mean 0.425 -> 0.387、max 0.44 -> 0.49（假分数不升反降，
+    //   真/假间隔从 0.29 拉大到 0.52 —— 判别力同时增强）。
+    //
+    // 取值：1.0 = 严格按 minContrast 硬跳（最接近 Halcon）；
+    //       0.9 = 默认，略保守（幅值在 (0.9~1.0)*minContrast 之间的点仍参与）；
+    //       0   = 关闭（旧语义：全部点按软权重参与）。
+    // 防御：一个位置的有效点数 < max(8, n/4) 时该位置直接判 -1（不可靠）。
+    float  skipWeight  = 0.9f;
 };
 
 class SHAPEMATCH_API ShapeMatcher
@@ -324,4 +345,14 @@ private:
     // correlation kernel cannot express, so this is a plain scalar scan.
     void scanLocalPolarity(int level, const XForm& xf, cv::Mat& scoreMap, int& R,
                            double target, double greed, bool nested);
+
+    //----
+    // "skip weak image gradients" weight, copied from FindParams::skipWeight
+    // at the start of every findShapeModel call.  0 = off.  All scoring loops
+    // (SIMD scan, scorePos / sub-pixel / final detail) read it: a model point
+    // whose sampled gradient length (= min(|grad|/minContrast, 1)) is below
+    // this threshold is excluded from the mean and the denominator becomes the
+    // kept count.  This is what makes the reported score track Halcon's:
+    // blur / weak lighting no longer drag one third of the points to cos ~ 0.1.
+    float skipWeight_ = 0.9f;
 };

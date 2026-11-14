@@ -120,6 +120,7 @@ FindParams Config::toFindParams() const
     p.debug      = debug;
     p.scoreMode  = scoreMode;
     p.minCoverage = minCoverage;
+    p.skipWeight = skipWeight;
     return p;
 }
 

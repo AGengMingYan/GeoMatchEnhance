@@ -113,6 +113,10 @@ struct Config
                                 // The cheapest way to reject the look-alike
                                 // positions that appear when minScore is lowered
                                 // on repetitive patterns.
+    // 对齐 Halcon 的"弱梯度点不评分"语义（详见 FindParams::skipWeight）：
+    // 图像梯度幅值低于 minContrast 的模型点不计入分数、分母用有效点数。
+    // 默认 0.9；设 0 恢复旧语义（全部点按软权重参与，模糊帧分数会系统性低 ~0.3）。
+    float  skipWeight   = 0.9f;
 
     // 注：软门限梯度归一化与亚像素梯度采样已内建为默认行为（见 ShapeMatch
     // 的 prepareSource / subpixelRefine），不再提供 Config 开关。

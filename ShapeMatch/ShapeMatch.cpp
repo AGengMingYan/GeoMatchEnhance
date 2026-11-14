@@ -6,6 +6,7 @@
 #include <opencv2/core/ocl.hpp>
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <unordered_map>
@@ -954,10 +955,14 @@ namespace
         cv::Mat* out;
         float target;   // min score to survive
         float slope;    // greediness slope
+        float w0;       // skip weight: model points whose sampled gradient
+                        // length (= min(|grad|/minContrast,1)) is below w0
+                        // are excluded from the mean (kept count in the
+                        // denominator instead of n).  0 = off.
 
         ScanInvoker(const cv::Mat& _sx, const cv::Mat& _sy, const XForm& _xf,
-                    cv::Mat& _out, float _target, float _slope)
-            : sx(&_sx), sy(&_sy), xf(&_xf), out(&_out), target(_target), slope(_slope) {}
+                    cv::Mat& _out, float _target, float _slope, float _w0 = 0.f)
+            : sx(&_sx), sy(&_sy), xf(&_xf), out(&_out), target(_target), slope(_slope), w0(_w0) {}
 
         void operator()(const cv::Range& range) const CV_OVERRIDE
         {
@@ -969,6 +974,13 @@ namespace
             const int16_t* SM_RESTRICT poy = xf->oy.data();
             const float*   SM_RESTRICT pnx = xf->nx.data();
             const float*   SM_RESTRICT pny = xf->ny.data();
+
+            // skipWeight bookkeeping: a position is only believable when a
+            // decent fraction of the model points actually has usable gradient
+            // magnitude in the search image, otherwise the division by the
+            // kept count could blow noise up to a "perfect" score.
+            const int   minKept = std::max(8, n / 4);
+            const float invKept = 1.f / (float)minKept;
 
             // the gradient images are CV_16F (half) -> half the memory traffic
             std::vector<const uint16_t*> rx(K), ry(K);
@@ -989,13 +1001,27 @@ namespace
 #if SM_USE_AVX2
                 const __m256 vInvN = _mm256_set1_ps(invN);
                 const __m256 vDead = _mm256_set1_ps(-1.f);
+                const __m256 vOne  = _mm256_set1_ps(1.f);
+                const __m256 vW02  = _mm256_set1_ps(w0 * w0);
+                const __m256 vMinK = _mm256_set1_ps((float)minKept);
                 // 16 positions per iteration: two 256-bit float accumulators.
                 // Each gather then touches 16 halves = 32 B, twice as much of
                 // the 64 B cache line as the 8-wide variant.
+                //
+                // skipWeight: per point the sampled gradient length equals the
+                // soft weight (w = min(|grad|/minContrast, 1)), so
+                // len2 = a*a + b*b < w0*w0 marks a point that Halcon would not
+                // score at all.  Its dot and its "1" in the denominator are
+                // masked off; the final mean divides by the kept count (with a
+                // minKept floor, below which the position is unreliable and
+                // reported dead).  With w0 = 0 the mask is all-ones and this
+                // reduces to the previous sum * invN behaviour bit for bit.
                 for (; x + 16 <= xEnd; x += 16)
                 {
                     __m256 sum0 = _mm256_setzero_ps();
                     __m256 sum1 = _mm256_setzero_ps();
+                    __m256 cnt0 = _mm256_setzero_ps();
+                    __m256 cnt1 = _mm256_setzero_ps();
                     bool dead0 = false, dead1 = false;
                     for (int k = 0; k < n; k++)
                     {
@@ -1018,15 +1044,23 @@ namespace
                         {
                             __m256 a0 = _mm256_cvtph_ps(_mm256_castsi256_si128(ha));
                             __m256 b0 = _mm256_cvtph_ps(_mm256_castsi256_si128(hb));
-                            sum0 = _mm256_add_ps(sum0, _mm256_add_ps(_mm256_mul_ps(na, a0),
-                                                                     _mm256_mul_ps(nb, b0)));
+                            __m256 d0 = _mm256_add_ps(_mm256_mul_ps(na, a0), _mm256_mul_ps(nb, b0));
+                            __m256 m0 = _mm256_cmp_ps(
+                                _mm256_add_ps(_mm256_mul_ps(a0, a0), _mm256_mul_ps(b0, b0)),
+                                vW02, _CMP_GE_OQ);                 // all-ones where strong
+                            sum0 = _mm256_add_ps(sum0, _mm256_and_ps(d0, m0));
+                            cnt0 = _mm256_add_ps(cnt0, _mm256_and_ps(vOne, m0));
                         }
                         if (!dead1)
                         {
                             __m256 a1 = _mm256_cvtph_ps(_mm256_extracti128_si256(ha, 1));
                             __m256 b1 = _mm256_cvtph_ps(_mm256_extracti128_si256(hb, 1));
-                            sum1 = _mm256_add_ps(sum1, _mm256_add_ps(_mm256_mul_ps(na, a1),
-                                                                     _mm256_mul_ps(nb, b1)));
+                            __m256 d1 = _mm256_add_ps(_mm256_mul_ps(na, a1), _mm256_mul_ps(nb, b1));
+                            __m256 m1 = _mm256_cmp_ps(
+                                _mm256_add_ps(_mm256_mul_ps(a1, a1), _mm256_mul_ps(b1, b1)),
+                                vW02, _CMP_GE_OQ);
+                            sum1 = _mm256_add_ps(sum1, _mm256_and_ps(d1, m1));
+                            cnt1 = _mm256_add_ps(cnt1, _mm256_and_ps(vOne, m1));
                         }
                         int m = k + 1;
                         if (((m & 7) == 0) || m == n)
@@ -1043,16 +1077,23 @@ namespace
                                 break;
                         }
                     }
+                    // mean over the kept points; below minKept the position is
+                    // not believable -> dead
+                    __m256 ok0 = _mm256_cmp_ps(cnt0, vMinK, _CMP_GE_OQ);
+                    __m256 sc0 = _mm256_div_ps(sum0, cnt0);
                     _mm256_storeu_ps(orow + x - R,
-                                     dead0 ? vDead : _mm256_mul_ps(sum0, vInvN));
+                                     dead0 ? vDead : _mm256_blendv_ps(vDead, sc0, ok0));
+                    __m256 ok1 = _mm256_cmp_ps(cnt1, vMinK, _CMP_GE_OQ);
+                    __m256 sc1 = _mm256_div_ps(sum1, cnt1);
                     _mm256_storeu_ps(orow + x - R + 8,
-                                     dead1 ? vDead : _mm256_mul_ps(sum1, vInvN));
+                                     dead1 ? vDead : _mm256_blendv_ps(vDead, sc1, ok1));
                 }
                 // eight neighbouring positions share the same offsets, so the
                 // eight source values are consecutive in memory -> one load
                 for (; x + 8 <= xEnd; x += 8)
                 {
                     __m256 sum = _mm256_setzero_ps();
+                    __m256 cnt = _mm256_setzero_ps();
                     bool dead = false;
                     for (int k = 0; k < n; k++)
                     {
@@ -1063,8 +1104,14 @@ namespace
                         // 8 halves = 128 bit -> 8 floats
                         __m256 a = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)pA));
                         __m256 b = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)pB));
-                        sum = _mm256_add_ps(sum, _mm256_add_ps(_mm256_mul_ps(_mm256_set1_ps(pnx[k]), a),
-                                                              _mm256_mul_ps(_mm256_set1_ps(pny[k]), b)));
+                        __m256 d8 = _mm256_add_ps(
+                            _mm256_mul_ps(_mm256_set1_ps(pnx[k]), a),
+                            _mm256_mul_ps(_mm256_set1_ps(pny[k]), b));
+                        __m256 mk8 = _mm256_cmp_ps(
+                            _mm256_add_ps(_mm256_mul_ps(a, a), _mm256_mul_ps(b, b)),
+                            vW02, _CMP_GE_OQ);
+                        sum = _mm256_add_ps(sum, _mm256_and_ps(d8, mk8));
+                        cnt = _mm256_add_ps(cnt, _mm256_and_ps(vOne, mk8));
                         int m = k + 1;
                         if (((m & 7) == 0) || m == n)
                         {
@@ -1081,16 +1128,26 @@ namespace
                     if (dead)
                         _mm256_storeu_ps(orow + x - R, vDead);
                     else
-                        _mm256_storeu_ps(orow + x - R, _mm256_mul_ps(sum, vInvN));
+                    {
+                        __m256 ok8 = _mm256_cmp_ps(cnt, vMinK, _CMP_GE_OQ);
+                        _mm256_storeu_ps(orow + x - R,
+                                         _mm256_blendv_ps(vDead,
+                                                          _mm256_div_ps(sum, cnt), ok8));
+                    }
                 }
 #endif
 #if SM_USE_SSE2
                 // four neighbouring positions share the same offsets, so the
                 // four source values are consecutive in memory -> one vector load
                 const __m128 vInvN128 = _mm_set1_ps(invN);
+                const __m128 vOne128  = _mm_set1_ps(1.f);
+                const __m128 vW02128  = _mm_set1_ps(w0 * w0);
+                const __m128 vMinK128 = _mm_set1_ps((float)minKept);
+                const __m128 vDead128 = _mm_set1_ps(-1.f);
                 for (; x + 4 <= xEnd; x += 4)
                 {
                     __m128 sum = _mm_setzero_ps();
+                    __m128 cnt = _mm_setzero_ps();
                     bool dead = false;
                     for (int k = 0; k < n; k++)
                     {
@@ -1101,8 +1158,12 @@ namespace
                         // 4 halves = 64 bit -> 4 floats
                         __m128 a = _mm_cvtph_ps(_mm_loadl_epi64((const __m128i*)(rx[ri] + ix)));
                         __m128 b = _mm_cvtph_ps(_mm_loadl_epi64((const __m128i*)(ry[ri] + ix)));
-                        sum = _mm_add_ps(sum, _mm_add_ps(_mm_mul_ps(_mm_set1_ps(pnx[k]), a),
-                                                         _mm_mul_ps(_mm_set1_ps(pny[k]), b)));
+                        __m128 d4 = _mm_add_ps(_mm_mul_ps(_mm_set1_ps(pnx[k]), a),
+                                               _mm_mul_ps(_mm_set1_ps(pny[k]), b));
+                        __m128 mk4 = _mm_cmpge_ps(
+                            _mm_add_ps(_mm_mul_ps(a, a), _mm_mul_ps(b, b)), vW02128);
+                        sum = _mm_add_ps(sum, _mm_and_ps(d4, mk4));
+                        cnt = _mm_add_ps(cnt, _mm_and_ps(vOne128, mk4));
                         int m = k + 1;
                         if (((m & 3) == 0) || m == n)
                         {
@@ -1118,22 +1179,35 @@ namespace
                     }
                     if (dead)
                     {
-                        __m128 v = _mm_set1_ps(-1.f);
-                        _mm_storeu_ps(orow + x - R, v);
+                        _mm_storeu_ps(orow + x - R, vDead128);
                     }
                     else
-                        _mm_storeu_ps(orow + x - R, _mm_mul_ps(sum, vInvN128));
+                    {
+                        // SSE2 has no blendv: or(and(score, ok), andnot(ok, dead))
+                        __m128 ok4 = _mm_cmpge_ps(cnt, vMinK128);
+                        __m128 sc4 = _mm_div_ps(sum, cnt);
+                        _mm_storeu_ps(orow + x - R,
+                                      _mm_or_ps(_mm_and_ps(sc4, ok4),
+                                                _mm_andnot_ps(ok4, vDead128)));
+                    }
                 }
 #endif
                 for (; x < xEnd; x++)
                 {
                     float sum = 0.f;
+                    int   cnt = 0;
                     bool dead = false;
                     for (int k = 0; k < n; k++)
                     {
                         int ix = x + pox[k];
                         int ri = poy[k] + R;
-                        sum += pnx[k] * f16ToF32(rx[ri][ix]) + pny[k] * f16ToF32(ry[ri][ix]);
+                        float ga = f16ToF32(rx[ri][ix]);
+                        float gb = f16ToF32(ry[ri][ix]);
+                        if (ga * ga + gb * gb >= w0 * w0)
+                        {
+                            sum += pnx[k] * ga + pny[k] * gb;
+                            cnt++;
+                        }
                         int m = k + 1;
                         if (((m & 3) == 0) || m == n)
                         {
@@ -1149,7 +1223,8 @@ namespace
                             }
                         }
                     }
-                    orow[x - R] = dead ? -1.f : sum * invN;
+                    orow[x - R] = (dead || cnt < minKept) ? -1.f
+                                                          : (cnt > 0 ? sum / cnt : -1.f);
                 }
             }
         }
@@ -1173,7 +1248,8 @@ void ShapeMatcher::correlateSparseX(int level, const XForm& xf, cv::Mat& scoreMa
     double g = std::min(std::max(greed, 0.0), 0.98);
     float slope = (float)((1.0 - g * target) / ((1.0 - g) * std::max(1, xf.n)));
 
-    ScanInvoker inv(srcGx_[level], srcGy_[level], xf, scoreMap, (float)target, slope);
+    ScanInvoker inv(srcGx_[level], srcGy_[level], xf, scoreMap, (float)target, slope,
+                    skipWeight_);
     // when we are already inside a parallel loop the rows must be scanned
     // serially: nested parallel_for_ corrupts the OpenCV thread pool
     double stripes = nested ? 1.0 : (double)std::max(1, scoreMap.rows / 4);
@@ -1212,7 +1288,8 @@ namespace
 
 
     inline float scorePos(const cv::Mat& sx, const cv::Mat& sy, const XForm& xf,
-                          int ay, int ax, float limit, int metric = POL_USE)
+                          int ay, int ax, float limit, int metric = POL_USE,
+                          float w0 = 0.f)
     {
         const int n = xf.n;
         const int16_t* pox = xf.ox.data();
@@ -1220,6 +1297,8 @@ namespace
         const float* pnx = xf.nx.data();
         const float* pny = xf.ny.data();
         float sum = 0.f;
+        int   cnt = 0;
+        const int minKept = std::max(8, n / 4);
         const float lim = limit * n;
         for (int k = 0; k < n; k++)
         {
@@ -1227,9 +1306,21 @@ namespace
             int xx = ax + pox[k];
             const uint16_t* rx = sx.ptr<uint16_t>(yy);
             const uint16_t* ry = sy.ptr<uint16_t>(yy);
-            float d = pnx[k] * f16ToF32(rx[xx]) + pny[k] * f16ToF32(ry[xx]);
+            float ga = f16ToF32(rx[xx]);
+            float gb = f16ToF32(ry[xx]);
+            if (w0 > 0.f)
+            {
+                // skipWeight: the sampled vector length IS the soft weight
+                // (w = min(|grad|/minContrast,1)); points below w0 match
+                // Halcon's "gradient magnitude below MinContrast is not
+                // scored" and are excluded from the mean.
+                if (ga * ga + gb * gb < w0 * w0) continue;
+            }
+            float d = pnx[k] * ga + pny[k] * gb;
             if (metric == POL_LOCAL) d = std::fabs(d);
             sum += d;
+            cnt++;
+
             if (limit > -9.f && k > (n >> 2))
             {
                 // Every term is at most 1 in magnitude, so either
@@ -1244,6 +1335,11 @@ namespace
             }
         }
         if (metric == POL_GLOBAL) sum = std::fabs(sum);
+        if (w0 > 0.f)
+        {
+            if (cnt < minKept) return -1.f;       // not enough usable gradient
+            return sum / cnt;                     // mean over the kept points
+        }
         return sum / n;
     }
 
@@ -1254,19 +1350,30 @@ namespace
     // surviving candidates and a partial-sum bound is not valid once sampling
     // is interpolated.  Borders are handled inside sampleF16Bilinear.
     inline float scorePosSubpix(const cv::Mat& sx, const cv::Mat& sy, const XForm& xf,
-                                 float ay, float ax, int metric = POL_USE)
+                                 float ay, float ax, int metric = POL_USE,
+                                 float w0 = 0.f)
     {
         const int n = xf.n;
         float sum = 0.f;
+        int   cnt = 0;
+        const int minKept = std::max(8, n / 4);
         for (int k = 0; k < n; k++)
         {
             const float gx = sampleF16Bilinear(sx, ay + xf.fy[k], ax + xf.fx[k]);
             const float gy = sampleF16Bilinear(sy, ay + xf.fy[k], ax + xf.fx[k]);
+            if (w0 > 0.f)
+            {
+                const float len2 = gx * gx + gy * gy;   // = w^2
+                if (len2 < w0 * w0) continue;
+            }
             float d = xf.nx[k] * gx + xf.ny[k] * gy;
             if (metric == POL_LOCAL) d = std::fabs(d);
             sum += d;
+            cnt++;
         }
         if (metric == POL_GLOBAL) sum = std::fabs(sum);
+        if (w0 > 0.f && cnt < minKept) return -1.f;
+        if (w0 > 0.f) return cnt > 0 ? sum / cnt : 0.f;
         return n > 0 ? sum / n : 0.f;
     }
 
@@ -1360,7 +1467,8 @@ namespace
     struct PoseScore { float mean, clipped, coverage; };
 
     inline PoseScore scorePoseDetail(const cv::Mat& sx, const cv::Mat& sy, const XForm& xf,
-                                     int ay, int ax, int metric = POL_USE)
+                                     int ay, int ax, int metric = POL_USE,
+                                     float w0 = 0.f)
     {
         const int n = xf.n;
         std::vector<float> dots;
@@ -1380,31 +1488,67 @@ namespace
         // metric 2 uses |dot| for the score but keeps the signed dots for the
         // coverage, because "which points disagree" is still the useful signal.
         const bool flip = (metric == POL_GLOBAL && total < 0.0);
-        double sum = 0.0, posSum = 0.0;
-        int    cnt = 0;
-        for (int k = 0; k < n; k++)
-        {
-            float d = dots[(size_t)k];
-            if (flip) d = -d;
-            sum += d;
-            if (d > 0.f) { posSum += d; cnt++; }
-        }
 
-        PoseScore ps;
-        const float inv = n > 0 ? 1.f / (float)n : 0.f;
-        if (metric == POL_LOCAL)
+        // skipWeight（对齐 Halcon）：先按"图像侧软权重"筛掉弱幅值点，
+        // mean/clipped/coverage 全部只对保留点计算，分母 = 保留点数。
+        // w0 <= 0 时保持旧语义（全部点、n 作分母）。
+        std::vector<float> use;
+        use.reserve((size_t)n);
+        if (w0 > 0.f)
         {
-            double a = 0;
-            for (int k = 0; k < n; k++) a += std::fabs(dots[(size_t)k]);
-            ps.mean    = (float)a * inv;
-            ps.clipped = (float)a * inv;
+            const int minKept = std::max(8, n / 4);
+            for (int k = 0; k < n; k++)
+            {
+                const float gx = sampleF16Bilinear(sx, (float)ay + xf.fy[k], (float)ax + xf.fx[k]);
+                const float gy = sampleF16Bilinear(sy, (float)ay + xf.fy[k], (float)ax + xf.fx[k]);
+                if (gx * gx + gy * gy < w0 * w0) continue;    // weak: not scored
+                float d = dots[(size_t)k];
+                if (flip) d = -d;
+                use.push_back(d);
+            }
+            if ((int)use.size() < minKept)
+            {
+                PoseScore bad;
+                bad.mean = bad.clipped = -1.f;
+                bad.coverage = (float)use.size() / (float)n;
+                return bad;
+            }
         }
         else
         {
+            for (int k = 0; k < n; k++)
+            {
+                float d = dots[(size_t)k];
+                if (flip) d = -d;
+                use.push_back(d);
+            }
+        }
+
+        const int nk = (int)use.size();
+        const float inv = nk > 0 ? 1.f / (float)nk : 0.f;
+        PoseScore ps;
+        if (metric == POL_LOCAL)
+        {
+            double a = 0;
+            for (int k = 0; k < nk; k++) a += std::fabs(use[(size_t)k]);
+            ps.mean    = (float)a * inv;
+            ps.clipped = (float)a * inv;
+            ps.coverage = 1.f;
+        }
+        else
+        {
+            double sum = 0.0, posSum = 0.0;
+            int    cnt = 0;
+            for (int k = 0; k < nk; k++)
+            {
+                const float d = use[(size_t)k];
+                sum += d;
+                if (d > 0.f) { posSum += d; cnt++; }
+            }
             ps.mean    = (float)sum * inv;
             ps.clipped = (float)posSum * inv;
+            ps.coverage = (float)cnt / (float)nk;    // share of kept points that agree
         }
-        ps.coverage = (float)cnt * inv;
         return ps;
     }
 }
@@ -1551,7 +1695,8 @@ void ShapeMatcher::refineLevel(int level, std::vector<Candidate>& cands,
                             by = std::min(std::max(by, xf.R), srcGx_[level].rows - 1 - xf.R);
                             float v = (bx < xf.R || by < xf.R)
                                           ? -2.f
-                                          : scorePos(srcGx_[level], srcGy_[level], xf, by, bx, limit, metric);
+                                          : scorePos(srcGx_[level], srcGy_[level], xf, by, bx, limit, metric,
+                                                     skipWeight_);
                             scoreBuf[(((size_t)i * ns + j) * W + (dy + win)) * W + (dx + win)] = v;
                             if (v > best.score)
                             {
@@ -1651,7 +1796,7 @@ void ShapeMatcher::subpixelRefine(int level, Candidate& c, int mode, int metric)
     auto eval = [&](const XForm& xf, int cy, int cx) -> float
     {
         return scorePosSubpix(srcGx_[level], srcGy_[level], xf,
-                              (float)cy, (float)cx, metric);
+                              (float)cy, (float)cx, metric, skipWeight_);
     };
 
     float s0 = eval(xf0, ay, ax);
@@ -1775,6 +1920,7 @@ void ShapeMatcher::scanLocalPolarity(int level, const XForm& xf, cv::Mat& scoreM
 
     auto scanRows = [&](int y0, int y1)
     {
+        const int minKept = std::max(8, n / 4);
         for (int y = y0; y < y1; y++)
         {
             float* orow = scoreMap.ptr<float>(y);
@@ -1783,15 +1929,21 @@ void ShapeMatcher::scanLocalPolarity(int level, const XForm& xf, cv::Mat& scoreM
             {
                 const int xBase = x + R;
                 float sum = 0.f;
+                int   cnt = 0;
                 bool dead = false;
                 for (int k = 0; k < n; k++)
                 {
                     const uint16_t* rx = gx.ptr<uint16_t>(yBase + poy[k]);
                     const uint16_t* ry = gy.ptr<uint16_t>(yBase + poy[k]);
                     const int ix = xBase + pox[k];
-                    const float d = pnx[k] * f16ToF32(rx[ix]) +
-                                    pny[k] * f16ToF32(ry[ix]);
+                    const float ga = f16ToF32(rx[ix]);
+                    const float gb = f16ToF32(ry[ix]);
+                    if (skipWeight_ > 0.f &&
+                        ga * ga + gb * gb < skipWeight_ * skipWeight_)
+                        continue;                       // weak gradient: skip
+                    const float d = pnx[k] * ga + pny[k] * gb;
                     sum += std::fabs(d);
+                    cnt++;
                     const int m = k + 1;
                     if (((m & 7) == 0) || m == n)
                     {
@@ -1801,7 +1953,8 @@ void ShapeMatcher::scanLocalPolarity(int level, const XForm& xf, cv::Mat& scoreM
                         if (sum + (float)(n - m) < lim) { dead = true; break; }
                     }
                 }
-                orow[x] = dead ? -1.f : sum * invN;
+                orow[x] = (dead || cnt < minKept) ? -1.f
+                                                  : (cnt > 0 ? sum / cnt : -1.f);
             }
         }
     };
@@ -1954,7 +2107,7 @@ void ShapeMatcher::leastSquaresRefine(int level, Candidate& c, int metric)
         {
             const int px = std::min(std::max(ax + dx, lo), hiX);
             const int py = std::min(std::max(ay + dy, lo), hiY);
-            s[ns] = scorePos(gx, gy, *pxf, py, px, -10.f, metric);
+            s[ns] = scorePos(gx, gy, *pxf, py, px, -10.f, metric, skipWeight_);
             sx[ns] = (double)(px - ax);
             sy[ns] = (double)(py - ay);
             ns++;
@@ -1989,7 +2142,7 @@ void ShapeMatcher::leastSquaresRefine(int level, Candidate& c, int metric)
     const double atPeak = scorePos(gx, gy, *pxf,
                                    std::min(std::max(cvRound(ay + dy), lo), hiY),
                                    std::min(std::max(cvRound(ax + dx), lo), hiX),
-                                   -10.f, metric);
+                                   -10.f, metric, skipWeight_);
     if (atPeak < -0.5f) return;
 
     c.pos = cv::Point2f((float)(ax + dx), (float)(ay + dy));
@@ -2337,6 +2490,10 @@ std::vector<MatchResult> ShapeMatcher::findShapeModel(const cv::Mat& gray, const
     const int nLevels = (int)modelLevels_.size();
     useOCL_ = fp.useOpenCL && oclUsable();
 
+    // skipWeight（对齐 Halcon 的"弱梯度点不评分"语义）：本次调用的全部评分
+    // 路径（SIMD 扫描/单点评分/亚像素/最终复评）都会读它。0 = 关闭。
+    skipWeight_ = std::min(1.f, std::max(0.f, fp.skipWeight));
+
     int64 t0 = cv::getTickCount();
     prepareSource(g8, nLevels, useOCL_);
     int64 t1 = cv::getTickCount();
@@ -2379,6 +2536,49 @@ std::vector<MatchResult> ShapeMatcher::findShapeModel(const cv::Mat& gray, const
             for (int ai = 0; ai < nA; ai += strideA)
                 poses.emplace_back(ai, si);
 
+        // 诊断探针（仅环境变量 SM_PROBE=1 时生效）：按角度打印粗层分数图的峰值
+        // 及其位置，用来判断"正确的（大角度）位姿在粗层是否拿到了足够分数"。
+        // 额外支持 SM_PROBE_X/SM_PROBE_Y（全分辨率坐标）：把该点在各角度下的
+        // 粗层得分一起打印出来，这是定位"真实位姿在粗层就低分"的关键数据。
+        // 正常运行时只多一次 getenv，对结果与耗时无影响。
+        const bool probeCoarse = (std::getenv("SM_PROBE") != nullptr);
+        bool probeHasPt = false;
+        double probePx = 0.0, probePy = 0.0;
+        double probeAng = 1e9;              // SM_PROBE_A: 真值角度(度)，可选
+        if (probeCoarse)
+        {
+            const char* sx = std::getenv("SM_PROBE_X");
+            const char* sy = std::getenv("SM_PROBE_Y");
+            if (sx && sy)
+            {
+                probePx = std::atof(sx);
+                probePy = std::atof(sy);
+                probeHasPt = true;
+            }
+            const char* sa = std::getenv("SM_PROBE_A");
+            if (sa) probeAng = std::atof(sa);
+        }
+        auto probeMap = [&](const cv::Mat& m, int ai, int R, int stride)
+        {
+            double pmn = 0, pmx = 0;
+            cv::Point pmnl, pmxl;
+            cv::minMaxLoc(m, &pmn, &pmx, &pmnl, &pmxl);
+            std::cout << "  [probe] ang=" << angleGrid_[ai] * 180.0 / CV_PI
+                      << " peak=" << pmx
+                      << " at=(" << (pmxl.x + R) << "," << (pmxl.y + R) << ")";
+            if (probeHasPt)
+            {
+                const int px = (int)std::lround(probePx / stride) - R;
+                const int py = (int)std::lround(probePy / stride) - R;
+                float pv = -2.f;
+                if (px >= 0 && py >= 0 && px < m.cols && py < m.rows)
+                    pv = m.at<float>(py, px);
+                std::cout << " val=" << pv;
+            }
+            std::cout << "\n";
+        };
+
+
         if (useOCL_)
         {
             // the dense path may build a correlation kernel inside the cache,
@@ -2392,7 +2592,7 @@ std::vector<MatchResult> ShapeMatcher::findShapeModel(const cv::Mat& gray, const
                 // the dense path builds a correlation kernel, which cannot
                 // express |dot|; any polarity other than use_polarity therefore
                 // goes through the sparse scan
-                if (fp.metric == 0 && K * K <= 6 * std::max(1, xf.n))
+                if (fp.metric == 0 && skipWeight_ <= 0.f && K * K <= 6 * std::max(1, xf.n))
                 {
                     correlate(top, ai, si, map, R);
                     nDense++;
@@ -2405,6 +2605,7 @@ std::vector<MatchResult> ShapeMatcher::findShapeModel(const cv::Mat& gray, const
                     cv::minMaxLoc(map, &mn, &mx);
                     if (mx > maxMap) maxMap = mx;
                 }
+                if (probeCoarse) probeMap(map, ai, R, strideA);
                 int64 te0 = cv::getTickCount();
                 extractCandidates(map, top, ai, si, R, topTarget, all, 64, 2);
                 phExtract += msSince(te0);
@@ -2450,6 +2651,11 @@ std::vector<MatchResult> ShapeMatcher::findShapeModel(const cv::Mat& gray, const
                             minMaxSerial(lmap, mn, mx);
                             if (mx > localMax) localMax = mx;
                         }
+                        if (probeCoarse)
+                        {
+                            cv::AutoLock plock(mtx);
+                            probeMap(lmap, ai, R, strideA);
+                        }
                         int64 te0 = cv::getTickCount();
                         extractCandidates(lmap, top, ai, si, R, topTarget, local, 64, 2);
                         exMs += msSince(te0);
@@ -2473,13 +2679,17 @@ std::vector<MatchResult> ShapeMatcher::findShapeModel(const cv::Mat& gray, const
         std::sort(all.begin(), all.end(),
                   [](const Candidate& a, const Candidate& b) { return a.score > b.score; });
         int keep = std::max(fp.maxMatches * 4, 40);
-        for (size_t i = 0; i < all.size() && (int)cands.size() < keep; i++)
+
+        // 先做一次全局去重（位置/角度/尺度近似的只留最高分），得到干净的候选池。
+        std::vector<Candidate> uniq;
+        uniq.reserve(all.size());
+        for (size_t i = 0; i < all.size(); i++)
         {
             const Candidate& c = all[i];
             bool dup = false;
-            for (size_t j = 0; j < cands.size(); j++)
+            for (size_t j = 0; j < uniq.size(); j++)
             {
-                const Candidate& o = cands[j];
+                const Candidate& o = uniq[j];
                 if (std::abs(c.pos.x - o.pos.x) <= 3.f && std::abs(c.pos.y - o.pos.y) <= 3.f &&
                     angleDiffWrapped(c.angle, o.angle) <= 1e-4f + (float)levelAngleStep_[top] &&
                     std::abs(c.scale - o.scale) <= 1e-4f + (float)levelScaleStep_[top] * 0.5f)
@@ -2487,8 +2697,41 @@ std::vector<MatchResult> ShapeMatcher::findShapeModel(const cv::Mat& gray, const
                     dup = true; break;
                 }
             }
-            if (!dup) cands.push_back(c);
+            if (!dup) uniq.push_back(c);
         }
+
+        // 候选池按"全局分数"截断。
+        // 说明：一度考虑过给候选加"角度桶多样性配额"（担心高对称目标在错误朝向上
+        // 拿到更高粗层分、把真实大角度位姿挤出池子）。2026-11-14 在 data2 实测否定了
+        // 这个假设：用一个按真实朝向对齐的模板另建模型，正确位姿的最终得分也只有
+        // 0.29~0.36（Halcon 0.57~0.68），说明"漏检"的根因是模板与目标实例的外观差异
+        // （模板单孔、目标双孔），不是候选排序。因此保留最简单的全局截断，零回归。
+        if (probeHasPt)
+        {
+            // 诊断：列出与真值位置/朝向相关的候选在 uniq 里的排名，用来确认
+            // "正确位姿是否在全局截断之前就已经排在 keep 之外"。
+            const int lx = (int)std::lround(probePx / strideA);
+            const int ly = (int)std::lround(probePy / strideA);
+            int shown = 0;
+            std::cout << "  [dbg] uniq total=" << uniq.size() << " keep=" << keep
+                      << " probeLevelPos=(" << lx << "," << ly << ")\n";
+            for (size_t i = 0; i < uniq.size() && shown < 24; i++)
+            {
+                const Candidate& c = uniq[i];
+                const bool nearPos = std::abs(c.pos.x - lx) <= 3 && std::abs(c.pos.y - ly) <= 3;
+                const bool nearAng = std::abs(probeAng - c.angle * 180.0 / CV_PI) <= 10.0;
+                if (!nearPos && !nearAng) continue;
+                std::cout << "  [dbg] uniq#" << i << " score=" << c.score
+                          << " ang=" << c.angle * 180.0 / CV_PI
+                          << " pos=(" << (int)(c.pos.x * strideA) << ","
+                          << (int)(c.pos.y * strideA) << ")"
+                          << (nearPos ? " <near-truth-pos>" : "") << "\n";
+                shown++;
+            }
+        }
+        // 全局按分截断（与旧版行为一致）
+        for (size_t i = 0; i < uniq.size() && (int)cands.size() < keep; i++)
+            cands.push_back(uniq[i]);
     }
     phTop = msSince(tTop0);
 
@@ -2606,7 +2849,8 @@ std::vector<MatchResult> ShapeMatcher::findShapeModel(const cv::Mat& gray, const
             ax = std::min(std::max(ax, xf.R), srcGx_[0].cols - 1 - xf.R);
             ay = std::min(std::max(ay, xf.R), srcGx_[0].rows - 1 - xf.R);
 
-            const PoseScore ps = scorePoseDetail(srcGx_[0], srcGy_[0], xf, ay, ax, fp.metric);
+            const PoseScore ps = scorePoseDetail(srcGx_[0], srcGy_[0], xf, ay, ax, fp.metric,
+                                                 skipWeight_);
             r.coverage = ps.coverage;
             if (fp.scoreMode == 2)          // trimmed-mean needs the sorted dots
                 r.score = scorePosMode(srcGx_[0], srcGy_[0], xf, ay, ax, 2, fp.metric);
@@ -2654,6 +2898,66 @@ std::vector<MatchResult> ShapeMatcher::findShapeModel(const cv::Mat& gray, const
                   << " keep=" << cands.size() << "\n";
     }
 
+    //---- per-point dot histogram at the top-1 pose (diagnostics) ----------
+    // Set SM_DUMP_COS=1 to print, for result #0, the distribution of the
+    // per-model-point gradient-direction dot products at the reported pose.
+    // This shows whether a low mean score comes from (a) a subset of flipped/
+    // noisy points (bimodal histogram) or (b) a systematic direction offset
+    // (single broad peak) - which call for very different fixes.
+    if (results.empty() == false && std::getenv("SM_DUMP_COS") != nullptr)
+    {
+        const MatchResult& r0 = results.front();
+        int ai = 0, si = 0;
+        double best = 1e9;
+        for (int i = 0; i < (int)angleGrid_.size(); i++)
+        {
+            double d = std::abs(angleGrid_[i] - (double)r0.angle);
+            if (d < best) { best = d; ai = i; }
+        }
+        best = 1e9;
+        for (int i = 0; i < (int)scaleGrid_.size(); i++)
+        {
+            double d = std::abs(scaleGrid_[i] - (double)r0.scale);
+            if (d < best) { best = d; si = i; }
+        }
+        const XForm& xf = getXForm(0, ai, si);
+        int ax = cvRound(r0.pos.x), ay = cvRound(r0.pos.y);
+        ax = std::min(std::max(ax, xf.R), srcGx_[0].cols - 1 - xf.R);
+        ay = std::min(std::max(ay, xf.R), srcGx_[0].rows - 1 - xf.R);
+
+        std::vector<float> dots((size_t)xf.n);
+        for (int k = 0; k < xf.n; k++)
+        {
+            const float gx = sampleF16Bilinear(srcGx_[0], (float)ay + xf.fy[k], (float)ax + xf.fx[k]);
+            const float gy = sampleF16Bilinear(srcGy_[0], (float)ay + xf.fy[k], (float)ax + xf.fx[k]);
+            dots[(size_t)k] = xf.nx[k] * gx + xf.ny[k] * gy;
+        }
+        std::sort(dots.begin(), dots.end());
+        // 12 buckets over [-1, 1]
+        int hist[12] = { 0 };
+        int neg = 0;
+        for (int k = 0; k < xf.n; k++)
+        {
+            float d = dots[(size_t)k];
+            if (d < 0.f) neg++;
+            int b = (int)std::floor((d + 1.f) * 6.f);
+            b = std::min(11, std::max(0, b));
+            hist[b]++;
+        }
+        auto q = [&](float p)
+        {
+            int idx = std::min(xf.n - 1, std::max(0, (int)std::lround(p * (xf.n - 1))));
+            return dots[(size_t)idx];
+        };
+        std::cout << "  [cosdump] n=" << xf.n
+                  << " p5=" << q(0.05f) << " p25=" << q(0.25f)
+                  << " p50=" << q(0.50f) << " p75=" << q(0.75f)
+                  << " p95=" << q(0.95f) << " negShare=" << (float)neg / xf.n << "\n";
+        std::cout << "  [cosdump] hist (0=-1.0 .. 11=+1.0): ";
+        for (int b = 0; b < 12; b++) std::cout << hist[b] << " ";
+        std::cout << "\n";
+    }
+
     int64 t2 = cv::getTickCount();
     lastSearchTime_ = (double)(t2 - t1) * 1000.0 / cv::getTickFrequency();
     return results;
@@ -2692,7 +2996,7 @@ double ShapeMatcher::probe(const cv::Mat& gray, cv::Point2f pos, double angle, d
     int ax = cvRound(pos.x), ay = cvRound(pos.y);
     ax = std::min(std::max(ax, xf.R), srcGx_[0].cols - 1 - xf.R);
     ay = std::min(std::max(ay, xf.R), srcGx_[0].rows - 1 - xf.R);
-    return scorePos(srcGx_[0], srcGy_[0], xf, ay, ax, -10.f);
+    return scorePos(srcGx_[0], srcGy_[0], xf, ay, ax, -10.f, POL_USE, skipWeight_);
 }
 
 //=======================================================================

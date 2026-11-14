@@ -893,6 +893,56 @@ powershell -ExecutionPolicy Bypass -File tools\compare-test2-four.ps1 -Days 2024
 powershell -ExecutionPolicy Bypass -File tools\analyze-test2-four.ps1
 ```
 
+## 十六、2026-11-14：Shape 分数差距的根因修复（skipWeight，对齐 Halcon）
+
+> 十五节与 data1/data2 报告共同暴露的"Shape 分数系统性低于 Halcon"已定位到**实现
+> 语义差异**并修复。本节汇总证据链与修复效果；完整对照数据在
+> `docs/data1-data2四器对比报告.md` 第九节。
+
+### 16.1 证据链（三步定位）
+
+1. **合成贴回**（模板原样贴回灰图）：ours 0.983 / Halcon 0.9935 —— 评分公式等价；
+2. **衰减对比**：真实图上 Halcon 只掉 0.036，我们掉 0.364 —— 敏感度差 10 倍；
+3. **逐点 cos 直方图**（`SM_DUMP_COS=1`）：模糊帧呈**双峰**——62.5% 的点 ≈0.97+、
+   **22.8% 塌到 0~0.17**、9.2% 为负。
+
+### 16.2 根因
+
+归一化平面按 `w = min(|grad|/minContrast, 1)` 压缩弱梯度点，dot 被等比衰减**后**仍计入
+mean；Halcon 的语义是这些点**不参加评分**（分母同步缩小）。模糊帧上约 1/3 的点
+w≈0.1，_mean 被 0.3 拉低_，而 Halcon 报"强点均值 0.96"。
+
+### 16.3 修复与实测
+
+`FindParams::skipWeight`（默认 0.9；`Config::skipWeight` 同步；CLI `-skip-w`）：
+全部评分路径（SIMD 扫描 / scorePos / 亚像素 / rescore / metric=2 扫描）跳过
+`w < skipWeight` 的点并对有效点数取均值；有效点 < max(8, n/4) 的位置判 −1。
+
+| 数据 | 指标 | 修复前 | 修复后 | Halcon |
+|---|---|---|---|---|
+| data1（117） | top-1 mean / min | 0.617 / 0.505 | **0.873 / 0.680** | 0.947 / 0.622 |
+| data1（117） | 同实例 corr | 0.568 | **0.808** | — |
+| data2 0°（18） | 检出 / mean | 5 / 0.911 | **18 / 0.707** | 18 / 0.739 |
+| data2 −90°（18） | 检出 / mean | **0 / —** | **17 / 0.614** | 11 / 0.619 |
+| 负样本（36） | max 分数 | 0.444 | **0.403** | — |
+| 速度 data1 | mean | 28.9 ms | 32.4 ms（+12%） | 4.6 ms |
+| 确定性 | 3 次逐位一致 | ✓ | **✓** | — |
+
+- 检出率/分数都**反超或持平 Halcon** 的一大截（尤其 −90° 簇 17/18 vs 11/18）；
+- 负样本 max 0.403 —— 常用阈值 0.5 以下，无误报风险；
+- 之前第七节"data2 −90° 漏检是模板实例外观差异、无解"的判断**被推翻**：
+  外观差异点原本被软权重过度惩罚，skip 语义下这些图仍以 0.53~0.69 检出。
+
+### 16.4 结论（Shape 现状）
+
+1. **定位/角度**：p50 0.72 px、0.11~0.19°（历史 667 张 + test2 + data1 一致）——已对标。
+2. **分数**：修复后与 Halcon 差 0.05~0.07（data1）、0.03~0.13（data2 分簇），
+   **可直接共用 Halcon 口径的 minScore 阈值**。
+3. **召回**：data1 117/117、data2 35/36（Halcon 29/36）—— 修复后**反超**。
+4. **速度**：仍慢约 3~6×（架构 + 点数差异，`-skip-w` 增加 12%）—— 独立优化项，
+   与本修复解耦。
+
+
 > 采样约定：每天 `Get-ChildItem | Sort-Object Name | Select-Object -First N`，合计 200 张。
 > CSV 默认写 `_ai_tmp\cmp200.csv`（`_ai_tmp` 已 gitignore）。
 > 复现前需自备 `dataset/test2/imgLog`（被 gitignore）与 `build/_diamond.shm|ncm`，

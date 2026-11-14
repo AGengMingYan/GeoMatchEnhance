@@ -119,6 +119,7 @@ namespace
         cfg.contrast    = gArgD(a, "-hi", 30.0);
         cfg.maxPoints   = (int)gArgD(a, "-points", 1200.0);
         cfg.minChainLen = (int)gArgD(a, "-chain", 2.0);
+        if (gHas(a, "-levels")) cfg.numLevels = (int)gArgD(a, "-levels", 0);
         applyModelRange(cfg, a);
 
         const std::string maskFile = gArg(a, "-mask", "");
@@ -226,6 +227,8 @@ namespace
         cfg.debug      = (int)gArgD(a, "-debug", 0);
         cfg.scoreMode  = (int)gArgD(a, "-score-mode", 0);
         cfg.minCoverage = (float)gArgD(a, "-min-cover", 0.0);
+        // -skip-w 0 关闭"跳过弱梯度点"；默认 0.9（对齐 Halcon，见 FindParams::skipWeight）
+        cfg.skipWeight = (float)gArgD(a, "-skip-w", 0.9);
         // minDistance only when asked for, so the value stored in the model wins
         if (gHas(a, "-min-dist")) cfg.minDistance = gArgD(a, "-min-dist", cfg.minDistance);
         cfg.metric     = (int)gArgD(a, "-metric", 0);
