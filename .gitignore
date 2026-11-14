@@ -70,3 +70,8 @@ dataset/
 # 本机明文加密包约定扩展名（.zip/.7z 落盘即密文，详见 .clinerules）
 *.zip1
 *.7z1
+
+# 大数据样例集：case2/case3 体积大，改走网盘同步，不入库
+# （case1 已入库，约 5 MB，保留以便 clone 后立即可跑）
+case2/
+case3/
