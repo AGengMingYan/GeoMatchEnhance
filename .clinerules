@@ -1789,3 +1789,36 @@ GUI 在 `dataset/data1/scan_1783729947577` 上框 231×233 的 ROI 建 NCC 模�
 - 裁剪起点对齐到 32 的倍数后 6 层**仍然错**（0.770），所以这不是"金字塔相位不对齐"问题。
 - 角度范围收窄到 ±6° 也**仍然错到另一个位置**（0.785），所以也不是角度网格问题。
 
+
+---
+
+## 发布 1.1.2 实录（2026-11-15）：链路与 1.1.1 完全一致，本机仍无需代理
+
+```
+tools\build-x64.bat ; tools\build-x86.bat              # 版本号改完先编两套
+powershell -File tools\make-sdk.ps1 -Version 1.1.2 -SkipBuild
+powershell -File tools\make-release-zips.ps1 -Version 1.1.2
+git add -- GeoMatch/GeoMatch.h CMakeLists.txt
+git -c i18n.commitEncoding=utf-8 commit -F _ai_tmp\commit_112.txt
+git -c i18n.commitEncoding=utf-8 tag -a 1.1.2 -F _ai_tmp\tag_112.txt
+git push --dry-run origin master 1.1.2   # 先确认 fast-forward + new tag
+git push origin master 1.1.2
+powershell -File tools\publish-release.ps1 -Tag 1.1.2 -File release_GeoGUIDemo_x64\GeoGUIDemo-1.1.2-win64.zip1 -NoProxy
+（同一条命令再跑两次，分别上 SDK win64 / win32；发行版已存在会复用 id）
+```
+
+本次结果：tag `1.1.2`（tag 对象 `f717dc1` → commit `0ccc993`）、发行版 id **1310625**、
+三个附件 + Gitee 自动源码包；回读校验三个包 `size`/`SHA256` 与本地完全一致、`testzip()=None`。
+
+### 小坑：exe 里搜不到版本字符串是正常的
+
+`GEOMATCH_VERSION_STRING` 只被 `GeoMatch::versionString()` 返回，而 GUI/CLI 都没有调用它，
+所以链接器把该字符串丢了 —— `python -c "b'1.1.2' in open('build/GeoGUIDemo.exe','rb').read()"`
+返回 False **不代表版本没更新**。想确认版本看这两处：
+
+- `release_GeoGUIDemo_x64\sdk\GeoMatch-<ver>-win64\lib\cmake\GeoMatch\GeoMatchConfigVersion.cmake`
+  里的 `set(PACKAGE_VERSION "1.1.2")`；
+- 包内 `README.txt` / 发行版正文的版本号。
+
+（真想让 exe 显示版本，就在 GUI 启动日志里打一行 `versionString()`，否则不用查它。）
+

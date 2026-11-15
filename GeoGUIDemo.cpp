@@ -388,6 +388,20 @@ struct Thumb
 };
 
 //=======================================================================
+//  图像视图的缩放/平移状态
+//=======================================================================
+//  zoom = 1 表示"适应窗口"(fitSize 的基准缩放)，>1 放大、<1 缩小；
+//  pan  是屏幕像素偏移，放大后用来拖动查看别处，缩到适配尺寸以内时会被清零；
+//  fitScale 是"适应窗口"时每个图像像素对应的屏幕像素数(每帧由 drawImageView 更新)，
+//  用来把「1:1 显示」换算成 zoom = 1/fitScale。
+struct ViewNav
+{
+    float  zoom     = 1.0f;
+    ImVec2 pan      = ImVec2(0.f, 0.f);
+    float  fitScale = 1.0f;
+};
+
+//=======================================================================
 //  应用状态
 //=======================================================================
 struct App
@@ -439,7 +453,10 @@ struct App
     bool  showGradients  = false;       // 画梯度箭头(黄)
     bool  autoRun        = true;       // 参数改完自动重建模板 + 重匹配
     bool  liveUpdate     = true;       // 拖动滑块的过程中就实时刷新
-    float zoom           = 1.0f;       // 1 = 适应窗口
+    //---- 图像视图的缩放/平移状态(每个页签独立) ----
+    // 索引与 viewTab 一致: 0=匹配结果 1=目标图 2=模板源图 3=模板模型
+    // 分开存的原因：在「匹配结果」上放大检查某个框时，不该连带把「模板源图」也放大。
+    ViewNav nav[4];
     bool  roiDirty       = false;      // ROI 刚改完，需要重建模板
     double lastOpMs      = 0;          // 上一次"重建 + 匹配"的总耗时，用来自动降频
 
@@ -600,6 +617,18 @@ struct App
 };
 
 static App g_app;
+
+//-----------------------------------------------------------------------
+//  取某个图像页签的缩放/平移状态(越界回落到「匹配结果」)
+//  注意：drawImageView() 用传入的 tab 索引取状态，不要用 a.viewTab ——
+//  页签内容在本帧才执行，a.viewTab 是在那之后才赋值的，用它会错一帧
+//  （表现是切页签的瞬间缩放/平移跳到上一个页签的值）。
+//-----------------------------------------------------------------------
+static ViewNav& navOf(App& a, int tab)
+{
+    if (tab < 0 || tab > 3) tab = 0;
+    return a.nav[tab];
+}
 
 //=======================================================================
 //  模板掩码可视化: 把掩码排除区(mask==0)以暗红色叠加到模板源图上
@@ -1180,8 +1209,17 @@ static ImVec2 fitSize(int w, int h, const ImVec2& avail, float zoom)
 }
 
 // roiOwner: 0 = 不允许框选，1 = 目标图，2 = 模板源图
+// tabIdx:   这张图属于哪个页签(0=匹配结果 1=目标图 2=模板源图 3=模板模型)，
+//           用来取该页签自己的缩放/平移状态
 // maskPaint: 为 true 时在模板源图上支持涂抹掩码(左键=参与/右键=排除)
-static void drawImageView(const char* id, const char* info, Texture& tex, int roiOwner, bool maskPaint = false)
+//
+// 缩放/平移操作(都只在鼠标位于本视图区内时生效)：
+//   滚轮         = 以鼠标位置为锚点缩放(0.1x ~ 40x)
+//   中键拖动     = 平移(所有页签)
+//   左键拖动     = 平移(仅只读页签，例如「匹配结果」，因为它不需要框 ROI)
+//   双击左键     = 复位成「适应窗口」(只读页签；其它页签用 Shift+双击)
+static void drawImageView(const char* id, const char* info, Texture& tex, int roiOwner,
+                          int tabIdx, bool maskPaint = false)
 {
     App& a = g_app;
     if (!tex.valid())
@@ -1190,28 +1228,132 @@ static void drawImageView(const char* id, const char* info, Texture& tex, int ro
         return;
     }
 
+    ViewNav& nav = navOf(a, tabIdx);
+
     ImVec2 avail = ImGui::GetContentRegionAvail();
     avail.y -= ImGui::GetTextLineHeightWithSpacing() * 2.0f;
+    if (avail.x < 40.f) avail.x = 40.f;
     if (avail.y < 40.f) avail.y = 40.f;
-    ImVec2 disp = fitSize(tex.w, tex.h, avail, a.zoom);
 
-    const ImVec2 origin = ImGui::GetCursorScreenPos();
-    ImGui::Image(ImTextureRef((ImTextureID)(uintptr_t)tex.srv), disp);
+    const ImVec2 areaMin = ImGui::GetCursorScreenPos();
+    const ImVec2 areaMax(areaMin.x + avail.x, areaMin.y + avail.y);
 
-    // 透明按钮用来接鼠标，实现 ROI 框选
-    ImGui::SetCursorScreenPos(origin);
-    ImGui::InvisibleButton(id, disp);
+    // 透明按钮固定铺满整个视图区来接鼠标。
+    // （以前按钮正好压在图片上，因为图片按"适应窗口"画、永远不超出视图区；
+    //   现在放大后图片会超出视图区，用固定大小的按钮命中区域更明确，
+    //   也让"在图片外的空白处按住拖动平移"能正常工作。）
+    ImGui::InvisibleButton(id, avail,
+                           ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonMiddle);
+    const bool itemHovered = ImGui::IsItemHovered();
+    const bool itemActive  = ImGui::IsItemActive();
 
+    ImGuiIO& io = ImGui::GetIO();
+
+    // 适应窗口的基准尺寸(zoom=1)再乘用户缩放
+    const float fitScale = std::min(avail.x / (float)tex.w, avail.y / (float)tex.h);
+    nav.fitScale = fitScale;
+    ImVec2 disp = fitSize(tex.w, tex.h, avail, nav.zoom);
+    if (disp.x <= 1.f || disp.y <= 1.f) disp = avail;
+
+    // 图像左上角屏幕坐标：始终按"居中 + pan 偏移"算。
+    // 放大后 pan=0 看到的是图像中心，往哪拖就往哪看。
+    auto imgPosOf = [&](const ImVec2& d)
+    {
+        return ImVec2(areaMin.x + (avail.x - d.x) * 0.5f + nav.pan.x,
+                      areaMin.y + (avail.y - d.y) * 0.5f + nav.pan.y);
+    };
+    ImVec2 imgPos = imgPosOf(disp);
+
+    //---- 滚轮缩放：以鼠标下的图像点为锚点，缩放后它还在原位 ----
+    if (itemHovered && io.MouseWheel != 0.f)
+    {
+        const float oldZoom = nav.zoom;
+        const float z = clampf(oldZoom * powf(1.15f, io.MouseWheel), 0.1f, 40.f);
+        if (z != oldZoom)
+        {
+            const ImVec2 m = io.MousePos;
+            // 鼠标下的图像点(归一化 [0,1] 坐标)
+            const float u = (m.x - imgPos.x) / disp.x;
+            const float v = (m.y - imgPos.y) / disp.y;
+            const ImVec2 nd = fitSize(tex.w, tex.h, avail, z);
+            nav.zoom = z;
+            nav.pan = ImVec2(m.x - u * nd.x - areaMin.x - (avail.x - nd.x) * 0.5f,
+                             m.y - v * nd.y - areaMin.y - (avail.y - nd.y) * 0.5f);
+            disp   = nd;
+            imgPos = imgPosOf(disp);
+        }
+    }
+
+    //---- 拖动平移 ----
+    // 「匹配结果」是只读页签，左键直接拖动；可框选 ROI 的页签用中键，
+    // 否则会和"按住左键拖 ROI"打架。
+    bool panDrag = false;
+    if (itemActive)
+    {
+        if (ImGui::IsMouseDragging(ImGuiMouseButton_Middle))          panDrag = true;
+        else if (roiOwner == 0 && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) panDrag = true;
+    }
+    if (panDrag)
+    {
+        nav.pan.x += io.MouseDelta.x;
+        nav.pan.y += io.MouseDelta.y;
+    }
+
+    // 限制平移范围：放大时最多把图像边缘拖到视图边上，不会拖出视野外
+    {
+        const float maxX = std::max(0.f, (disp.x - avail.x) * 0.5f);
+        const float maxY = std::max(0.f, (disp.y - avail.y) * 0.5f);
+        nav.pan.x = clampf(nav.pan.x, -maxX, maxX);
+        nav.pan.y = clampf(nav.pan.y, -maxY, maxY);
+        imgPos = imgPosOf(disp);
+    }
+
+    //---- 双击复位成「适应窗口」 ----
+    if (itemHovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) &&
+        (roiOwner == 0 || io.KeyShift))
+    {
+        nav.zoom = 1.0f;
+        nav.pan  = ImVec2(0.f, 0.f);
+        disp     = fitSize(tex.w, tex.h, avail, nav.zoom);
+        imgPos   = imgPosOf(disp);
+    }
+
+    //---- 只画可见的那一块 ----
+    // 放大后图片会超出视图区，用 UV 裁剪 + 只占可见区域，避免盖到右侧面板上
+    {
+        const ImVec2 visMin(std::max(imgPos.x, areaMin.x), std::max(imgPos.y, areaMin.y));
+        const ImVec2 visMax(std::min(imgPos.x + disp.x, areaMax.x),
+                            std::min(imgPos.y + disp.y, areaMax.y));
+        if (visMax.x > visMin.x && visMax.y > visMin.y)
+        {
+            const ImVec2 uv0((visMin.x - imgPos.x) / disp.x, (visMin.y - imgPos.y) / disp.y);
+            const ImVec2 uv1((visMax.x - imgPos.x) / disp.x, (visMax.y - imgPos.y) / disp.y);
+            ImGui::SetCursorScreenPos(visMin);
+            ImGui::Image(ImTextureRef((ImTextureID)(uintptr_t)tex.srv),
+                         ImVec2(visMax.x - visMin.x, visMax.y - visMin.y), uv0, uv1);
+            // 图片是"画上去"的，布局光标要回到视图区左上角继续用
+            ImGui::SetCursorScreenPos(areaMin);
+        }
+    }
+
+    // 屏幕 <-> 图像坐标(用真实绘制矩形，含缩放和平移)
     auto toImg = [&](const ImVec2& p)
     {
-        return ImVec2((p.x - origin.x) * (float)tex.w / disp.x,
-                      (p.y - origin.y) * (float)tex.h / disp.y);
+        return ImVec2((p.x - imgPos.x) * (float)tex.w / disp.x,
+                      (p.y - imgPos.y) * (float)tex.h / disp.y);
     };
     auto toScr = [&](const ImVec2& p)
     {
-        return ImVec2(origin.x + p.x * disp.x / (float)tex.w,
-                      origin.y + p.y * disp.y / (float)tex.h);
+        return ImVec2(imgPos.x + p.x * disp.x / (float)tex.w,
+                      imgPos.y + p.y * disp.y / (float)tex.h);
     };
+    auto inImage = [&](const ImVec2& p)
+    {
+        return p.x >= imgPos.x && p.x <= imgPos.x + disp.x &&
+               p.y >= imgPos.y && p.y <= imgPos.y + disp.y;
+    };
+    // 鼠标既要在视图区内、又要落在图像上：视图区里可能有空白边(letterbox)
+    const bool hoverImg = itemHovered && inImage(io.MousePos);
 
     //---- 掩码涂抹模式(模板源图专属，优先于 ROI 框选) ----
     if (maskPaint && roiOwner == 2)
@@ -1220,7 +1362,7 @@ static void drawImageView(const char* id, const char* info, Texture& tex, int ro
         const bool paintDown = ImGui::IsMouseDown(ImGuiMouseButton_Right);  // 右键 = 恢复(置255)
         const bool anyDown   = paintDown || eraseDown;
 
-        if (ImGui::IsItemHovered() && anyDown)
+        if (hoverImg && anyDown)
         {
             ImVec2 p = toImg(ImGui::GetMousePos());
             p.x = clampf(p.x, 0.f, (float)tex.w - 1.f);
@@ -1244,7 +1386,7 @@ static void drawImageView(const char* id, const char* info, Texture& tex, int ro
         }
 
         // 画笔光标圆圈
-        if (ImGui::IsItemHovered())
+        if (hoverImg)
         {
             ImVec2 p = toImg(ImGui::GetMousePos());
             ImVec2 c = toScr(ImVec2(clampf(p.x, 0.f, (float)tex.w - 1.f),
@@ -1255,15 +1397,18 @@ static void drawImageView(const char* id, const char* info, Texture& tex, int ro
                                           : IM_COL32(0, 255, 0, 255), 0, 2.f);
         }
 
-        ImGui::Text("%s", info);
+        ImGui::SetCursorScreenPos(ImVec2(areaMin.x, areaMax.y));
+        ImGui::Text("%s   |  缩放 %.2fx", info, nav.zoom);
         return;
     }
 
     if (roiOwner != 0)
     {
-        if (ImGui::IsItemHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+        if (hoverImg && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
         {
             a.dragA = toImg(ImGui::GetMousePos());
+            a.dragA.x = clampf(a.dragA.x, 0.f, (float)tex.w - 1.f);
+            a.dragA.y = clampf(a.dragA.y, 0.f, (float)tex.h - 1.f);
             a.dragB = a.dragA;
             a.dragging = true;
         }
@@ -1327,7 +1472,8 @@ static void drawImageView(const char* id, const char* info, Texture& tex, int ro
         }
     }
 
-    ImGui::Text("%s", info);
+    ImGui::SetCursorScreenPos(ImVec2(areaMin.x, areaMax.y));
+    ImGui::Text("%s   |  缩放 %.2fx", info, nav.zoom);
 }
 
 static void drawViewPane()
@@ -1351,7 +1497,8 @@ static void drawViewPane()
             // 传 1 会让 drawImageView() 把「ROI 框」也画在这张图上，而模板常常就是
             // 用同一个 ROI 裁出来的（尺寸完全相同、位置只差几十像素），于是看起来
             // 像"匹配出了好几个绿框"。同时也避免了在结果图上误拖鼠标改动模板 ROI。
-            drawImageView("##area_result", info, a.texResult, 0);
+            // 只读页 + 左键可拖动平移：这里最需要放大看某个框对得准不准。
+            drawImageView("##area_result", info, a.texResult, 0, 0);
             a.viewTab = 0;
             ImGui::EndTabItem();
             a.showResultOnce = false;       // 只在这一次请求后清除
@@ -1359,14 +1506,15 @@ static void drawViewPane()
         if (ImGui::BeginTabItem("目标图"))
         {
             snprintf(info, sizeof(info), "目标图  %dx%d", a.texTarget.w, a.texTarget.h);
-            drawImageView("##area_target", info, a.texTarget, a.texTarget.valid() ? 1 : 0);
+            drawImageView("##area_target", info, a.texTarget, a.texTarget.valid() ? 1 : 0, 1);
             a.viewTab = 1;
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("模板源图"))
         {
             snprintf(info, sizeof(info), "模板源图  %dx%d", a.texTplSrc.w, a.texTplSrc.h);
-            drawImageView("##area_tpl", info, a.texTplSrc, a.texTplSrc.valid() ? 2 : 0, a.paintMask);
+            drawImageView("##area_tpl", info, a.texTplSrc, a.texTplSrc.valid() ? 2 : 0, 2,
+                          a.paintMask);
             a.viewTab = 2;
             ImGui::EndTabItem();
         }
@@ -1374,7 +1522,7 @@ static void drawViewPane()
         {
             snprintf(info, sizeof(info), "模板模型(绿=轮廓 红=采样点 蓝=中心)  %dx%d",
                      a.texModel.w, a.texModel.h);
-            drawImageView("##area_model", info, a.texModel, 0);
+            drawImageView("##area_model", info, a.texModel, 0, 3);
             a.viewTab = 3;
             ImGui::EndTabItem();
         }
@@ -2139,8 +2287,35 @@ static void drawPanel()
         textDimWrapped("默认只画模型轮廓（Halcon 风格）。采样点和梯度箭头会盖住 1 像素宽的轮廓，按需开启。");
         ImGui::Checkbox("参数改动后自动刷新", &a.autoRun);
         ImGui::Checkbox("拖动时实时刷新", &a.liveUpdate);
+
+        //---- 图像视图缩放/平移 ----
+        // 每个页签各一套状态：「匹配结果」上放大检查某个框，不会连带放大「模板源图」。
+        // 鼠标操作：滚轮缩放(以鼠标为锚点)、中键拖动平移；
+        // 只读页(「匹配结果」)左键也能拖动，双击复位成适应窗口。
+        ViewNav& nav = navOf(a, a.viewTab);
         itemWidthForLabel("显示缩放");
-        ImGui::SliderFloat("显示缩放", &a.zoom, 0.2f, 4.f, "%.2f");
+        if (ImGui::SliderFloat("显示缩放", &nav.zoom, 0.1f, 8.f, "%.2fx"))
+            nav.pan = ImVec2(0.f, 0.f);          // 滑块缩放以图像中心为准
+        if (fitsOnLine(checkWidth("适应窗口"))) ImGui::SameLine();
+        if (ImGui::Button("适应窗口"))
+        {
+            nav.zoom = 1.0f;
+            nav.pan  = ImVec2(0.f, 0.f);
+        }
+        if (fitsOnLine(checkWidth("1:1 像素"))) ImGui::SameLine();
+        if (ImGui::Button("1:1 像素"))
+        {
+            // fitScale 由 drawImageView 每帧更新(1.0 = 图像像素与屏幕像素 1:1)
+            nav.zoom = clampf(1.0f / std::max(0.001f, nav.fitScale), 0.1f, 40.f);
+            nav.pan  = ImVec2(0.f, 0.f);
+        }
+        if (ImGui::Button("居中复位", ImVec2(-1, 0)))
+        {
+            nav.zoom = 1.0f;
+            nav.pan  = ImVec2(0.f, 0.f);
+        }
+        textDimWrapped("左侧图像：滚轮缩放(以鼠标为中心)、中键拖动平移；"
+                       "「匹配结果」页左键也能拖动、双击复位。查看识别误差时先放大再逐框核对。");
         endGroup();
     }
 
