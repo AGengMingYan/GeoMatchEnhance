@@ -427,6 +427,12 @@ struct App
                                         // 所以不能当默认（实测同一位姿我们 0.946、Halcon 0.556）
     float minCoverage    = 0.f;         // 0 = 关闭。 模型点里"梯度方向一致"的最低占比,
                                         // 用来剔除调低最小分数后冒出来的相似位置
+    float skipWeight     = 0.f;         // 0（默认）= 按全部模型点平均 = Halcon 口径：
+                                        // 模板某块落在平坦背景上时 dot≈0 会如实拉低分数，
+                                        // 所以"只对上一部分模板"的位姿拿不到高分。
+                                        // 0.9 = 跳过弱梯度点（追召回用，分数会虚高 0.1~0.3）
+    float cellMissMax    = 0.35f;       // 4x4 格里"没梯度"的格占比超过这个值就拒掉
+                                        // （0 = 关闭）。与 skipWeight 无关地生效。
     int   boxMode        = 0;           // 结果框样式: 0 = 固定方框(默认), 1 = 旋转框, 2 = 模型凸包
     bool  showContour    = true;        // 画模型轮廓折线(Halcon 风格, 默认开)
     bool  showPoints     = false;       // 画采样点(红点)
@@ -556,6 +562,8 @@ struct App
         c.debug        = 0;
         c.scoreMode    = scoreMode;
         c.minCoverage  = minCoverage;
+        c.skipWeight   = skipWeight;
+        c.cellMissMax  = cellMissMax;
         c.boxMode      = boxMode;
         c.showContour    = showContour;
         c.showPoints     = showPoints;
@@ -584,6 +592,8 @@ struct App
         useOpenCL   = c.useOpenCL;
         scoreMode   = c.scoreMode;
         minCoverage = c.minCoverage;
+        skipWeight  = c.skipWeight;
+        cellMissMax = c.cellMissMax;
         // boxMode 只影响画出来的样子，不写进模型文件；加载模型时保留界面上
         // 当前的选择，不要被 Matcher::load() 重置出来的默认值覆盖。
     }
@@ -992,9 +1002,9 @@ static void runMatch(App& a, int loops)
     // 复现留痕: 原图只在换图时落盘一次，参数/结果每次都记
     if (a.tgtPath != g_reproTarget) { g_reproTarget = a.tgtPath; reproSave("target.jpg", a.tgtGray); }
     logf("搜索参数: 最小分数 %.2f 最大匹配 %d 最小间距 %.0f 最大重叠 %.2f 贪婪 %.2f 亚像素 %d "
-         "Metric %d 评分 %d 最小覆盖率 %.2f OpenCL %d 次数 %d 目标=%s",
+         "Metric %d 评分 %d 最小覆盖率 %.2f 弱梯度跳过 %.2f 模板缺失上限 %.2f OpenCL %d 次数 %d 目标=%s",
          a.minScore, a.maxMatches, a.minDistance, a.maxOverlap, a.greediness,
-         a.subpixelMode, a.metric, a.scoreMode, a.minCoverage,
+         a.subpixelMode, a.metric, a.scoreMode, a.minCoverage, a.skipWeight, a.cellMissMax,
          (int)a.useOpenCL, loops, a.tgtPath.c_str());
 
     const int loopsUsed = std::max(1, loops);
@@ -1980,6 +1990,10 @@ static void drawPanel()
                     "要和 Halcon 分数对比，请选 mean。");
         }
         changedSearch |= sliderF("最小覆盖率", &a.minCoverage, 0.f, 1.f, "%.2f", commitSearch);
+        // skipWeight / cellMissMax: 决定"弱梯度点算不算分"和"模板局部缺失多大算错",
+        // 是"重复纹理里出现多个高分重叠结果"时最有效的两个闸门。
+        changedSearch |= sliderF("弱梯度跳过", &a.skipWeight, 0.f, 1.f, "%.2f", commitSearch);
+        changedSearch |= sliderF("模板缺失上限", &a.cellMissMax, 0.f, 1.f, "%.2f", commitSearch);
         {
             // 极性(Halcon 的 Metric)：目标亮/暗反转或局部反光时用
             const char* items[] = { "要求极性一致(默认)",
@@ -2000,6 +2014,19 @@ static void drawPanel()
             textDimWrapped("0 = 关闭。覆盖率 = 模型点里梯度方向一致的占比，结果表\"覆盖\"列就是它。"
                            "调低最小分数后冒出来的相似结构通常能拿高分，但只对上模型的一部分，覆盖率明显偏低。"
                            "实测参考: case1 真值 0.99 / 误检 0.62(取 0.80)；case3 真值 0.81 / 误检 0.75(取 0.78)。");
+        if (a.skipWeight > 0.f)
+            textWarnWrapped("弱梯度跳过 > 0 = 只对\"图像上确有梯度\"的模型点取平均，分母变小、"
+                            "分数会虚高：实测同一位姿(模板 U 弯、错位 86 px) 本项 0.82，"
+                            "而按全部模型点平均(Halcon 口径)只有 0.55。"
+                            "默认 0 才是和 Halcon 可比的口径，调到 0.9 只在追召回时用。");
+        else
+            textDimWrapped("弱梯度跳过 = 0（默认，Halcon 口径）: 全部模型点都进分母，"
+                           "模板哪块落在平坦背景上、那块的 dot≈0 就如实扣分，"
+                           "所以\"只对上一部分模板\"的位置不会拿到高分。"
+                           "代价是弱对比/模糊帧的真目标分数会低 0.1~0.3（这种场景可把它调到 0.9）。");
+        if (a.cellMissMax > 0.f)
+            textDimWrapped("模板缺失上限: 4x4 格里\"几乎没有图像梯度\"的格占比超过它即拒绝，用来挡"
+                           "\"模板有一块根本没对上\"的假目标（0 = 关闭，默认 0.35）。");
         endGroup();
     }
 

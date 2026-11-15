@@ -39,6 +39,13 @@ struct XForm;
 #  define SHAPEMATCH_API
 #endif
 
+// Compile-time truth about the SIMD width the shape engine itself was built
+// with: 256 = the AVX2 kernels are compiled in, 0 = scalar fallback.  Do not
+// guess from __AVX2__ in another translation unit -- a 32-bit build once had
+// __AVX2__ defined in the facade while ShapeMatch.cpp silently compiled every
+// 256-bit path out, which cost 2x on preprocessing and 8x on the fused pass.
+SHAPEMATCH_API int shapeSimdWidth();
+
 struct MatchResult
 {
     cv::Point2f pos;   // center of the instance in the search image
@@ -162,41 +169,43 @@ struct FindParams
     //    取整的 <=0.5px 抖动，降低斜角误差（粗扫仍用整数卷积核保速度）。
 
     //----
-    // skipWeight（对齐 Halcon 语义，2026-11-14）：评分时跳过"图像梯度幅值 <
-    // minContrast"的模型点，分母改用有效点数。
+    // skipWeight（2026-11-15 起默认 0 = 按全部模型点平均，即 Halcon 口径）
     //
-    // 原因（与 Halcon 的 ~0.30 分数差的根因）：归一化梯度平面存的是
-    //   w * 单位方向        w = min(|grad|/minContrast, 1)
-    // 旧做法把这些点的 dot 按 w 等比衰减后计入 mean，于是模糊/弱对比帧上
-    // 约 1/3 的点掉到 cos≈0.1，分数从 0.98 衰减到 0.61（data1 实测）；
-    // 而 Halcon 在同样帧上仍报 0.96 —— 它等效于"弱幅值点不参加评分"。
+    // 语义：> 0 时，图像梯度幅值 < skipWeight 的模型点不参与平均，分母只用
+    //       "有效点"（keptAll）；= 0 时全部 n 个点都参与（平坦处 dot ≈ 0 直接
+    //       拉低分数），与 Halcon 的"分母永远是全部模型点"一致。
     //
-    // 实测（data1 前 12 张 + 负样本集 data1 模板配 data2 图）：
-    //   ours mean 0.713 -> 0.909（Halcon 0.973，gap 0.26 -> 0.06）
-    //   负样本 mean 0.425 -> 0.387、max 0.44 -> 0.49（假分数不升反降，
-    //   真/假间隔从 0.29 拉大到 0.52 —— 判别力同时增强）。
+    // 为什么默认改成 0（2026-11-15 实测，模板 = case1 蛇形走线的 U 弯 215×164）：
+    //   真值位姿            skipWeight=0.9 -> 0.996 ; =0 -> 0.995 ; Halcon 0.9748
+    //   错位 86/89/179 px   skipWeight=0.9 -> 0.743/0.774/0.822（三个都过 minScore 0.7）
+    //                       skipWeight=0   -> 0.459/0.508/0.546（只有真值过）
+    //                       Halcon         -> 0.486/0.485/0.556
+    //   原因：> 0 时"只对上模板下半部分"的位姿把没对上的那半从分母里删掉了，
+    //   分数被抬到 0.82；Halcon 不删，所以只有 0.49~0.56。
+    //   代价实测很小（同一批模型/参数）：
+    //     data1 前 40 张  0.9083 -> 0.9083（逐位相同，点全落在强边上）
+    //     data2 36 张      0.6746/35 命中 -> 0.6714/36 命中（min 0.54）
+    //     case1 7 张       0.799~0.980（原 0.842~0.989，都远高于 0.7）
+    //   也就是说：只有"模板有大片平坦区"时两口径才会差 0.27，正好是会产生
+    //   "多个高分重叠结果"的那类模板。要追召回（弱对比目标）再把这一项调到
+    //   0.9，用之前那套数据（data2 会多 1 张、分数虚高 0.27）自己权衡。
     //
-    // 取值：1.0 = 严格按 minContrast 硬跳（最接近 Halcon）；
-    //       0.9 = 默认，略保守（幅值在 (0.9~1.0)*minContrast 之间的点仍参与）；
-    //       0   = 关闭（旧语义：全部点按软权重参与）。
-    // 防御：一个位置的有效点数 < max(8, n/4) 时该位置直接判 -1（不可靠）。
-    //
-    // ⚠ 与 cellMissMax 配合使用：skipWeight 会跳过"图像上没梯度"的点，所以
-    // "模板只有一部分出现在图上"的位置（重复纹理里的错位实例）也会被抬到
-    // 0.9+（实测 0.475 → 0.967）。cellMissMax 用"4×4 网格里空了多少格"把这类
-    // 位置拒掉；只靠 minCoverage 不够（见下方 coverage 的说明）。
-    float  skipWeight  = 0.9f;
+    // 防御：skipWeight > 0 且有效点数 < max(8, n/4) 时该位置直接判 -1（不可靠）。
+    float  skipWeight  = 0.f;
 
     // 0 = off；>0 = 允许的"模板缺失面积比例"上限，超过即拒绝该匹配。
-    // 判据：把模板分成 4×4 格，统计每格里"图像梯度足够强（未被 skipWeight 跳过）"
-    // 的点占比；占比 < 0.2 的格算"缺失"，缺失格数 / 总格数 = missShare。
+    // 判据：把模板分成 4×4 格，统计每格里"图像梯度足够强"的点占比；占比 < 0.2
+    // 的格算"缺失"，缺失格数 / 总格数 = missShare。
+    // "足够强"的参考阈值取 skipWeight，skipWeight = 0（默认口径）时回落到 0.9，
+    // 所以这个判据在两种口径下都有效（否则 skipWeight=0 时所有点都算"强"，
+    // missShare 恒为 0，闸门等于关掉）。
     //   * 模糊/弱对比的真目标：弱点分散，各格占比 0.65~0.86，最多 1~2 格偏低
     //     → missShare ≈ 0.06~0.13（实测 data1 模糊帧）
     //   * "只对上模板一部分"的错位实例：整行整列缺失
     //     → missShare ≈ 0.5（实测模板只贴一半时 8/16 格为空）
     // 默认 0.35：允许最多约 1/3 面积缺失（真实产线里模板边缘被遮挡/出画面也能过），
     // 同时"只对上模板一半"的错位实例（missShare≈0.5）仍会被拒。
-    // 实测余量：data1 最低分真目标 0.25、data2 −90° 帧 0.00、"模板只贴一半" 0.50。
+    // 实测余量：data1 最低分真目标 0.25、data2 −90° 帧 0.00、模板只贴一半 0.50。
     float  cellMissMax = 0.35f;
 };
 

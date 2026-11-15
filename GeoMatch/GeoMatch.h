@@ -29,8 +29,8 @@
 //-----------------------------------------------------------------------
 #define GEOMATCH_VERSION_MAJOR 1
 #define GEOMATCH_VERSION_MINOR 1
-#define GEOMATCH_VERSION_PATCH 0
-#define GEOMATCH_VERSION_STRING "1.1.0"
+#define GEOMATCH_VERSION_PATCH 1
+#define GEOMATCH_VERSION_STRING "1.1.1"
 
 
 //-----------------------------------------------------------------------
@@ -115,12 +115,14 @@ struct Config
                                 // The cheapest way to reject the look-alike
                                 // positions that appear when minScore is lowered
                                 // on repetitive patterns.
-    // 对齐 Halcon 的"弱梯度点不评分"语义（详见 FindParams::skipWeight）：
-    // 图像梯度幅值低于 minContrast 的模型点不计入分数、分母用有效点数。
-    // 默认 0.9；设 0 恢复旧语义（全部点按软权重参与，模糊帧分数会系统性低 ~0.3）。
-    float  skipWeight   = 0.9f;
-    // 与 skipWeight 配合：0 = 关闭；>0 = 允许的"模板缺失面积比例"上限
-    // （重复纹理里"只对上模板一部分"的位置会被 skipWeight 抬到高分，靠这个拒掉）。
+    // 分数口径（详见 FindParams::skipWeight）。
+    // 0（默认）= 按全部模型点平均 = Halcon 口径：模板某部分在图像上是平坦背景时，
+    //   那些点的 dot≈0 会如实拉低分数，"只对上模板一部分"的位姿拿不到高分。
+    // 0.9 = 跳过"图像梯度 < 0.9"的模型点、分母只用有效点：弱对比/模糊帧的分数
+    //   会高 0.1~0.3（追召回用），但只对上一部分模板的位姿也会被抬到 0.8+。
+    float  skipWeight   = 0.f;
+    // 0 = 关闭；>0 = 允许的"模板缺失面积比例"上限（4x4 格里没梯度的格占比）。
+    // 与 skipWeight 无关地生效，"模板有一块根本没对上"的假目标靠它拒掉。
     float  cellMissMax  = 0.35f;
 
     // 注：软门限梯度归一化与亚像素梯度采样已内建为默认行为（见 ShapeMatch

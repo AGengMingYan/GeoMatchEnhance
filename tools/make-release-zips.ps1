@@ -1,5 +1,5 @@
-param(
-    [string]$Version = '1.1.0',
+﻿param(
+    [string]$Version = '1.1.1',
     [switch]$SkipGui          # 只打 SDK 包，不重打 GUI 包
 )
 

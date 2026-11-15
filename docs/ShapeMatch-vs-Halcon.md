@@ -1150,7 +1150,7 @@ _ai_tmp\ptq.exe case1\temp.jpg --find case1\tmp_grab_1762994178.jpg [--find-leve
 | ├ 粗层 topScan（162 个位姿） | 22~41 ms，其中候选提取 `extract` 7.3~7.5 ms |
 | ├ level1 refine（36 个候选） | 7.2 ms（1200 点）/ 28.6 ms（0 → 5759 点） |
 | └ 亚像素 | 5.5~6.9 ms |
-| 我们 x86 同进程（ptq，360°） | 94~102 ms |
+| 我们 x86 同进程（ptq，360°） | 94~102 ms（当时 32 位构建 `SM_USE_AVX2=0`，SIMD 全被编掉；修正后同图 **45~54 ms**，与 x64 持平，见 17.11） |
 
 角度线性度（x64）：`360° = 35.6 ms`、`90° = 32.2 ms`、`10° = 11.7 ms`
 → 粗层位姿数 162 → 41 只省 3 ms，说明**固定成本**（预处理 + 提取 + 精化 ≈ 20 ms）已经吃掉大半；
@@ -1214,7 +1214,8 @@ Halcon 快的地方是**每个点求值的成本**：8 位整数梯度 + SIMD �
    忘了重量化 `np`，整数内核就会用旧方向打分 —— 现在 `buildXForm` 末尾和取反之后都调它。
 3. **`coverage`/`minCoverage` 不受影响**：整数内核只写分数图，覆盖率仍来自半精度重打分。
 4. 环境变量 `SM_NO_Q8=1` 强制走半精度路径，用于 A/B 对照（默认关闭）。
-5. x86（`SM_USE_AVX2 = 0`）与点数 > 30000 时自动回落半精度，行为与之前一致。
+5. 点数 > 30000 时自动回落半精度，行为与之前一致。x86 只要有 `/arch:AVX2` 同样走整数内核
+   （见 17.11：此前 32 位被 `_M_IX86` 守卫挡掉，镜像面白算了）。
 
 #### 实测（x64，`-t2`，同一模型同一批图）
 
@@ -1296,4 +1297,52 @@ maxPoints 1200 / 角度 ±180°`，搜索 `最小分数 0.70、最大匹配 12�
 ```
 GeoMatchDemo -t template.png -mask template_mask.png -s target.jpg -angle 360 -contrast 88.8 -hi 110 -points 1200 -minscore 0.30 -max 8 -min-dist 30 -max-overlap 1.0 -score-mode 0 -skip-w 0.9 -noshow -o out
 ```
+
+---
+
+### 17.11 32 位「100 ms」的根因：SIMD 被静默编掉了（2026-11-15 实测）
+
+现象：`build_x86\GeoGUIDemo.exe` 同一模板同一图显示「合计 ≈ 100 ms」，而 x64 只有 40 ms 左右，
+被误判成「Q8 优化把 x86 拖慢了」。
+
+对照（模板 `template.png` 157×145 / 1200 点 / 3 层 / 360°=164 位姿 / 1280×1024，
+`-contrast 22 -hi 12`，与 GUI 的 3.0/5.5 灰度等价；`-debug 2` 拆解）：
+
+| 构建 | preprocess | topScan | extract | refine | subpixel | search | total |
+|---|---|---|---|---|---|---|---|
+| x86，`56e67ec`（Q8 之前） | 15.5 | 48.2 | 6.1 | 9.8 | 11.3 | 69.6 | **85.1** |
+| x86，HEAD（Q8，但 `SM_USE_AVX2=0`） | **31.7** | 44.8 | 6.7 | 9.6 | 11.3 | 66.1 | **97.8** |
+| **x86，修正 `SM_USE_AVX2` 后** | 4~7 | 27~29 | 6.9 | 7.3 | 7.9 | 42~49 | **45~54** |
+| x64，`56e67ec` | 3.4 | 35.8 | 6.8 | 6.8 | 5.6 | 48.4 | 51.8 |
+| x64，HEAD（Q8） | 4.5 | 18.5 | 6.1 | 7.4 | 6.1 | 32.3 | 36.8 |
+
+不带 `-debug 2` 各跑 3 次取最小：x86 **44.6 ms**、x64 **44.4 ms**（已经持平）。
+逐图正确性：case1 全部 9 张，x86(修正后) 与 x64 的 `#0 s/c/a/k/pos` **逐字符一致**；
+`SM_NO_Q8=1` 与默认也只差耗时，分数/位置完全相同。
+
+两个独立问题：
+
+1. **`ShapeMatch.cpp` 的 `SM_USE_AVX2` 在 32 位下被强制为 0。**
+   旧守卫是 `#if defined(__AVX2__) || defined(_M_X64)` 里再套 `#if !defined(_M_IX86)`，
+   注释写「32-bit MSVC cannot reach ymm without /arch」——但两份 `build.ninja` 的 `FLAGS`
+   都确实是 `/O2 /arch:AVX2`，而 **MSVC 在 x86 上同样定义 `__AVX2__`**
+   （GUI 启动横幅那行 `-> __AVX2__ defined` 就是证据）。于是 32 位构建里
+   融合预处理、`ScanInvoker`、`ScanInvoker8` 全被编掉，只剩逐像素标量循环。
+   守卫改成 `#if defined(__AVX2__)` 优先后，x86 从 85 ms 直接降到 45~54 ms（比旧版快 1.9×）。
+2. **Q8 的 8 位镜像面没有跟消费者一起条件编译。** `gradientHalves()` 无条件算 `q8/m8`，
+   但消费它的 `ScanInvoker8` 只存在于 AVX2 构建 → 「AVX2 关掉」的构建白付一倍预处理
+   （15.5 → 31.7 ms）而 topScan 一分不省（44.8 vs 48.2）。这正是「100 ms 还不如以前 85 ms」的来源。
+   现在 `SM_USE_AVX2=0` 时 `q8/m8` 直接 `release()`，标量尾部也不再写镜像面。
+
+通用教训：
+
+- **为某个内核预处理出来的数据，必须与那个内核同条件编译**，否则在没有该内核的构建里就是纯成本。
+- **判断 SIMD 有没有真的生效，不能看横幅**（`GeoMatch.cpp` 那个 TU 的宏不代表热点 TU 的分支）。
+  现在横幅新增一行 **`-> shape engine SIMD: 256-bit AVX2 kernels`**（或 `scalar fallback`），
+  它由 `ShapeMatch.cpp` 里的 `shapeSimdWidth()` 返回，是**编译进热点 TU 的真值**，
+  以后再出现"哪个 TU 的宏不一样"就能一眼看出来。
+  最快的判据：同参数跑 x86/x64，`preprocess` 差 4~9 倍、`topScan` 差 2 倍以上，就一定是 SIMD 没开。
+- 报「变慢了」之前先确认**跑的是哪个 exe**：32 位产物在 `build_x86\`，64 位在 `build\`，
+  两者默认目录里都叫 `GeoGUIDemo.exe`。
+
 

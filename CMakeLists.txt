@@ -1,74 +1,152 @@
-cmake_minimum_required(VERSION 3.10.0)
-project(GeoMatchDemo VERSION 1.1.0 LANGUAGES C CXX)
+cmake_minimum_required(VERSION 3.15)
+project(GeoMatchDemo VERSION 1.1.1 LANGUAGES C CXX)
+
+#===============================================================================
+#  手动编译（推荐，一条命令）
+#-------------------------------------------------------------------------------
+#  x64 :  tools\build-x64.bat          -> build\*.exe
+#  x86 :  tools\build-x86.bat          -> build_x86\*.exe
+#
+#  等价的手工命令（Ninja 没有 PLATFORM，架构由 vcvars 决定，必须先 call）：
+#      call "D:\develop2\vs2019\IDE\VC\Auxiliary\Build\vcvars64.bat"
+#      cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -S . -B build
+#      cmake --build build
+#
+#  想用 Visual Studio 生成器（不用先 call vcvars，单步调试更方便）：
+#      cmake -G "Visual Studio 16 2019" -A x64 -S . -B build_vs
+#      cmake --build build_vs --config Release
+#
+#  常见 -D 选项：
+#      -DOPENCV_ROOT=<path>           指定 OpenCV（不指定就按 32/64 位自动找）
+#      -DGEOMATCH_SIMD=OFF            不编 /arch:AVX2（给不支持 AVX2 的 CPU）
+#      -DGEOMATCH_BUILD_GUI=OFF       不编 imgui 界面（只要库 + 命令行）
+#      -DGEOMATCH_BUILD_SHARED=ON     把 GeoMatch 编成 dll
+#      -DGEOMATCH_BUILD_EXAMPLES=OFF  不编 examples/
+#
+#  产物：
+#      GeoMatch.lib      库（ShapeMatch 形状匹配 + NccMatch 灰度相关 + GeoMatch 门面）
+#      GeoMatchDemo.exe  命令行（-t1 建模 / -t2 搜索 / 位置参数 = 图片目录）
+#      NccDemo.exe       NCC 命令行（对标 create_ncc_model / find_ncc_model）
+#      GeoGUIDemo.exe    imgui 界面（结果图 / 参数面板 / 日志）
+#      AnalyzeCase.exe   批量评估工具
+#      Demo1.exe         最小调用示例
+#
+#===============================================================================
 
 set(CMAKE_CXX_STANDARD 17)
-if(NOT CMAKE_BUILD_TYPE)
-    set(CMAKE_BUILD_TYPE Release)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Release / Debug" FORCE)
 endif()
 
-# 说明：Windows 下 32/64 位是两套 OpenCV，要靠 OPENCV_ROOT 区分。
-#   x64: -DCMAKE_GENERATOR_PLATFORM=x64 -DOPENCV_ROOT=D:/Develop/OpenCV455/opencv/build
-#   x86: -DCMAKE_GENERATOR_PLATFORM=Win32 -DOPENCV_ROOT=D:/Develop/OpenCV455_32
-# Ninja 生成器没有 PLATFORM，改用 vcvars64/vcvars32 决定目标架构。
+#===============================================================================
+#  OpenCV：32/64 位是两套，靠 OPENCV_ROOT 区分；不指定就按目标架构自动找。
+#  （CMAKE_SIZEOF_VOID_P = 8 -> x64，4 -> x86）
+#===============================================================================
+if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+    set(GM_ARCH "x64")
+    set(GM_OCV_SUBDIRS "x64/vc15" "x64/vc14")
+    set(GM_OCV_CANDIDATES
+        "D:/develop2/OpenCV455/opencv/build"
+        "D:/Develop/OpenCV455/opencv/build"
+        "C:/opencv/build")
+else()
+    set(GM_ARCH "x86")
+    set(GM_OCV_SUBDIRS "x86/vc15" "x86/vc14")
+    # 仓库里自带一套 32 位 OpenCV（include/ + opencv_world455.lib 平铺）
+    set(GM_OCV_CANDIDATES
+        "${CMAKE_CURRENT_SOURCE_DIR}/OpenCV455_MSVC32"
+        "D:/Develop/OpenCV455_32"
+        "D:/develop2/OpenCV455_32")
+endif()
 
-
-
-# OpenCV build root; override on the command line with -DOPENCV_ROOT=<path>
+# ---- 1) OpenCV 根目录（可被 -DOPENCV_ROOT 覆盖） ----------------------------
+set(OPENCV_ROOT "" CACHE PATH "OpenCV 构建根目录（含 include/opencv2，以及 <arch>/vcNN/lib 或平铺的 *.lib）")
 if(NOT OPENCV_ROOT)
-    if(EXISTS "D:/Develop/OpenCV455/opencv/build")
-        set(OPENCV_ROOT "D:/Develop/OpenCV455/opencv/build")
-    else()
-        set(OPENCV_ROOT "D:/develop2/OpenCV455/opencv/build")
-    endif()
+    foreach(cand ${GM_OCV_CANDIDATES})
+        if(EXISTS "${cand}/include/opencv2")
+            set(OPENCV_ROOT "${cand}")
+            break()
+        endif()
+    endforeach()
 endif()
-message(STATUS "OpenCV root: ${OPENCV_ROOT}")
+if(NOT OPENCV_ROOT OR NOT EXISTS "${OPENCV_ROOT}/include/opencv2")
+    message(FATAL_ERROR
+        "找不到 OpenCV（${GM_ARCH}）。请用 -DOPENCV_ROOT=<path> 指定，"
+        "该目录下要有 include/opencv2。尝试过的位置：${GM_OCV_CANDIDATES}")
+endif()
 
 set(OpenCV_INCLUDE_DIRS "${OPENCV_ROOT}/include")
-if(EXISTS "${OPENCV_ROOT}/x64/vc15/lib/opencv_world455.lib")
-    set(OpenCV_LIBS "${OPENCV_ROOT}/x64/vc15/lib/opencv_world455.lib")
-elseif(EXISTS "${OPENCV_ROOT}/x64/vc14/lib/opencv_world455.lib")
-    set(OpenCV_LIBS "${OPENCV_ROOT}/x64/vc14/lib/opencv_world455.lib")
-else()
-    set(OpenCV_LIBS "${OPENCV_ROOT}/opencv_world455.lib")
+
+# ---- 2) 库目录：<arch>/vcNN/lib 优先，其次平铺 ------------------------------
+set(OpenCV_LIB_DIR "")
+foreach(sub ${GM_OCV_SUBDIRS})
+    if(EXISTS "${OPENCV_ROOT}/${sub}/lib")
+        set(OpenCV_LIB_DIR "${OPENCV_ROOT}/${sub}/lib")
+        break()
+    endif()
+endforeach()
+if(NOT OpenCV_LIB_DIR)
+    file(GLOB _flat "${OPENCV_ROOT}/opencv_world*.lib")
+    if(_flat)
+        set(OpenCV_LIB_DIR "${OPENCV_ROOT}")
+    endif()
+endif()
+if(NOT OpenCV_LIB_DIR)
+    message(FATAL_ERROR "在 ${OPENCV_ROOT} 下找不到 opencv_world*.lib（${GM_ARCH}）")
 endif()
 
+file(GLOB OpenCV_REL_LIBS "${OpenCV_LIB_DIR}/opencv_world*.lib")
+list(FILTER OpenCV_REL_LIBS EXCLUDE REGEX "d\\.lib$")
+file(GLOB OpenCV_DBG_LIBS "${OpenCV_LIB_DIR}/opencv_world*d.lib")
+list(GET OpenCV_REL_LIBS 0 OpenCV_LIB_RELEASE)
+# Debug 版同时给出：VS 生成器切到 Debug 时不会撞 LNK2038（RuntimeLibrary 不匹配）。
+# 注意 IMPORTED 目标的 INTERFACE_LINK_LIBRARIES 不接受 optimized/debug 关键字，
+# 必须用生成器表达式按配置选。
+set(OpenCV_LIBS "$<$<NOT:$<CONFIG:Debug>>:${OpenCV_LIB_RELEASE}>")
+if(OpenCV_DBG_LIBS)
+    list(GET OpenCV_DBG_LIBS 0 OpenCV_LIB_DEBUG)
+    list(APPEND OpenCV_LIBS "$<$<CONFIG:Debug>:${OpenCV_LIB_DEBUG}>")
+endif()
 
-# set(OpenCV_INCLUDE_DIRS "C:/Develop/OpenCV455_32/include")
-# set(OpenCV_LIBS "C:/Develop/OpenCV455_32/opencv_world455.lib")
+# ---- 3) 运行时 dll：编完自动拷到 exe 旁边（以前要手工拷） -------------------
+file(GLOB OpenCV_DLLS
+    "${OPENCV_ROOT}/x64/vc15/bin/opencv_world*.dll"
+    "${OPENCV_ROOT}/x86/vc15/bin/opencv_world*.dll"
+    "${OPENCV_ROOT}/bin/opencv_world*.dll"
+    "${OPENCV_ROOT}/opencv_world*.dll")
+
+function(geomatch_copy_opencv_dll target)
+    if(OpenCV_DLLS)
+        add_custom_command(TARGET ${target} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different ${OpenCV_DLLS}
+                    "$<TARGET_FILE_DIR:${target}>"
+            COMMENT "Copied OpenCV runtime dll next to ${target}")
+    endif()
+endfunction()
 
 
-# set(OPENCV_ROOT "D:/develop2/OpenCV455/opencv/build" CACHE PATH "OpenCV build/install root")
+#===============================================================================
+#  编译选项
+#-------------------------------------------------------------------------------
+# 源码是 UTF-8（无 BOM）且含中文注释/字面量；不加 /utf-8 时 MSVC 按 cp936 读，
+# 会刷一屏 C4819，中文输出也是乱码。
+#===============================================================================
+option(GEOMATCH_SIMD "Release 编 /arch:AVX2（运行需要 AVX2 CPU；代码里会自动判断）" ON)
+if(MSVC)
+    add_compile_options(/utf-8 /W3)
+    if(GEOMATCH_SIMD)
+        add_compile_options(/arch:AVX2)
+    endif()
+    add_compile_definitions(_USE_MATH_DEFINES)
+endif()
 
-# if(EXISTS "${OPENCV_ROOT}/OpenCVConfig.cmake")
-#     set(OpenCV_DIR "${OPENCV_ROOT}")
-#     find_package(OpenCV QUIET)
-# endif()
-
-# if(NOT OpenCV_FOUND)
-#     message(STATUS "OpenCVConfig.cmake not usable -> falling back to explicit paths")
-#     set(OPENCV_INCLUDE_DIR "${OPENCV_ROOT}/include")
-#     if(EXISTS "${OPENCV_ROOT}/x64/vc15/lib")
-#         set(OPENCV_LIB_DIR "${OPENCV_ROOT}/x64/vc15/lib")
-#     else()
-#         set(OPENCV_LIB_DIR "${OPENCV_ROOT}/x64/vc14/lib")
-#     endif()
-#     set(OpenCV_INCLUDE_DIRS "${OPENCV_INCLUDE_DIR}")
-#     set(OpenCV_LIBS
-#         optimized "${OPENCV_LIB_DIR}/opencv_world455.lib"
-#         debug     "${OPENCV_LIB_DIR}/opencv_world455d.lib")
-# endif()
-
-
-
-
-
-include_directories(${OpenCV_INCLUDE_DIRS})
-message("${OpenCV_INCLUDE_DIRS}")
-#-----------------------------------------------------------------------
-#  GeoMatch library: shape matcher core + high level facade.
-#  GEOMATCH_BUILD_SHARED=ON  -> shared library (dll / so)
-#  GEOMATCH_BUILD_SHARED=OFF -> static library (default, no dll hell)
-#-----------------------------------------------------------------------
+#-------------------------------------------------------------------------------
+#  GeoMatch 库：ShapeMatch（形状/梯度）+ NccMatch（灰度相关）+ GeoMatch（门面）
+#    GEOMATCH_BUILD_SHARED=ON  -> dll；OFF（默认）-> 静态库，免 dll hell
+#-------------------------------------------------------------------------------
 option(GEOMATCH_BUILD_SHARED "build GeoMatch as a shared library" OFF)
 
 set(GEOMATCH_SOURCES
@@ -82,141 +160,116 @@ set(GEOMATCH_SOURCES
 
 if(GEOMATCH_BUILD_SHARED)
     add_library(GeoMatch SHARED ${GEOMATCH_SOURCES})
-    # PRIVATE: we are building it   PUBLIC: consumers import from the dll
+    # PRIVATE: 自己在编；PUBLIC: 消费方要定义 GEOMATCH_SHARED 才会 import dll
     target_compile_definitions(GeoMatch PRIVATE GEOMATCH_EXPORTS PUBLIC GEOMATCH_SHARED)
 else()
     add_library(GeoMatch STATIC ${GEOMATCH_SOURCES})
-    # static build: the symbols are baked into the consumer, no decoration
     target_compile_definitions(GeoMatch PUBLIC GEOMATCH_STATIC)
 endif()
 
 # BUILD_INTERFACE: 构建时用源码树；INSTALL_INTERFACE: 装好之后用 <sdk>/include。
-# 只写 ${CMAKE_CURRENT_SOURCE_DIR} 会让 CMake 拒绝导出（"prefixed in the source directory"）。
+# 只写 ${CMAKE_CURRENT_SOURCE_DIR} 会让 install(EXPORT) 拒绝导出
+# （"prefixed in the source directory"）。
+#
+# OpenCV 的头/库也包在 BUILD_INTERFACE 里：我们自己编 exe 时要传递（PUBLIC），
+# 但**不写进导出的 GeoMatchTargets.cmake** —— 否则 SDK 到别的机器上会引用
+# 这台机器的绝对路径而链接失败。SDK 消费方按 docs/SDK.md 自己链 OpenCV。
 target_include_directories(GeoMatch PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+    $<BUILD_INTERFACE:${OpenCV_INCLUDE_DIRS}>
     $<INSTALL_INTERFACE:include>)
-if(OpenCV_LIBS)
-    target_link_libraries(GeoMatch PUBLIC ${OpenCV_LIBS})
-else()
-    target_link_libraries(GeoMatch PUBLIC ${OpenCV_LIBS} ${OpenCV_LIBRARIES})
-endif()
-target_compile_definitions(GeoMatch PRIVATE _USE_MATH_DEFINES)
-# the static lib is meant to be consumed with the same runtime as the app
-if(MSVC AND NOT GEOMATCH_BUILD_SHARED)
-    set_property(TARGET GeoMatch PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+target_link_libraries(GeoMatch PUBLIC
+    "$<BUILD_INTERFACE:$<$<NOT:$<CONFIG:Debug>>:${OpenCV_LIB_RELEASE}>>")
+if(OpenCV_LIB_DEBUG)
+    target_link_libraries(GeoMatch PUBLIC
+        "$<BUILD_INTERFACE:$<$<CONFIG:Debug>:${OpenCV_LIB_DEBUG}>>")
 endif()
 
-#-----------------------------------------------------------------------
-#  command line front end - now only argument parsing and printing
-#-----------------------------------------------------------------------
+#-------------------------------------------------------------------------------
+#  命令行前端（只做参数解析和打印）
+#-------------------------------------------------------------------------------
 add_executable(GeoMatchDemo main.cpp)
-add_executable(Demo1 main1.cpp)
-add_executable(GeoGUIDemo GeoGUIDemo.cpp)
-# NCC 命令行前端(对标 Halcon create_ncc_model / find_ncc_model)
-add_executable(NccDemo NccDemo.cpp)
-target_include_directories(NccDemo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-if(OpenCV_LIBS)
-    target_link_libraries(NccDemo PRIVATE GeoMatch ${OpenCV_LIBS})
-else()
-    target_link_libraries(NccDemo PRIVATE GeoMatch ${OpenCV_LIBS} ${OpenCV_LIBRARIES})
-endif()
-if(MSVC)
-    target_compile_options(NccDemo PRIVATE /utf-8 $<$<CONFIG:Release>:/O2 /arch:AVX2>)
-endif()
-
-# 命令行分析工具: 拿已有模型跑一批真实图片，打印每张的分数/位姿/耗时
-add_executable(AnalyzeCase AnalyzeCase.cpp)
-target_include_directories(AnalyzeCase PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-if(OpenCV_LIBS)
-    target_link_libraries(AnalyzeCase PRIVATE GeoMatch ${OpenCV_LIBS})
-else()
-    target_link_libraries(AnalyzeCase PRIVATE GeoMatch ${OpenCV_LIBS} ${OpenCV_LIBRARIES})
-endif()
-if(MSVC)
-    target_compile_options(AnalyzeCase PRIVATE /utf-8)
-endif()
-
 target_include_directories(GeoMatchDemo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(GeoMatchDemo PRIVATE GeoMatch)
+
+add_executable(Demo1 main1.cpp)
+target_include_directories(Demo1 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(Demo1 PRIVATE GeoMatch)
 
-#-----------------------------------------------------------------------
-#  Dear ImGui - Win32 + DirectX11 backends (used by GeoGUIDemo)
-#  the sources live in imgui/imgui/imgui-master/imgui-master
-#-----------------------------------------------------------------------
+# NCC 命令行前端（对标 Halcon create_ncc_model / find_ncc_model）
+add_executable(NccDemo NccDemo.cpp)
+target_include_directories(NccDemo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(NccDemo PRIVATE GeoMatch)
+
+# 批量评估：拿已有模型跑一批真实图片，打印每张的分数/位姿/耗时
+add_executable(AnalyzeCase AnalyzeCase.cpp)
+target_include_directories(AnalyzeCase PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(AnalyzeCase PRIVATE GeoMatch)
+
+foreach(t GeoMatchDemo Demo1 NccDemo AnalyzeCase)
+    geomatch_copy_opencv_dll(${t})
+endforeach()
+
+#===============================================================================
+#  Dear ImGui - Win32 + DirectX11 backends（GeoGUIDemo 用）
+#    GEOMATCH_BUILD_GUI=OFF 可以不编它
+#===============================================================================
+option(GEOMATCH_BUILD_GUI "build the imgui front end (GeoGUIDemo)" ON)
 set(IMGUI_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/imgui/imgui/imgui-master/imgui-master")
 
-add_library(imgui STATIC
-    ${IMGUI_ROOT}/imgui.cpp
-    ${IMGUI_ROOT}/imgui_draw.cpp
-    ${IMGUI_ROOT}/imgui_tables.cpp
-    ${IMGUI_ROOT}/imgui_widgets.cpp
-    ${IMGUI_ROOT}/backends/imgui_impl_win32.cpp
-    ${IMGUI_ROOT}/backends/imgui_impl_dx11.cpp
-)
-target_include_directories(imgui PUBLIC ${IMGUI_ROOT} ${IMGUI_ROOT}/backends)
-target_link_libraries(imgui PUBLIC d3d11 dxgi d3dcompiler)
+if(GEOMATCH_BUILD_GUI AND EXISTS "${IMGUI_ROOT}/imgui.cpp")
+    add_library(imgui STATIC
+        ${IMGUI_ROOT}/imgui.cpp
+        ${IMGUI_ROOT}/imgui_draw.cpp
+        ${IMGUI_ROOT}/imgui_tables.cpp
+        ${IMGUI_ROOT}/imgui_widgets.cpp
+        ${IMGUI_ROOT}/backends/imgui_impl_win32.cpp
+        ${IMGUI_ROOT}/backends/imgui_impl_dx11.cpp
+    )
+    target_include_directories(imgui PUBLIC ${IMGUI_ROOT} ${IMGUI_ROOT}/backends)
+    target_link_libraries(imgui PUBLIC d3d11 dxgi d3dcompiler)
 
-#-----------------------------------------------------------------------
-#  GeoGUIDemo - imgui front end for quick template matching checks
-#-----------------------------------------------------------------------
-# 必须按 GUI 子系统链接（/SUBSYSTEM:WINDOWS）：
-# 默认的 add_executable 是控制台子系统，双击/被拉起时会额外开一个黑窗口，
-# 而且那个控制台常常盖在 GUI 上面，鼠标点不到界面。
-# 源码用的是 main()，所以显式把入口指到 mainCRTStartup，否则 MSVC 会找 WinMain
-# 并报 "unresolved external symbol WinMain"。
-set_target_properties(GeoGUIDemo PROPERTIES WIN32_EXECUTABLE TRUE)
-if(MSVC)
-    target_link_options(GeoGUIDemo PRIVATE /ENTRY:mainCRTStartup)
+    add_executable(GeoGUIDemo GeoGUIDemo.cpp)
+    # 必须按 GUI 子系统链接（/SUBSYSTEM:WINDOWS）：
+    # 默认的 add_executable 是控制台子系统，双击/被脚本拉起时会额外开一个黑窗口，
+    # 那个控制台常常盖在 GUI 上面，鼠标点不到界面。
+    # 源码用的是 main()，所以显式把入口指到 mainCRTStartup，否则 MSVC 会找 WinMain
+    # 并报 "unresolved external symbol WinMain"。
+    set_target_properties(GeoGUIDemo PROPERTIES WIN32_EXECUTABLE TRUE)
+    if(MSVC)
+        target_link_options(GeoGUIDemo PRIVATE /ENTRY:mainCRTStartup)
+    endif()
+    target_include_directories(GeoGUIDemo PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR} ${IMGUI_ROOT} ${IMGUI_ROOT}/backends)
+    target_link_libraries(GeoGUIDemo PRIVATE GeoMatch imgui comdlg32 ole32 uuid)
+    geomatch_copy_opencv_dll(GeoGUIDemo)
+elseif(GEOMATCH_BUILD_GUI)
+    message(STATUS "imgui 源码不存在，跳过 GeoGUIDemo：${IMGUI_ROOT}")
 endif()
 
-target_include_directories(GeoGUIDemo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${IMGUI_ROOT} ${IMGUI_ROOT}/backends)
-target_compile_definitions(GeoGUIDemo PRIVATE _USE_MATH_DEFINES)
-if(OpenCV_LIBS)
-    target_link_libraries(GeoGUIDemo PRIVATE GeoMatch imgui ${OpenCV_LIBS} comdlg32 ole32 uuid)
-else()
-    target_link_libraries(GeoGUIDemo PRIVATE GeoMatch imgui ${OpenCV_LIBS} ${OpenCV_LIBRARIES} comdlg32)
-endif()
-if(MSVC)
-    # /utf-8: the source contains chinese labels, MSVC must not read it as cp936
-    target_compile_options(GeoGUIDemo PRIVATE /utf-8 $<$<CONFIG:Release>:/O2 /arch:AVX2>)
-endif()
-
-# release build uses fast math + SIMD; MSVC also gets /arch:AVX2 when available
-if(MSVC)
-    target_compile_options(GeoMatch  PRIVATE $<$<CONFIG:Release>:/O2 /arch:AVX2>)
-    target_compile_options(GeoMatchDemo PRIVATE $<$<CONFIG:Release>:/O2 /arch:AVX2>)
-    target_compile_options(Demo1 PRIVATE $<$<CONFIG:Release>:/O2 /arch:AVX2>)
-endif()
-
-target_compile_definitions(GeoMatchDemo PRIVATE _USE_MATH_DEFINES)
-
-#-----------------------------------------------------------------------
-#  最小调用示例（构建出来保证 SDK 文档里的代码是能编译的）
-#  GEOMATCH_BUILD_EXAMPLES=OFF 可以不编译它们
-#-----------------------------------------------------------------------
+#===============================================================================
+#  最小调用示例（编出来保证 SDK 文档里的代码是能编译的）
+#===============================================================================
 option(GEOMATCH_BUILD_EXAMPLES "build the SDK examples" ON)
 if(GEOMATCH_BUILD_EXAMPLES AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/examples")
     add_executable(example_shape_match examples/example_shape_match.cpp)
     target_link_libraries(example_shape_match PRIVATE GeoMatch)
     add_executable(example_ncc_match examples/example_ncc_match.cpp)
     target_link_libraries(example_ncc_match PRIVATE GeoMatch)
-    if(MSVC)
-        target_compile_options(example_shape_match PRIVATE /utf-8)
-        target_compile_options(example_ncc_match PRIVATE /utf-8)
-    endif()
+    geomatch_copy_opencv_dll(example_shape_match)
+    geomatch_copy_opencv_dll(example_ncc_match)
 endif()
 
-#-----------------------------------------------------------------------
-#  安装规则：gen 目录就是 SDK 的 layout
+#===============================================================================
+#  安装规则：装出来的目录就是 SDK 的 layout
 #      include/GeoMatch/GeoMatch.h          (facade)
 #      include/ShapeMatch/ShapeMatch.h
 #      include/NccMatch/NccMatch.h
 #      lib/GeoMatch.lib  |  bin/GeoMatch.dll
 #      lib/cmake/GeoMatch/GeoMatchConfig.cmake
 #
-#  cmake --install . --prefix <sdk> 即可得到可交付目录。
-#-----------------------------------------------------------------------
+#    cmake --install . --prefix <sdk>
+#===============================================================================
 include(GNUInstallDirs)
 set(GEOMATCH_INSTALL_CMAKEDIR "${CMAKE_INSTALL_LIBDIR}/cmake/GeoMatch")
 
@@ -237,7 +290,7 @@ install(EXPORT GeoMatchTargets
         NAMESPACE GeoMatch::
         DESTINATION ${GEOMATCH_INSTALL_CMAKEDIR})
 
-# 版本/目标文件，供 find_package(GeoMatch) 使用
+# 版本/配置文件，供 find_package(GeoMatch) 使用
 include(CMakePackageConfigHelpers)
 write_basic_package_version_file(
     "${CMAKE_CURRENT_BINARY_DIR}/GeoMatchConfigVersion.cmake"
@@ -260,4 +313,20 @@ install(FILES
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/docs/SDK.md")
     install(FILES docs/SDK.md DESTINATION . COMPONENT docs)
 endif()
+
+#===============================================================================
+#  配置完成摘要
+#===============================================================================
+message(STATUS "")
+message(STATUS "================ GeoMatch 配置完成 ================")
+message(STATUS "  架构        : ${GM_ARCH}")
+message(STATUS "  配置        : ${CMAKE_BUILD_TYPE}${CMAKE_CONFIGURATION_TYPES}")
+message(STATUS "  生成器      : ${CMAKE_GENERATOR}")
+message(STATUS "  OpenCV      : ${OPENCV_ROOT}")
+message(STATUS "  OpenCV lib  : ${OpenCV_LIB_RELEASE}")
+message(STATUS "  AVX2        : ${GEOMATCH_SIMD}")
+message(STATUS "  GUI 界面    : ${GEOMATCH_BUILD_GUI}")
+message(STATUS "  输出目录    : ${CMAKE_BINARY_DIR}")
+message(STATUS "  下一步      : cmake --build ${CMAKE_BINARY_DIR}")
+message(STATUS "==================================================")
 

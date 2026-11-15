@@ -22,13 +22,12 @@
 // 256-bit path.  MSVC does not predefine __AVX2__, it only honours /arch:AVX2
 // at code generation time, so the macro is defined by the build system below.
 #if !defined(SM_USE_AVX2)
-#  if defined(__AVX2__) || defined(_M_X64)
-#    if !defined(_M_IX86)   // 32-bit MSVC cannot reach ymm without /arch
-#      define SM_USE_AVX2 1
-#      include <immintrin.h>
-#    else
-#      define SM_USE_AVX2 0
-#    endif
+#  if defined(__AVX2__)
+#    define SM_USE_AVX2 1   // /arch:AVX2 was given (MSVC defines this for x86
+                             // and x64 alike -- verified on the 32-bit build,
+                             // which printed "__AVX2__ defined")
+#  elif defined(_M_X64)
+#    define SM_USE_AVX2 1   // x64 baseline
 #  else
 #    define SM_USE_AVX2 0
 #  endif
@@ -36,6 +35,16 @@
 #if SM_USE_AVX2
 #  include <immintrin.h>
 #endif
+
+// reports what this translation unit was really compiled with (see the header)
+int shapeSimdWidth()
+{
+#if SM_USE_AVX2
+    return 256;
+#else
+    return 0;
+#endif
+}
 
 // restrict qualifier: MSVC spells it __restrict, gcc/clang __restrict__
 #if !defined(SM_RESTRICT)
@@ -859,9 +868,20 @@ namespace
         const int h = gray8.rows, w = gray8.cols;
         gx16.create(h, w, CV_16F);
         gy16.create(h, w, CV_16F);
-        // 8-bit mirror of the same normalised gradients (coarse scan kernel)
+        // 8-bit mirror of the same normalised gradients.  Only ScanInvoker8
+        // consumes it, and that kernel exists in an AVX2 build only -- so a
+        // build without /arch:AVX2 must not pay for the mirror, otherwise the
+        // scalar preprocess does the work twice for nothing (measured: 15.5 ->
+        // 31.7 ms on a 32-bit build while the coarse scan gained nothing).
+#if SM_USE_AVX2
+        const bool wantMirror = true;
         q8.create(h, w, CV_8SC2);
         m8.create(h, w, CV_8U);
+#else
+        const bool wantMirror = false;
+        q8.release();
+        m8.release();
+#endif
 
         // one padding element on each side holds the BORDER_REFLECT_101 value,
         // so the inner loop never needs a branch for x == 0 or x == w-1
@@ -916,8 +936,8 @@ namespace
             // horizontal difference / smoothing + normalization + half store
             unsigned short* gxr = gx16.ptr<unsigned short>(y);
             unsigned short* gyr = gy16.ptr<unsigned short>(y);
-            signed char* qr = q8.ptr<signed char>(y);
-            uchar* mr = m8.ptr<uchar>(y);
+            signed char* qr = wantMirror ? q8.ptr<signed char>(y) : nullptr;
+            uchar* mr = wantMirror ? m8.ptr<uchar>(y) : nullptr;
             x = 0;
 #if SM_USE_AVX2
             for (; x + 8 <= w; x += 8)
@@ -993,13 +1013,15 @@ namespace
 #else
                 gxr[x] = f32ToF16(ox);
                 gyr[x] = f32ToF16(oy);
-                ox = f16ToF32(gxr[x]);
-                oy = f16ToF32(gyr[x]);
 #endif
-                const bool keep = (ox * ox + oy * oy) >= w0sq;
-                qr[2 * x]     = keep ? (signed char)cvRound(ox * (float)kQ8) : (signed char)0;
-                qr[2 * x + 1] = keep ? (signed char)cvRound(oy * (float)kQ8) : (signed char)0;
-                mr[x] = keep ? (uchar)1 : (uchar)0;
+                // the mirror is only built in an AVX2 build (see wantMirror)
+                if (wantMirror)
+                {
+                    const bool keep = (ox * ox + oy * oy) >= w0sq;
+                    qr[2 * x]     = keep ? (signed char)cvRound(ox * (float)kQ8) : (signed char)0;
+                    qr[2 * x + 1] = keep ? (signed char)cvRound(oy * (float)kQ8) : (signed char)0;
+                    mr[x] = keep ? (uchar)1 : (uchar)0;
+                }
             }
         }
     }
@@ -1847,6 +1869,24 @@ namespace
         const int R = std::max(1, xf.R);
         const int GRID = 4;                 // 4x4 template cells
         const int CELLS = GRID * GRID;
+        // "图像梯度是否足够强"的参考阈值：评分口径用 skipWeight，但它为 0
+        // （默认 = Halcon 口径，全部模型点都参与平均）时，这个判据不能跟着失效
+        // —— 否则 missShare 恒为 0，cellMissMax 等于关掉。故回落到 0.9。
+        const float wCell = (w0 > 0.f) ? w0 : 0.9f;
+        // 分数口径（2026-11-15）：方向余弦，即 Halcon 的"归一化梯度点积"。
+        // 存储的梯度平面是 单位方向 * w，其中
+        //     w = 1                 (|grad| >= minContrast)
+        //     w = (|grad|/mc)^2     (|grad| <  minContrast)
+        // 所以 dot / |stored| 就是方向余弦；Halcon 的分母永远是全部模型点，
+        // 且"该处没有边"时点积记 0 —— 这里用 kEdgeMin 表示"没有边"。
+        // 不做这一步时（旧行为）弱边点的贡献被 w 衰减到 0.1~0.6，data1 上
+        // 全点均值只有 0.636，而 Halcon 是 0.956；做完这一步两者同量级。
+        const float kEdgeMin = []()
+        {
+            const char* e = std::getenv("SM_EDGE_MIN");       // calibration knob
+            return e ? (float)std::atof(e) : 0.05f;
+        }();
+        static const bool cosNorm = (std::getenv("SM_NO_COSNORM") == nullptr);
         int cellTot[CELLS];
         int cellKept[CELLS];
         for (int c = 0; c < CELLS; c++) { cellTot[c] = 0; cellKept[c] = 0; }
@@ -1863,8 +1903,18 @@ namespace
             const float len2 = gx * gx + gy * gy;         // = w^2 (soft weight)
             const bool st = (w0 <= 0.f) || (len2 >= w0 * w0);
             strong[(size_t)k] = st ? 1 : 0;
-            dots[(size_t)k] = xf.nx[k] * gx + xf.ny[k] * gy;
-            total += dots[(size_t)k];
+            {
+                const float raw = xf.nx[k] * gx + xf.ny[k] * gy;
+                float d = raw;
+                if (cosNorm)
+                {
+                    const float len = std::sqrt(len2);
+                    d = (len >= kEdgeMin) ? raw / len : 0.f;   // 没有边 -> 0
+                    d = std::min(1.f, std::max(-1.f, d));
+                }
+                dots[(size_t)k] = d;
+                total += d;
+            }
             if (st) keptAll++;
 
             {
@@ -1872,14 +1922,14 @@ namespace
                 const int cy = std::min(GRID - 1, std::max(0, (int)((xf.oy[k] + R) * GRID / (2 * R + 1))));
                 const int c = cy * GRID + cx;
                 cellTot[c]++;
-                if (st) cellKept[c]++;
+                if (len2 >= wCell * wCell) cellKept[c]++;
             }
         }
 
         const bool flip = (metric == POL_GLOBAL && total < 0.0);
 
-        // skipWeight（对齐 Halcon）：mean/clipped 只对"有效点"取平均。
-        // coverage 仍以全部 n 为分母（见上面的说明）。
+        // 默认口径（skipWeight = 0）：mean/clipped 对全部 n 个模型点取平均 = Halcon；
+        // 设了 skipWeight 则只对"有效点"取平均，coverage 仍以全部 n 为分母。
         const int minKept = std::max(8, n / 4);
         double sum = 0.0, posSum = 0.0, absSum = 0.0;
         int cnt = 0;
@@ -1921,7 +1971,26 @@ namespace
             ps.coverage = n > 0 ? (float)agree * invN : 0.f;
         }
 
-        // share of template cells that are effectively empty in this image
+        // A cell counts as "missing" when less than kCellKeepMin of its model
+        // points sit on a usable image gradient.
+        //
+        // Calibration (2026-11-15, SM_DUMP_CELLS + _ai_tmp/cells_probe.ps1):
+        //   - the U-bend / serpentine template of this log, pose shifted by 86 px
+        //     (the case users report as "overlapping duplicates with high score")
+        //     keeps 0.18~0.37 in the shifted-away half -> missShare 0.10 at 0.2
+        //     but 0.375 at 0.4 (rejected) and 0.5 at 0.5.
+        //   - data2 (-90deg cluster, weak appearance) keeps 0.00~0.5 scattered,
+        //     so missShare becomes 0.4~0.67 at 0.4 and 0.5~0.71 at 0.5
+        //     -> tightening globally costs 8 of 35 true detections.
+        // i.e. "part of the template has no image gradient" cannot separate a
+        // shifted false pose from a weak but correct one, so 0.2 stays the
+        // default; SM_CELL_KEEP lets an application tighten it when its targets
+        // really do have dense edges everywhere.
+        const float kCellKeepMin = []()
+        {
+            const char* e = std::getenv("SM_CELL_KEEP");      // calibration knob
+            return e ? (float)std::atof(e) : 0.2f;
+        }();
         {
             int judged = 0, missing = 0;
             for (int c = 0; c < CELLS; c++)
@@ -1929,7 +1998,7 @@ namespace
                 if (cellTot[c] < 4) continue;              // too few points to judge
                 judged++;
                 const float share = (float)cellKept[c] / (float)cellTot[c];
-                if (share < 0.2f) missing++;
+                if (share < kCellKeepMin) missing++;
             }
             ps.missShare = judged > 0 ? (float)missing / (float)judged : 0.f;
         }
@@ -3273,19 +3342,18 @@ std::vector<MatchResult> ShapeMatcher::findShapeModel(const cv::Mat& gray, const
         results.push_back(m);
     }
 
-    //---- optional robust re-scoring of the final matches ------------------
-    // the search / refine used mean (scorePos); if a different score mode is
-    // requested, re-aggregate the per-point dot products at the found pose.
-    // this only changes the reported confidence, never the pose.
-    // minCoverage rides along: the same pass also yields the fraction of
-    // model points that agree, which is what separates a real instance from a
-    // look-alike spot on a repetitive pattern.
+    //---- robust re-scoring of the final matches --------------------------
+    // the search / refine used the magnitude-damped dot product for ranking;
+    // the score that is *reported* must be the one a user compares with Halcon:
+    // mean over all model points of the direction cosine ("scoreMode 0").
+    // This pass also yields coverage (fraction of agreeing points) and is the
+    // only place the reported value is produced, so it always runs.
+    // Cost: one n-point pass per reported match.
     //
     // The "template cell missing" verdict (missShare) is already applied while
     // collecting the results (see above), so every match reaching this pass has
     // passed cellMissMax.
-    if ((fp.scoreMode != 0 || fp.minCoverage > 0.f || fp.skipWeight > 0.f)
-        && !results.empty())
+    if (!results.empty())
     {
         int64 trs0 = cv::getTickCount();
         for (size_t ri = 0; ri < results.size(); ri++)
@@ -3342,6 +3410,19 @@ std::vector<MatchResult> ShapeMatcher::findShapeModel(const cv::Mat& gray, const
             keep.reserve(results.size());
             for (const MatchResult& r : results)
                 if (r.coverage >= fp.minCoverage) keep.push_back(r);
+            results.swap(keep);
+        }
+        // Re-apply the score threshold to the *final* score.  Until now only the
+        // candidate score was checked (`if (c.score < minScore) break;` while
+        // collecting); a different score mode can lower the reported value below
+        // the user's minScore, and such a match would still be listed with a
+        // printed score that contradicts the setting.
+        if (fp.minScore > 0.f)
+        {
+            std::vector<MatchResult> keep;
+            keep.reserve(results.size());
+            for (const MatchResult& r : results)
+                if (r.score >= fp.minScore) keep.push_back(r);
             results.swap(keep);
         }
         phRescore = msSince(trs0);

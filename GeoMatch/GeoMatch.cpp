@@ -1009,6 +1009,11 @@ std::string environmentReport()
     std::ostringstream os;
     os << "OpenCV " << CV_VERSION << "\n";
     os << "CPU     : " << cv::getCPUFeaturesLine() << "\n";
+    // what the shape engine was really compiled with (not what this TU sees)
+    const int sw = shapeSimdWidth();
+    os << "  -> shape engine SIMD: "
+       << (sw > 0 ? std::to_string(sw) + "-bit AVX2 kernels" : std::string("scalar fallback"))
+       << "\n";
 #if defined(__AVX2__)
     os << "  -> __AVX2__ defined (256-bit SIMD available)\n";
 #endif

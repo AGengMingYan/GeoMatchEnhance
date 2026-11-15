@@ -52,6 +52,8 @@ _sdk64dll
 _sdk32
 build_dll64
 build_x86
+# Visual Studio 生成器的输出目录（cmake -G "Visual Studio 16 2019" ... -B build_vs）
+build_vs
 
 # 本机加密软件产生的图片/文件密文备份（原名后追加 .txt，仅本地使用，见 .clinerules）
 *.png.txt

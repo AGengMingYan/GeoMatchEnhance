@@ -227,8 +227,9 @@ namespace
         cfg.debug      = (int)gArgD(a, "-debug", 0);
         cfg.scoreMode  = (int)gArgD(a, "-score-mode", 0);
         cfg.minCoverage = (float)gArgD(a, "-min-cover", 0.0);
-        // -skip-w 0 关闭"跳过弱梯度点"；默认 0.9（对齐 Halcon，见 FindParams::skipWeight）
-        cfg.skipWeight = (float)gArgD(a, "-skip-w", 0.9);
+        // -skip-w 0（默认）= 按全部模型点平均（Halcon 口径）；0.9 = 跳过弱梯度点
+        // （追召回用，但只对上模板一部分的位姿会被抬分，见 FindParams::skipWeight）
+        cfg.skipWeight = (float)gArgD(a, "-skip-w", 0.0);
         // -cell-miss 0 关闭"模板局部缺失"拒绝；默认 0.35（见 FindParams::cellMissMax）
         cfg.cellMissMax = (float)gArgD(a, "-cell-miss", 0.35);
         // minDistance only when asked for, so the value stored in the model wins

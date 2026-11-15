@@ -1337,3 +1337,251 @@ preprocess 1.5~3 ms；Halcon 同图 **2~3 ms**。
 的默认值。**改 CLI 参数后自检方法**：故意传一个极端值（`-skip-w 0`），结果必须变化；
 不变就说明参数没接上。
 
+
+---
+
+## 严重：32 位构建里 `SM_USE_AVX2` 被 `!_M_IX86` 守卫静默关掉（2026-11-15 实测）
+
+用户报「`build_x86\GeoGUIDemo.exe` 要 100 ms，以前 40 ms」。查下来是**两个独立问题**叠加：
+
+### 1. `SM_USE_AVX2` 在 x86 上是 0（不是 Q8 的锅，是更早就存在）
+
+```cpp
+// 旧写法（错）
+#  if defined(__AVX2__) || defined(_M_X64)
+#    if !defined(_M_IX86)   // 注释说 "32-bit MSVC cannot reach ymm without /arch"
+#      define SM_USE_AVX2 1
+#    else
+#      define SM_USE_AVX2 0   // ← 32 位即使 /arch:AVX2 也在这里被砍
+```
+
+事实：两份 `build.ninja` 的 `FLAGS` 都是 `/O2 /arch:AVX2`，**MSVC 在 x86 上也定义 `__AVX2__`**
+（GUI 横幅 `-> __AVX2__ defined` 就是那行 `GeoMatch.cpp` 打的）。所以 32 位白白丢了
+融合预处理 / `ScanInvoker` / `ScanInvoker8` 三条 SIMD 路径，只剩逐像素标量。
+
+改成 `#if defined(__AVX2__)` 优先之后（同图同模板，360°，1280×1024）：
+
+| 构建 | preprocess | topScan | total |
+|---|---|---|---|
+| x86 旧（SIMD 关） | 15.5 ms | 48.2 ms | 85.1 ms |
+| x86 「Q8 但 SIMD 关」 | 31.7 ms | 44.8 ms | 97.8 ms（用户看到的 100 ms） |
+| **x86 SIMD 开** | 4~7 ms | 27~29 ms | **45~54 ms**（与 x64 44.4 持平） |
+
+### 2. 「为某内核预处理的数据」必须与该内核同条件编译
+
+Q8 的 8 位镜像面 `q8/m8` 在 `gradientHalves()` 里无条件算，但消费它的 `ScanInvoker8`
+只在 AVX2 构建里存在 → SIMD 被砍的构建白付一倍预处理（15.5→31.7 ms），topScan 一分不省。
+**规则：任何派生缓存/量化面的生成代码，都要和它的消费者用同一个条件编译宏包起来**，
+否则在没有消费者的构建里就是纯成本（本次直接把 85 ms 拖成 98 ms）。
+
+### 判断方法（下次 5 分钟能定位）
+
+1. **先确认跑的是哪个 exe**：`build\GeoGUIDemo.exe`（x64）vs `build_x86\GeoGUIDemo.exe`（x86），
+   两者文件名相同、都在各自 build 目录下，最容易搞混。
+2. 用 CLI 复现 GUI 参数（GUI 灰度 ×4 = CLI Sobel 单位）：
+   `GeoMatchDemo -t template.png -s target.jpg -angle 360 -contrast 22 -hi 12 -points 1200 -minscore 0.70 -max 12 -min-dist 30 -debug 2 -noshow`
+3. **看 `preprocess` 的相对值**：x86 比 x64 慢 4~9 倍 = SIMD 没生效（正常应在同一个量级）。
+   `topScan` 慢 2 倍以上同理。`refine/subpixel` 只差 1.3~1.9 倍是正常 32 位开销。
+4. 对比「上一版」不要靠感觉：`git worktree add _ai_tmp\wt_old <commit>` 单独编一份旧代码，
+   用同一个 exe 参数跑同一张图（本次就是这么确认旧 x86 = 85.1 ms 的）。
+5. 不要用 GUI 横幅判断 SIMD 有没有生效 —— 那是另一个 TU 的宏，和热点 TU 可能不一致。
+   （已于 2026-11-15 补上 `shapeSimdWidth()`：横幅现在会打
+   `-> shape engine SIMD: 256-bit AVX2 kernels` / `scalar fallback`，这个才是 `ShapeMatch.cpp` 的真值。）
+
+
+---
+
+## 「多个重叠结果 + 分数很高」的真实原因：skipWeight 的分母（2026-11-15 实测 case1 U 弯模板）
+
+现象（`build/logs/GeoGUIDemo_20261115_081520`）：模板是蛇形走线的 U 弯（215×164），
+搜索参数 `最小间距 30 / 最大重叠 1.00(=关闭) / 最小覆盖率 0`，报 4 个结果，框沿同一条
+竖直走线上下平移（间距 86/93/89/179 px），分数 0.996 / 0.822 / 0.774 / 0.743。
+
+**结论：这不是 NMS 参数问题，是评分口径问题。**
+
+| 位姿 | 我们(默认 skip-w 0.9) | 我们 `-skip-w 0` | Halcon 17 |
+|---|---|---|---|
+| 真值 (847,341) | 0.996 (c=1.00) | 0.995 | **0.9748** |
+| 错位 179 px (850,520) | 0.822 (c=0.74) | 0.546 | **0.5555** |
+| 错位 86 px (849,427) | 0.743 (c=0.70) | 0.459 | **0.4863** |
+| 错位 89 px (853,609) | 0.774 (c=0.75) | 0.508 | **0.4854** |
+
+- `skipWeight` 把「图像上梯度太弱」的模型点从**分子和分母里一起去掉**，
+  于是「只对上模板下半部分」的位姿分母只剩那半 → 分数被抬到 0.82。
+  `mean`/`clipped` 都是这样算的（`scorePoseDetail` 里 `invK = 1/keptAll`）。
+- **Halcon 的分母永远是全部模型点**（图像梯度按点归一化，平坦处贡献≈0），
+  所以同一批位置只有 0.46~0.56。`-skip-w 0` 之后我们与 Halcon 差 ≤0.03，
+  说明公式/几何没问题，差的就是这个口径。
+- **Halcon 的 MaxOverlap 不是这里的决定因素**：Halcon 用 `MaxOverlap=0.5` 时
+  这 4 个位姿**一个不少**（相邻两框只重叠 0.46~0.48 < 0.5），
+  我们是 `MaxOverlap=0.3` 才掉到 2 个；把 MinScore 设回 0.7，Halcon 直接报 1 个。
+  一句话：**Halcon 靠"分数本来就低"过滤，我们靠"分数高但再拿 NMS 兜"是兜不住的。**
+- 另两条辅助闸门在**这个**场景同样无效：
+  - `minCoverage`：误检 0.70~0.75，但 data2 的 −90° 真目标也只有 0.66~0.76 → 冲突；
+  - `maxOverlap`：见上，几何上就不重叠（框高 164，位移 179）。
+- **根因还要看建模**：日志已经在提示「点散布比 1.36 / 法线最集中方向 64%」——
+  模板是平行走线，沿走线方向平移仍能对上大半，模型本身位置判别力就弱；
+  `过阈值像素 9596 > 点数 1200×2` 说明只留了最强的 1/8。
+
+### 「模板局部缺失」判据也分不开这两类（校准数据）
+
+`cellMissShare`（4×4 格，格内"有梯度点占比"低于阈值算缺失）实测：
+
+| 位姿/数据 | cellKeep=0.2（默认） | 0.4 | 0.5 |
+|---|---|---|---|
+| 本案例真值 | 0.00 | 0.00 | 0.00 |
+| 本案例错位 86~179 px | 0.10 | **0.375** | 0.50 |
+| data2 −90° 真目标（36 张） | 0~0.25 | 0.27~0.67 | 0.4~0.71 |
+
+阈值放到 0.4 能拒掉本案例的错位位姿，但 **data2 丢 8/35 命中**（真目标"缺的那块"是分散的
+外观差异，错位位姿是集中一侧，格统计分不开）。所以默认仍是 0.2；
+需要标定时用环境变量 `SM_CELL_KEEP`（`_ai_tmp/cells_probe.ps1` 用 `-cell-miss 0 -max 1`
+保证每张图只打印一个 cells 块）。
+
+### 本次落地
+
+1. `FindParams::skipWeight` / `cellMissMax` 提到 GUI「匹配判据」里（滑块
+   「弱梯度跳过」「模板缺失上限」，并写进日志行的搜索参数），现场可以一键把
+   「弱梯度跳过」调到 0 —— 本案例立刻从 4 个结果变 1 个（0.995）。
+2. 修掉一个真 bug：**rescore 之后没有再按最终分数过 `minScore`**。
+   以前只有候选阶段判一次（`if (c.score < minScore) break;`），换成
+   `scoreMode=1/2/3` 后上报分数可以低于用户设的阈值仍被列出。现在补了一次过滤。
+3. `missShare` 的 per-cell 阈值抽成 `kCellKeepMin` 常量（默认 0.2，`SM_CELL_KEEP` 可覆盖）。
+
+回归验证（同模型/同参数）：data1 前 40 张 **逐位相同（0 lost，|dScore|<1e-6，mean 0.9083）**；
+data2 **35/36 不变**（2 张因为位姿重选分数 +0.04）；case1 7 张全中、分数不变、负样本 0 命中。
+
+### 通用教训
+
+- **分数口径变了要立刻报告"同一批位姿 Halcon 是多少"**，不要只看"我们分数高不高"。
+  两个引擎只有在同一批位置上对比，才能区分「公式错」和「口径错」。
+- 评估"要不要调 NMS"之前，先算一下**框的重叠率**：位移 86 px + 框高 164 = 重叠 0.48，
+  `maxOverlap=0.5` 天然不触发，调它没用。
+- 复制问题现场时，CLI 复现 GUI 必须换算：GUI「灰度差」×4 = CLI `-contrast/-hi`
+  （本案例 `minContrast 8.6 / hi 11.9` → `-contrast 34.4 -hi 47.6`，否则点数/分数都对不上）。
+
+
+---
+
+## 分数口径改为「Halcon 语义」为默认（2026-11-15 落地，上一条的后续）
+
+上一条记录了 `skipWeight` 如何把"只对上模板一部分"的位姿抬到 0.82。用户要求
+**分数要可信、宁可真目标分下降**，所以默认口径整体换成 Halcon：
+
+1. `skipWeight` 默认 **0**（库 `FindParams` / `Config` / CLI `-skip-w` / GUI 滑块全部 0）：
+   分母恒为**全部模型点**。0.9 保留为"追召回"选项（分数会虚高 0.1~0.27）。
+2. `scorePoseDetail` 增加**方向余弦归一化**（Halcon 的"归一化梯度点积"）：
+   我们的梯度平面存的是 `单位方向 * w`（`w=1` 当 `|grad|>=minContrast`，否则 `(m/mc)^2`），
+   所以 `dot/|stored|` 就是 cos；`|stored| < SM_EDGE_MIN`（默认 0.05）的点记 0
+   （= Halcon 的"该处没有边 → 点积 0"）。不加这一步，弱边点先被 w 衰减一次，
+   data2 的 −90° 簇只有 0.67，加完是 0.93。
+3. **上报分数改成详情分数**：以前 `scoreMode=0 && minCoverage=0 && skipWeight=0` 时
+   根本不跑 rescore，报出去的是搜索用的幅值加权分数。现在 rescore **恒跑**
+   （每个结果一次 n 点 pass，含一个 sqrt/Pt；U 弯 360° 搜索仍 33 ms，无感），
+   并在 rescore 之后**按最终分数重新过 `minScore`**（以前只在候选阶段判一次）。
+4. `cellMissMax` 的"强梯度"判据与 `skipWeight` 解耦（`wCell = skipWeight>0 ? skipWeight : 0.9`），
+   否则默认 0 时所有点都算"强"、missShare 恒 0、闸门等于关掉。
+
+### 实测（同一批模型/图）
+
+| 场景 | 改前(skip 0.9, 幅值加权) | 改后(默认) | Halcon |
+|---|---|---|---|
+| U 弯真值 | 0.996 | **1.000** | 0.9748 |
+| U 弯 3 个错位位姿 | 0.822/0.774/0.743 | **0.554/0.521/0.485** | 0.556/0.486/0.485 |
+| U 弯 minScore 0.7 | 4 个结果 | **1 个结果** | 1 个 |
+| 模板只贴 55%（假目标） | 0.966（靠 cellMissMax 拒） | **0.476**（分数自己就低） | — |
+| case1 7 张真目标 | 0.842~0.989 | **0.838~0.989** | 0.478~0.984 |
+| data2 −90° 簇 | 0.67（35/36 命中 @0.5） | **0.41~0.50**（5/36 @0.5、36/36 @0.40） | 0.50~0.60 |
+
+- **data2 的召回下降是这次的必然代价**：那批目标本来就是"外观差异 + 弱对比"，
+  Halcon 也只给 0.5~0.6。要召回就把 `minScore` 降到 0.40，或临时把弱梯度跳过调回 0.9。
+- 只贴一半模板的假目标现在**不靠 cellMissMax 也过不了** 0.7 阈值 —— 分数本身可信了。
+
+### 另一半原因：**建模对比度**（很容易被忽略）
+
+data1 焊盘模板用 CLI 默认 `-contrast 12 -hi 30`（Sobel 单位 = GUI 灰度差 3/7.5）建的模型，
+全点均值只有 **0.647 / min 0.511**；同一批图换成 `-contrast 60 -hi 90` → **0.958**、
+`-contrast 120 -hi 160` → **0.983 / min 0.963**（Halcon 0.956），而点数仍是 1197/1198。
+
+原因：阈值太低时模型里混进了大量弱边点，这些点在任何图上的方向都不可靠，
+**全点平均必然低**。Halcon 的 `create_shape_model` 默认 `Contrast=30` 是**灰度单位**
+（≈ 我们 Sobel 120），GUI 的「最小对比度」也是灰度单位，默认却只有 3.0。
+
+⚠ 不能把默认一刀切提高：`case1\temp.jpg`（U 弯，低对比）在 Sobel 120/160 下**建不出模型**。
+判断方法：看建模日志的「最弱点的梯度只有最强点的 X%」——X 很小（<15%）说明模型里混了弱边点，
+此时提高「最小对比度」比调评分参数更能让分数可信。扫描脚本：`_ai_tmp/contrast_sweep.ps1`。
+
+### 踩坑
+
+`_ai_tmp/reshape.ps1` 的 `-SkipW off` 之前**根本没用**（只设 `$env:SM_SKIPW`，不传参数给 exe），
+所以早先"skip-w 0 与 0.9 逐位相同"的结论是假的（两次都跑的是同一口径）。
+已改成拼 `-skip-w <v>` 传参。**做 A/B 前先确认参数真的传进去了**（传极端值看结果是否变化）。
+
+
+---
+
+## CMakeLists 整理（2026-11-15）：手动编译一条命令 + 四个踩坑
+
+现在手动编译只有两种姿势（都能用，已实测）：
+
+```
+tools\build-x64.bat        # -> build\*.exe      (vcvars64 + cmake -G Ninja + ninja)
+tools\build-x86.bat        # -> build_x86\*.exe  (vcvars32 + 仓库自带的 OpenCV455_MSVC32)
+```
+手工等价命令（Ninja 没有 -A/PLATFORM，架构由 vcvars 决定）：
+```
+call "...\vcvars64.bat"
+cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -S . -B build
+cmake --build build
+```
+VS 生成器（不用先 call vcvars，能单步调试，已实测 configure+Release 编译通过）：
+```
+cmake -G "Visual Studio 16 2019" -A x64 -S . -B build_vs
+cmake --build build_vs --config Release
+```
+
+`CMakeLists.txt` 里做的事：按 `CMAKE_SIZEOF_VOID_P` 自动选 x64/x86 的 OpenCV（`<root>/x64/vc15/lib`
+或仓库里的平铺 `OpenCV455_MSVC32`），找不到就 `FATAL_ERROR` 并列出试过的路径；POST_BUILD 把
+`opencv_world*.dll` 自动拷到 exe 旁边（以前要手工拷）；`/utf-8 /W3` 全局（消掉一屏 C4819）；
+`-DGEOMATCH_SIMD=OFF` 可关 `/arch:AVX2`；`-DGEOMATCH_BUILD_GUI=OFF` 可只要库和命令行。
+
+### 坑 1：CMake 变量名大小写敏感，写错只表现为"打印为空"
+汇总行写了 `${OPENCV_LIB_RELEASE}`（大写 O），而变量是 `OpenCV_LIB_RELEASE` → 那行打印空白，
+其它配置全对，非常难看出来。**报错/空白优先怀疑拼写，而不是赋值逻辑。**
+
+### 坑 2：`INTERFACE_LINK_LIBRARIES` 不接受 `optimized` / `debug` 关键字
+```
+Add ERROR: Property INTERFACE_LINK_LIBRARIES may not contain link-type keyword "optimized".
+```
+按 Debug/Release 选库必须用生成器表达式：
+```cmake
+"$<$<NOT:$<CONFIG:Debug>>:${rel_lib}>"   "$<$<CONFIG:Debug>:${dbg_lib}>"
+```
+（顺带：给 Debug 也提供 `opencv_world455d.lib`，VS 生成器切 Debug 才不会撞 LNK2038。）
+
+### 坑 3：`install(EXPORT)` 的导出目标里不能出现 `IMPORTED` 目标
+用 `geomatch::opencv`（INTERFACE IMPORTED）连接最省事，但导出时会写成
+`INTERFACE_LINK_LIBRARIES "geomatch::opencv"`，消费方 `find_package(GeoMatch)` 在 generate 阶段
+报"target geomatch::opencv not found"。正确做法是把依赖包进 `BUILD_INTERFACE`：
+```cmake
+target_include_directories(GeoMatch PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+    $<BUILD_INTERFACE:${OpenCV_INCLUDE_DIRS}>
+    $<INSTALL_INTERFACE:include>)
+target_link_libraries(GeoMatch PUBLIC
+    "$<BUILD_INTERFACE:$<$<NOT:$<CONFIG:Debug>>:${OpenCV_LIB_RELEASE}>>")
+```
+这样自己编 exe 时依赖照样传递，导出的 `GeoMatchTargets.cmake` 里**只剩** `GEOMATCH_STATIC`
+和 `${_IMPORT_PREFIX}/include`（SDK 消费方按 docs/SDK.md 自己链 OpenCV，不会引用本机绝对路径）。
+校验办法：`cmake --install build --prefix <tmp>` 后 `Select-String INTERFACE_` 看导出文件。
+
+### 坑 4：`editor` 的 `insert_line=<EOF>` 可能插进未闭合的块里
+这次往 CMakeLists 末尾追加内容，正好落在 `foreach(...)  geomatch_copy_opencv_dll(${t})` 之后、
+`endforeach()` 之前 → 后面所有 `add_executable` 都被包进循环，报一串
+"add_executable cannot create target X because another target with the same name already exists"。
+**追加后立刻 grep 块关键字核对**：
+```powershell
+Select-String -Path CMakeLists.txt -Pattern '^\s*(if|foreach|function|macro)\(|^\s*endif|endforeach|endfunction|endmacro'
+```
+数量必须成对，且 `endforeach` 不能跑到文件最后一行。
+
