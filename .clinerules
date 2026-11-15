@@ -1651,3 +1651,59 @@ powershell -File tools\publish-release.ps1 -Tag 1.1.1 -File release_GeoGUIDemo_x
    ```
    本次回读 25,264,274 字节与本地一致、`testzip()=None`、22 个条目、顶层目录 `GeoGUIDemo-1.1.1`。
 
+
+---
+
+## 文档图片与抽样数据集的维护（2026-11-15）
+
+### README 的图怎么重新生成（不要手工截图）
+
+`docs/model_info.png`、`docs/match_result.jpg`、`docs/match_result_2/3/4.jpg` 全部是
+**CLI 画出来的**，不是 GUI 截图：
+
+```bat
+REM 先把输出目录建好，否则 program 写 model_info.png 时目录还不存在 → 静默不生成
+mkdir _ai_tmp\docout
+GeoMatchDemo -t case1\temp.jpg -d case1 -o _ai_tmp\docout -loops 5 -minscore 0.70 -max 12 -noshow
+REM out\model_info.png (846x444) → docs\model_info.png
+REM out\tmp_grab_1762994178.jpg (1280x1024) → docs\match_result.jpg
+REM 其余三张按 README 表格对应的图（203/464/529）缩到 1024 宽 → match_result_2/3/4.jpg
+```
+缩放/拷贝一律用 **System.Drawing**（`_ai_tmp/make_readme_figs.ps1`），不要用 python/cv2：
+python 写的 jpg 在磁盘上是密文，`read_files` 上传会被服务端拒收。
+
+> 顺带：**`-o` 指向一个不存在的目录时 model_info.png 不会生成**（imwrite 静默失败），
+> 只有结果图会因为后面才建目录而写出来。所以先 `mkdir`。
+
+### 位置参数不是搜索目录
+
+`GeoMatchDemo -t tpl.jpg <dir>` 里的 `<dir>` **不会被当成搜索目录**（实际搜的是默认的
+`case1`），必须写 `-d <dir>`。用位置参数配合 `-minscore 0.5` 会得到"全 0 命中"的假象
+（本次就踩了：sample\data1 用位置参数 0/6，改成 `-d` 后 6/6、分数 0.886~1.000）。
+
+### 抽样数据集
+
+- `dataset/sample/data1`（焊盘 140×140 + 6 图）、`dataset/sample/data2`（通孔 110×110 + 8 图），
+  共约 5 MB，入库；其余 `dataset/*` 仍被忽略，规则是：
+  ```
+  dataset/*
+  !dataset/sample/
+  ```
+- 入库前必须验证是**明文图片**（头 `FF D8 FF`）且能被 cv2 读：`Copy-Item` 出来的文件
+  字节与源一致，但用 python 之类写会被加密。
+- 实测（x64 Release 1.1.1，`-max 1`）：
+  - data1：`-angle 20 -contrast 120 -hi 160 -minscore 0.5` → **6/6**，0.886~1.000，
+    角度 ±1.2°。默认 12/30 只有 ~0.65（模型混了弱边点，见上一条对比度结论）。
+  - data2：`-angle-start -100 -angle 200 -minscore 0.4` → **7/8**；0° 组 0.905~0.995，
+    −90° 组 0.437~0.442（Halcon 同图 0.5~0.6），1 张 0.40 阈值下未检出。
+- 文档：`dataset/sample/README.md` 写清尺寸/跑法/实测分数；根 README 有「样例数据」章节。
+
+### 还没更新的图（需要 GUI 自动化）
+
+`docs/img/step*.png`（三步测试Demo 的 6 张界面图）、`docs/gui_model_info.png`、
+`docs/gui_match_result.jpg` 仍是 1.1.0 的界面（评分方式显示 positive-mean、最小分数 0.5、
+没有「弱梯度跳过 / 模板缺失上限」两个滑块）。这些必须在真实界面里截，
+且原图带红色标注框 + 编号，重新生成需要鼠标自动化（`_ai_tmp/gui_shot.ps1` 只能整窗截图，
+不能拖动 ROI / 点按钮）。`docs/synth_*.png`、`docs/match_a/b_result.jpg` 的源数据已不在仓库里，
+无法重新生成。
+

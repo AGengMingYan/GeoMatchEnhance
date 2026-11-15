@@ -95,12 +95,12 @@ Release 构建自动开启 `/O2 /arch:AVX2`。
 仓库自带两组抽样数据（`dataset/sample/`，共约 5 MB；完整数据集体积大，不入库），
 clone 下来就能直接验证效果，方便写脚本时有固定输入：
 
-```bash
-# 白色焊盘（锐边、多个实例）：6/6 检出，得分 0.886~1.000
+```bat
+REM 白色焊盘（锐边、多个实例）：6/6 检出，得分 0.886~1.000
 GeoMatchDemo -t dataset/sample/data1/template_pad.jpg -d dataset/sample/data1 ^
              -angle 20 -contrast 120 -hi 160 -minscore 0.5 -max 1 -noshow
 
-# 通孔标记（同一批图有 0° 与 -90° 两簇朝向）：7/8 检出
+REM 通孔标记（同一批图有 0 度与 -90 度两簇朝向）：7/8 检出
 GeoMatchDemo -t dataset/sample/data2/template_via.jpg -d dataset/sample/data2 ^
              -angle-start -100 -angle 200 -minscore 0.4 -max 1 -noshow
 ```
