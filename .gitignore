@@ -75,6 +75,8 @@ out/
 # 只保留抽样目录 dataset/sample/（约 5 MB），clone 后能立刻跑测试
 dataset/*
 !dataset/sample/
+# Halcon 经典示例图（螺母/卡簧/齿轮/圆环/logo，20 张约 11 MB），用于形状匹配多实例测试
+!dataset/image/
 
 # 本机明文加密包约定扩展名（.zip/.7z 落盘即密文，详见 .clinerules）
 *.zip1
