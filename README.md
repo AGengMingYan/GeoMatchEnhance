@@ -59,6 +59,7 @@ geo-match-enhance/
 ├── main1.cpp            # 简化版交互 Demo
 ├── GeoGUIDemo.cpp       # ImGui 图形界面（两种匹配方式共用）
 ├── case1/               # 示例模板与搜索图
+├── tools/               # 构建/发布/对比脚本（build-x64.bat、gen_synth.py 生成合成样本等）
 ├── CMakeLists.txt
 └── docs/                # 本文档引用的测试图片
 ```
@@ -92,7 +93,7 @@ Release 构建自动开启 `/O2 /arch:AVX2`。
 
 ## 样例数据
 
-仓库自带两组抽样数据（`dataset/sample/`，共约 5 MB；完整数据集体积大，不入库），
+仓库自带三组抽样数据（`dataset/sample/`，共约 17 MB；完整数据集体积大，不入库），
 clone 下来就能直接验证效果，方便写脚本时有固定输入：
 
 ```bat
@@ -103,7 +104,16 @@ GeoMatchDemo -t dataset/sample/data1/template_pad.jpg -d dataset/sample/data1 ^
 REM 通孔标记（同一批图有 0 度与 -90 度两簇朝向）：7/8 检出
 GeoMatchDemo -t dataset/sample/data2/template_via.jpg -d dataset/sample/data2 ^
              -angle-start -100 -angle 200 -minscore 0.4 -max 1 -noshow
+
+REM 合成样本（16 个角度 × 5 个缩放＝80 张，文件名编码真值）：80/80 检出
+GeoMatchDemo -t case1/temp.jpg -d dataset/sample/synth ^
+             -angle 360 -smin 0.7 -smax 1.3 -minscore 0.5 -max 1 -noshow
 ```
+
+> 合成样本用来验证**旋转 + 缩放精度**：文件名里的 `a+45.0_s085` 表示真值角度 +45.0°、
+> 缩放 0.85。实测 80/80 全部检出，角度误差 ≤0.30°（均值 0.06°），缩放误差 ≤0.005，
+> 分数 0.856~0.928。需要别的角度/缩放组合可以用
+> `python tools/gen_synth.py --out <目录>` 重新生成（脚本会自动按真值命名）。
 
 > `-contrast 120 -hi 160` 是 data1 的关键：焊盘边缘很锐利，用默认的 12/30（= 界面上
 > 灰度差 3/7.5）建模型会混进大量弱边点，全点均值只有 ~0.65；提到 120/160 后模型点

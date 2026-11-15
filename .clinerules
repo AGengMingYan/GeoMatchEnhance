@@ -1707,3 +1707,34 @@ python 写的 jpg 在磁盘上是密文，`read_files` 上传会被服务端拒�
 不能拖动 ROI / 点按钮）。`docs/synth_*.png`、`docs/match_a/b_result.jpg` 的源数据已不在仓库里，
 无法重新生成。
 
+
+---
+
+## 生成/校验「合成样本」的两条通用结论（2026-11-15）
+
+1. **`%+05.1f` 的 5 是「含符号的总宽度」**：`'%+05.1f' % 45.0` → `+45.0`（**不是** `+045.0`），
+   只有 ≥100° 才变 6 字符 `+120.0`。文件名按 `synth_a%+05.1f_s%03d.jpg` 生成没问题，
+   但**校验/匹配文件名必须用宽松正则** `[+-]\d+\.\d`，写死 `[+-]\d{3}\.\d` 会 80 张全匹配不到。
+2. **入库的合成样本用 JPEG(q92) + 700×700**：同一套 80 张 900×900 PNG 是 **41 MB**，
+   改成 700×700 q92 只有 **12 MB**，而精度无可见差别（两种都是 80/80、角度误差 ≤0.30°）。
+   噪声大的图 PNG 压不动，仓库里放大图前先看体积。
+
+## PowerShell 的 `>` 重定向写的是 UTF-16LE，python 按 utf-8 读会「no rows parsed」
+
+`& .\tool.exe ... | ForEach-Object { "$_" } > out.txt` 落盘是 **FF FE** 开头的 UTF-16，
+python `open(..., encoding='utf-8')` 一行都匹配不到、**还不报错**（结果为空，极易误判成程序没输出）。
+两种改法：
+
+- 推荐：`[System.IO.File]::WriteAllLines($p, $lines, (New-Object System.Text.UTF8Encoding($false)))`
+  （powershell .NET API 在白名单里，落盘是明文、无 BOM）；
+- 或 python 侧直接 `encoding='utf-16'`。
+
+**不要改成 `cmd /c ... > out.txt`** —— 那条路径落盘是密文（见第 1 节）。
+
+## run_commands 里写 `@"..."@` here-string 会直接语法错误
+
+想临时拼一个 .bat 时不要用 here-string：会被拆成多条 PowerShell 语句，报
+「here-string 标题后面和行尾之前不允许包含任何字符」「setlocal 无法识别」「for 缺少左括号」。
+正确做法：用 `editor` 工具把批处理内容写成 `_ai_tmp\xxx.bat`，再 `cmd /c _ai_tmp\xxx.bat`，
+一次就成（本机解密 80 张图就是这么跑的）。
+
