@@ -71,8 +71,10 @@ build_vs
 # CLI / Demo 匹配结果输出目录
 out/
 
-# 外部标准数据集（Oxford 等，体积大，可重新下载，不入库）
-dataset/
+# 外部标准数据集（体积大，可重新采集，整包不入库）
+# 只保留抽样目录 dataset/sample/（约 5 MB），clone 后能立刻跑测试
+dataset/*
+!dataset/sample/
 
 # 本机明文加密包约定扩展名（.zip/.7z 落盘即密文，详见 .clinerules）
 *.zip1
