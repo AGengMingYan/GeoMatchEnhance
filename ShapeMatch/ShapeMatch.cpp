@@ -1097,6 +1097,14 @@ void ShapeMatcher::correlate(int level, int aIdx, int sIdx, cv::Mat& scoreMap, i
         buildKernel(xf);
     R = xf.R;
 
+    // Same guard as correlateSparseX: filter2D below would be fine, but the crop
+    // uses (rows - 2R) which goes negative once the kernel outgrows the level.
+    if (2 * R + 1 > srcGx_[level].rows || 2 * R + 1 > srcGx_[level].cols)
+    {
+        scoreMap.release();
+        return;
+    }
+
     const float invN = 1.f / std::max(1, xf.n);
     if (useOCL_)
     {
@@ -1603,6 +1611,17 @@ void ShapeMatcher::correlateSparseX(int level, const XForm& xf, cv::Mat& scoreMa
     R = xf.R;
     const int K = 2 * R + 1;
     CV_Assert(srcGx_[level].type() == CV_16F && srcGy_[level].type() == CV_16F);
+    // A pose whose correlation kernel is bigger than the (pyramid) search image
+    // has no valid position at all.  cv::Mat::create would abort on the negative
+    // size (Assertion s >= 0 in cv::setSize), which makes a too wide scale range
+    // or an oversized ROI kill the whole process instead of just finding nothing.
+    // An empty map is treated as "no candidate" by every consumer
+    // (extractCandidates / minMaxSerial both tolerate empty input).
+    if (K > srcGx_[level].rows || K > srcGx_[level].cols)
+    {
+        scoreMap.release();
+        return;
+    }
     scoreMap.create(srcGx_[level].rows - K + 1, srcGx_[level].cols - K + 1, CV_32F);
 
     double g = std::min(std::max(greed, 0.0), 0.98);
@@ -2380,6 +2399,12 @@ void ShapeMatcher::scanLocalPolarity(int level, const XForm& xf, cv::Mat& scoreM
     const cv::Mat& gx = srcGx_[level];
     const cv::Mat& gy = srcGy_[level];
     CV_Assert(gx.type() == CV_16F && gy.type() == CV_16F);
+    if (K > gx.rows || K > gx.cols)
+    {
+        // model bigger than the level image: no valid position (see correlateSparseX)
+        scoreMap.release();
+        return;
+    }
     scoreMap.create(gx.rows - K + 1, gx.cols - K + 1, CV_32F);
 
     const int n = xf.n;

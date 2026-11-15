@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.15)
-project(GeoMatchDemo VERSION 1.1.2 LANGUAGES C CXX)
+project(GeoMatchDemo VERSION 1.1.3 LANGUAGES C CXX)
 
 #===============================================================================
 #  手动编译（推荐，一条命令）

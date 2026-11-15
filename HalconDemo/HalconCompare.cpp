@@ -56,6 +56,10 @@ static double nowMs()
 
 int main(int argc, char** argv)
 {
+    // Unbuffered stdout: Halcon aborts (0xC0000409) instead of throwing when a
+    // parameter is rejected, and block-buffered output would be lost on abort.
+    setvbuf(stdout, NULL, _IONBF, 0);
+
     if (argc < 3)
     {
         printf("usage: HalconCompare <template> <search-dir> [minScore] "

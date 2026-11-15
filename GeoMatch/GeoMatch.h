@@ -29,8 +29,8 @@
 //-----------------------------------------------------------------------
 #define GEOMATCH_VERSION_MAJOR 1
 #define GEOMATCH_VERSION_MINOR 1
-#define GEOMATCH_VERSION_PATCH 2
-#define GEOMATCH_VERSION_STRING "1.1.2"
+#define GEOMATCH_VERSION_PATCH 3
+#define GEOMATCH_VERSION_STRING "1.1.3"
 
 
 //-----------------------------------------------------------------------
