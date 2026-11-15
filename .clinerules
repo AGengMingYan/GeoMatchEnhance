@@ -1585,3 +1585,69 @@ Select-String -Path CMakeLists.txt -Pattern '^\s*(if|foreach|function|macro)\(|^
 ```
 数量必须成对，且 `endforeach` 不能跑到文件最后一行。
 
+
+---
+
+## 发布 1.1.1 实录（2026-11-15）：这台机器**直连 gitee API 已通，不需要 1080 代理**
+
+完整链路（本次全部实测通过）：
+
+```
+# 1) 版本号（两处必须同步）
+GeoMatch/GeoMatch.h        GEOMATCH_VERSION_MAJOR/MINOR/PATCH + _STRING
+CMakeLists.txt             project(GeoMatchDemo VERSION ...)
+
+# 2) 一条命令编两套
+tools\build-x64.bat    ->  build\*.exe
+tools\build-x86.bat    ->  build_x86\*.exe
+
+# 3) 准备 release_GeoGUIDemo_x64\（gitignore 里，不进仓库）
+GeoGUIDemo.exe + opencv_world455.dll + msvcp140*/vcruntime140*/concrt140/vccorlib140
++ README.txt + release_body.md
+（VC 运行时从 C:\Windows\System32 拷 x64 版；readme 用 editor 写 .md 再 PS 转 .txt）
+
+# 4) SDK 目录（install + OpenCV 依赖 + 文档 + 示例）
+powershell -File tools\make-sdk.ps1 -SkipBuild -Version 1.1.1
+
+# 5) 打三个 .zip1
+powershell -File tools\make-release-zips.ps1 -Version 1.1.1
+
+# 6) 提交 + tag + 推送
+git add -u; git add -- tools\build-x64.bat
+git -c i18n.commitEncoding=utf-8 commit -F _ai_tmp\commit_1111.txt
+git -c i18n.commitEncoding=utf-8 tag -a 1.1.1 -F _ai_tmp\tag_1111.txt
+git push origin master 1.1.1
+
+# 7) 建发行版 + 上附件（本机加 -NoProxy！另一台机器才需要 --socks5-hostname 127.0.0.1:1080）
+powershell -File tools\publish-release.ps1 -Tag 1.1.1 -File release_GeoGUIDemo_x64\GeoGUIDemo-1.1.1-win64.zip1 -NoProxy
+（同一条命令再跑 SDK win64 / win32；发行版已存在时脚本会复用 id，不覆盖）
+```
+
+本次结果：tag `1.1.1` = commit `6ac6b18`，发行版 id `1310293`，
+三个附件 + Gitee 自动源码包，正文来自 `release_GeoGUIDemo_x64\release_body.md`。
+
+### 令牌
+
+`Gitee私人令牌.txt`（仓库根目录，`.gitignore` 的 `*令牌*.txt` 已覆盖）里放 32 位十六进制令牌即可，
+`publish-release.ps1` 会自动读（密文也能用 Git 的 cat.exe 解）。**两台机器各放一份，不要进仓库。**
+
+### 三个坑（本次踩到/验证）
+
+1. **验证提交信息别用 PowerShell 管道**：`git show -s --format=%B | Out-File` 会把 UTF-8 显示成
+   "鍒嗘暟鍙ｅ緞…" 这种乱码，看着像提交信息被写坏。正确做法：
+   ```cmd
+   git cat-file commit HEAD > _ai_tmp\raw_commit.bin
+   ```
+   再用 python `open(...,'rb').read()` 解码 `utf-8` 核对（本次实测提交信息是好的）。
+2. **不含 BOM 的 .ps1 里写中文目录名会乱码**：`make-release-zips.ps1` 原来无 BOM，
+   PS5.1 按 GBK 解析 `'图片说明'` → 包里目录名是乱码。1.1.1 已把
+   `make-sdk.ps1` / `make-release-zips.ps1` 统一改成 UTF-8 **带 BOM**。
+   顺带教训：**用 editor 写"补丁脚本"时里面不要出现中文**（脚本本身无 BOM，PS 会按 GBK 读，
+   中文替换文本会被二次编码写进目标文件）。
+3. **发布包必须"远端回读"验证**，不能只看本地：
+   ```bash
+   curl.exe -sSL --ssl-no-revoke -o dl.zip "https://gitee.com/<repo>/releases/download/<tag>/<name>"
+   python -c "import zipfile;z=zipfile.ZipFile('dl.zip');print(z.testzip(), len(z.namelist()))"
+   ```
+   本次回读 25,264,274 字节与本地一致、`testzip()=None`、22 个条目、顶层目录 `GeoGUIDemo-1.1.1`。
+
