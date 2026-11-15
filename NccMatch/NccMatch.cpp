@@ -342,11 +342,17 @@ bool NccMatcher::createNccModel(const cv::Mat& gray, const NccParams& p)
 
     // Smallest template side that still gets its own pyramid level.
     //
-    // 8 allows a 9x9 level for a 154x148 template (5 levels, same as Halcon).
-    // It only became usable after the level-to-level position mapping was fixed
-    // to use the SEARCH image pyramid: with a wrong ratio the candidate was
-    // shifted by pixels per level and the deepest level always failed.
-    const int minSide = 8;
+    // 9 reproduces Halcon 17's own cap.  `get_ncc_model_params` shows Halcon
+    // ignores a larger NumLevels request whenever the next level would be
+    // smaller than ~9 px, and its coarsest patches are: 140x140 -> 5 levels
+    // (9x9), 154x148 -> 5 (10x10), 110x110 -> 4 (14x14), 231x233 -> 5 (15x15)
+    // - i.e. never 8x8.  With 8 we allowed a 6th level for 231x233 (8x8): an
+    // 8x8 NCC over a PCB pad array has no position discrimination left, a wrong
+    // pose scored 0.9179 there while the true pose scores 1.0000 at 5 levels,
+    // so the search refined the wrong pose and reported 0.789 340 px away
+    // (Halcon on the same template / image: 1.0000).  9 fixes that without
+    // costing any levels on the 140x140 / 154x148 / 110x110 templates.
+    const int minSide = 9;
     while (true)
     {
         if (p.numLevels > 0 && (int)pir.size() >= p.numLevels) break;
