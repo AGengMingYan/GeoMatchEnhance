@@ -353,6 +353,7 @@ target_link_libraries(app PRIVATE GeoMatch::GeoMatch ${OpenCV_LIBS})
 |---|---|
 | **[docs/ShapeMatch-vs-Halcon.md](docs/ShapeMatch-vs-Halcon.md)** | 形状匹配 vs Halcon：667 张晶圆图标定图的分数分布、位置一致性、掩码/评分模式等 11 组实验结论 |
 | **[docs/NCC-vs-Halcon.md](docs/NCC-vs-Halcon.md)** | NCC vs Halcon：精度（Δscore/Δpos/Δangle）、速度拆解、旋转模板构建的优化过程与后续方案 |
+| **[docs/数据集四器综合对比-2026-11-16.md](docs/数据集四器综合对比-2026-11-16.md)** | 四器（本项目/Halcon × Shape/NCC）在 `dataset` 抽样/合成/示例图上的检出率、分数、角度一致性、耗时，以及 67 个极端参数用例的鲁棒性矩阵（x64/x86 均 0 崩溃） |
 
 > ShapeMatch 报告写于 2026-11-11，其第 10 节「positive-mean 是通用解」的结论
 > **已于 2026-11-13 被推翻**（错位置会虚高到 0.946，Halcon 只有 0.556），
