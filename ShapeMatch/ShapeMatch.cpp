@@ -186,6 +186,19 @@ namespace
         return (double)(cv::getTickCount() - t0) * 1000.0 / cv::getTickFrequency();
     }
 
+    // Coarse-scan scheduling: how many parallel stripes the (angle x scale)
+    // pose list is split into.  One stripe per pose lets the thread pool spread
+    // the poses over all cores; the old "poses/8" collapsed a short pose list
+    // into a single stripe and ran the whole coarse scan serial.
+    // SM_COARSE_STRIPES=0 restores that old grouping for A/B comparison.
+    double coarseStripes(size_t nPoses)
+    {
+        static const bool grouped = (std::getenv("SM_COARSE_STRIPES") != nullptr &&
+                                     std::atoi(std::getenv("SM_COARSE_STRIPES")) == 0);
+        const double n = std::max(1.0, (double)nPoses);
+        return grouped ? std::max(1.0, n / 8.0) : n;
+    }
+
     bool oclUsable()
     {
         static int cached = -1;
@@ -883,12 +896,6 @@ namespace
         m8.release();
 #endif
 
-        // one padding element on each side holds the BORDER_REFLECT_101 value,
-        // so the inner loop never needs a branch for x == 0 or x == w-1
-        std::vector<short> vbuf((size_t)w + 16), dbuf((size_t)w + 16);
-        short* V = vbuf.data() + 1;
-        short* D = dbuf.data() + 1;
-
         const float mc = (float)minContrast;
         // a point may be scored when the sampled gradient length, i.e. the soft
         // weight, reaches w0 - exactly the test the scalar / half paths do
@@ -897,15 +904,29 @@ namespace
         // upper end: that would keep the |grad| == 1 pixels the half path drops.
         const float w0c = std::max(0.f, w0);
         const float w0sq = w0c * w0c;
+
+        // Rows are independent: row y reads only gray8 rows y-1/ y / y+1 and
+        // writes only its own gx16/gy16/q8/m8 row.  The one piece of per-row
+        // state is the V/D scratch below, so it is allocated per band instead of
+        // hoisted out of the loop.  This was the last fully serial stage of the
+        // recognition path (measured 8.2 ms on a 2448x2048 image, i.e. 15% of
+        // the whole search) - see .clinerules 7.4 item 8.
+        auto processRows = [&](int y0, int y1)
+        {
+            // one padding element on each side holds the BORDER_REFLECT_101
+            // value, so the inner loop never needs a branch for x == 0 / x == w-1
+            std::vector<short> vbuf((size_t)w + 16), dbuf((size_t)w + 16);
+            short* V = vbuf.data() + 1;
+            short* D = dbuf.data() + 1;
 #if SM_USE_AVX2
-        const __m256 vmc = _mm256_set1_ps(mc);
-        const __m256 one = _mm256_set1_ps(1.f);
-        const __m256 vW02 = _mm256_set1_ps(w0sq);
-        const __m256 v127 = _mm256_set1_ps((float)kQ8);
-        const __m256i vOne32 = _mm256_set1_epi32(1);
+            const __m256 vmc = _mm256_set1_ps(mc);
+            const __m256 one = _mm256_set1_ps(1.f);
+            const __m256 vW02 = _mm256_set1_ps(w0sq);
+            const __m256 v127 = _mm256_set1_ps((float)kQ8);
+            const __m256i vOne32 = _mm256_set1_epi32(1);
 #endif
 
-        for (int y = 0; y < h; y++)
+        for (int y = y0; y < y1; y++)
         {
             const uchar* r0 = gray8.ptr<uchar>(reflect101(y - 1, h));
             const uchar* r1 = gray8.ptr<uchar>(y);
@@ -1023,6 +1044,35 @@ namespace
                     mr[x] = keep ? (uchar)1 : (uchar)0;
                 }
             }
+        }
+        };   // end processRows
+
+        // Small images (the coarse pyramid levels) are not worth the dispatch
+        // overhead: below ~200k pixels the band count would exceed the rows per
+        // thread anyway.  SM_PREP_SERIAL=1 forces the serial path for A/B.
+        static const bool prepSerial = (std::getenv("SM_PREP_SERIAL") != nullptr);
+        const long long px = (long long)w * (long long)h;
+        if (!prepSerial && px >= 200000 && cv::getNumThreads() > 1)
+        {
+            // One band per ~32 rows: with 20 threads on a 2048-row level that is
+            // 64 stripes (3+ per thread), which balances better than 64-row
+            // bands (32 stripes, only 1.6 per thread).  SM_PREP_BAND overrides
+            // the band height for tuning.
+            static const int bandRows = []
+            {
+                const char* v = std::getenv("SM_PREP_BAND");
+                const int b = v ? std::atoi(v) : 0;
+                return (b > 0) ? b : 32;
+            }();
+            const double bands = std::max(2.0, std::min((double)h / (double)bandRows,
+                                                        (double)cv::getNumThreads() * 4.0));
+            cv::parallel_for_(cv::Range(0, h),
+                              [&](const cv::Range& r) { processRows(r.start, r.end); },
+                              bands);
+        }
+        else
+        {
+            processRows(0, h);
         }
     }
 
@@ -2932,7 +2982,14 @@ void ShapeMatcher::extractCandidates(const cv::Mat& scoreMap, int level, int aId
 void ShapeMatcher::prepareSource(const cv::Mat& gray, int levels, bool useOCL)
 {
     srcPyramid_.resize(levels);
-    gray.convertTo(srcPyramid_[0], CV_8U);
+    // An 8U input is used as-is: srcPyramid_[0] is only ever a SOURCE below
+    // (pyrDown / gradientHalves), and findShapeModel() already hands us an 8U
+    // buffer.  Copying here used to convertTo() every pixel a second time -
+    // measured 1.5 ms on 2448x2048, i.e. 22% of the whole preprocess, for no
+    // benefit.  A shallow reference also keeps the caller's buffer alive, which
+    // is harmless because nothing here writes to it.
+    if (gray.type() == CV_8U) srcPyramid_[0] = gray;
+    else                      gray.convertTo(srcPyramid_[0], CV_8U);
     for (int i = 1; i < levels; i++)
         cv::pyrDown(srcPyramid_[i - 1], srcPyramid_[i]);
 
@@ -2997,7 +3054,8 @@ std::vector<MatchResult> ShapeMatcher::findShapeModel(const cv::Mat& gray, const
     cv::Mat g8;
     if (gray.channels() == 3) cv::cvtColor(gray, g8, cv::COLOR_BGR2GRAY);
     else if (gray.channels() == 4) cv::cvtColor(gray, g8, cv::COLOR_BGRA2GRAY);
-    else gray.convertTo(g8, CV_8U);
+    else if (gray.type() != CV_8U) gray.convertTo(g8, CV_8U);
+    else g8 = gray;               // already 8U: no copy, prepareSource takes a reference
 
     const int nLevels = (int)modelLevels_.size();
     useOCL_ = fp.useOpenCL && oclUsable();
@@ -3014,6 +3072,7 @@ std::vector<MatchResult> ShapeMatcher::findShapeModel(const cv::Mat& gray, const
     // phase timers for -debug 2 (top level scan, candidate extraction, the
     // per level refinement, sub-pixel fit and the optional re-scoring)
     double phTop = 0, phExtract = 0, phRefine = 0, phSubpixel = 0, phRescore = 0;
+    double phMerge = 0;   // the serial sort + near-duplicate pass after the scan
 
     const int top = nLevels - 1;
     const int nA = (int)angleGrid_.size();
@@ -3169,7 +3228,12 @@ std::vector<MatchResult> ShapeMatcher::findShapeModel(const cv::Mat& gray, const
                             probeMap(lmap, ai, R, strideA);
                         }
                         int64 te0 = cv::getTickCount();
-                        extractCandidates(lmap, top, ai, si, R, topTarget, local, 64, 2);
+                        // SM_NO_EXTRACT=1 skips the local-maximum pass, to
+                        // measure what it actually costs on the wall clock
+                        // (phExtract sums every worker, so it is not that).
+                        static const bool noExtract = (std::getenv("SM_NO_EXTRACT") != nullptr);
+                        if (!noExtract)
+                            extractCandidates(lmap, top, ai, si, R, topTarget, local, 64, 2);
                         exMs += msSince(te0);
                     }
                     cv::AutoLock lock(mtx);
@@ -3177,7 +3241,14 @@ std::vector<MatchResult> ShapeMatcher::findShapeModel(const cv::Mat& gray, const
                     if (localMax > maxMap) maxMap = localMax;
                     phExtract += exMs;
                 },
-                std::max(1.0, (double)poses.size() / 8.0));
+                // One stripe per pose.  With "poses/8" a 9-pose search got a
+                // single stripe and ran fully serial: topScan stayed at 10.2 ms
+                // whether cv::setNumThreads was 1 or 20.  Each pose is already a
+                // long serial task (a full score map), so splitting finer only
+                // helps: the OpenCV pool hands one pose to each worker.
+                // SM_COARSE_STRIPES=0 restores the old "poses/8" grouping, so the
+                // two schedulings can be A/B compared on the same binary.
+                coarseStripes(poses.size()));
         }
         if (fp.debug)
         {
@@ -3188,6 +3259,10 @@ std::vector<MatchResult> ShapeMatcher::findShapeModel(const cv::Mat& gray, const
                       << " mapMax=" << maxMap
                       << " candidates=" << all.size() << "\n";
         }
+        // The parallel scan is over now; everything below (sort + the O(n^2)
+        // near-duplicate pass) runs on ONE thread, so it sits on the Amdahl
+        // critical path and must be visible separately from the scan itself.
+        const int64 tMerge0 = cv::getTickCount();
         std::sort(all.begin(), all.end(),
                   [](const Candidate& a, const Candidate& b) { return a.score > b.score; });
         int keep = std::max(fp.maxMatches * 4, 40);
@@ -3244,6 +3319,12 @@ std::vector<MatchResult> ShapeMatcher::findShapeModel(const cv::Mat& gray, const
         // 全局按分截断（与旧版行为一致）
         for (size_t i = 0; i < uniq.size() && (int)cands.size() < keep; i++)
             cands.push_back(uniq[i]);
+
+        phMerge = msSince(tMerge0);
+        if (fp.debug)
+            std::cout << "  [dbg] merge(sort+dedup, serial) = " << phMerge
+                      << " ms   all=" << all.size() << " uniq=" << uniq.size()
+                      << " keep=" << keep << "\n";
     }
     phTop = msSince(tTop0);
 
@@ -3457,7 +3538,9 @@ std::vector<MatchResult> ShapeMatcher::findShapeModel(const cv::Mat& gray, const
     {
         // where the search time actually goes (debug >= 2)
         std::cout << "  [dbg2] topScan=" << phTop << " (extract=" << phExtract
-                  << ") refine=" << phRefine << " subpixel=" << phSubpixel
+                  << " sum-over-workers, merge(sort+dedup,serial)=" << phMerge
+                  << ", scan=" << (phTop - phMerge) << ")"
+                  << " refine=" << phRefine << " subpixel=" << phSubpixel
                   << " rescore=" << phRescore
                   << "  sum=" << (phTop + phRefine + phSubpixel + phRescore)
                   << " ms  poses=" << (((nA + strideA - 1) / strideA) *

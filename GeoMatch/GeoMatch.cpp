@@ -1049,8 +1049,13 @@ namespace
     // that decides how fast the search can ever be.
     double benchBandwidth(int threads, size_t bytes)
     {
-        const int n = (int)(bytes / sizeof(float));
-        cv::Mat a(1, n, CV_32F), b(1, n, CV_32F);
+        // A (1, n) row would make the measurement meaningless: copyTo
+        // parallelises over ROWS, so a single row is always one thread and the
+        // "20 threads" line reported the 1-thread number.  Keep it 2D with many
+        // rows so every thread really gets a slice.
+        const int rows = 16384;
+        const int cols = (int)std::max<size_t>(64, bytes / sizeof(float) / (size_t)rows);
+        cv::Mat a(rows, cols, CV_32F), b(rows, cols, CV_32F);
         cv::randu(a, 0.f, 1.f);
         cv::setNumThreads(threads);
         a.copyTo(b);                                   // touch the pages
@@ -1062,7 +1067,7 @@ namespace
             a.copyTo(b);
             best = std::min(best, tickMs(t0));
         }
-        const double moved = 2.0 * bytes;              // read + write
+        const double moved = 2.0 * (double)a.total() * (double)a.elemSize();
         return moved / (best * 1e-3) / 1e9;            // GB/s
     }
 
