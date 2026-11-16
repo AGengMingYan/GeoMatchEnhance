@@ -19,9 +19,11 @@
 - [测试报告](#测试报告)
 - [NCC 匹配（灰度相关）](#ncc-匹配灰度相关nccmatch)
 - [性能调优](#性能调优)
+- [文档索引](docs/README.md)
 
 > **第一次用？** 直接看 [三步测试 Demo](docs/快速上手-三步测试Demo.md)：
 > 选图片目录 → 框选模板 → 执行匹配，3 分钟跑通，不用读其它文档。
+> 全部文档（入门 / API / 结论汇总 / 历史归档）见 **[docs/README.md](docs/README.md)**。
 
 ---
 
@@ -61,7 +63,7 @@ geo-match-enhance/
 ├── case1/               # 示例模板与搜索图
 ├── tools/               # 构建/发布/对比脚本（build-x64.bat、gen_synth.py 生成合成样本等）
 ├── CMakeLists.txt
-└── docs/                # 本文档引用的测试图片
+└── docs/                # 文档（入口：docs/README.md）与测试图片
 ```
 
 调用方只需 `#include "GeoMatch/GeoMatch.h"`（形状匹配）或
@@ -365,21 +367,31 @@ target_link_libraries(app PRIVATE GeoMatch::GeoMatch ${OpenCV_LIBS})
 
 ## 测试报告
 
-以下测试均在当前开发机上实测，所有数据可复现。
+以下测试均在当前开发机上实测，所有数据可复现。**完整文档索引见 [docs/README.md](docs/README.md)。**
 
 ### 与 Halcon 17 的对比报告
 
-两份完整报告（同进程、同模板、同参数，可直接复现）：
-
 | 报告 | 内容 |
 |---|---|
+| **[docs/与Halcon差距清单.md](docs/与Halcon差距清单.md)** | **总索引**：能力缺口 / 性能 / 工程化差距按 P0~P3 排优先级；含耗时拆解、硬件利用现状、OpenCL 结论、已证伪的「差距」 |
+| **[docs/数据集四器综合对比-2026-11-16.md](docs/数据集四器综合对比-2026-11-16.md)** | 四器（本项目 / Halcon 17 × Shape / NCC）在 `dataset` 上的检出率、Δscore、Δangle、Δpos、耗时，以及 67 个极端参数用例的鲁棒性矩阵（x64/x86 均 0 崩溃） |
 | **[docs/ShapeMatch-vs-Halcon.md](docs/ShapeMatch-vs-Halcon.md)** | 形状匹配 vs Halcon：667 张晶圆图标定图的分数分布、位置一致性、掩码/评分模式等 11 组实验结论 |
 | **[docs/NCC-vs-Halcon.md](docs/NCC-vs-Halcon.md)** | NCC vs Halcon：精度（Δscore/Δpos/Δangle）、速度拆解、旋转模板构建的优化过程与后续方案 |
-| **[docs/数据集四器综合对比-2026-11-16.md](docs/数据集四器综合对比-2026-11-16.md)** | 四器（本项目/Halcon × Shape/NCC）在 `dataset` 抽样/合成/示例图上的检出率、分数、角度一致性、耗时，以及 67 个极端参数用例的鲁棒性矩阵（x64/x86 均 0 崩溃） |
 
 > ShapeMatch 报告写于 2026-11-11，其第 10 节「positive-mean 是通用解」的结论
 > **已于 2026-11-13 被推翻**（错位置会虚高到 0.946，Halcon 只有 0.556），
 > 报告开头有修订说明，默认值现为 `mean`。
+
+### 1.2.0 实测耗时（x64 AVX2，i7-13700H，`-loops 5` 取最小）
+
+| 场景 | 预处理 | 搜索 | 合计 | Halcon 17 (x86) |
+|---|---|---|---|---|
+| data1 焊盘 1280×1024，±10°，140×140 模板 | 2.1 ms | 7.5 ms | **9.6 ms** | 4.06 ms |
+| case1 1280×1024，**360°**，154×148 模板 | 2.1 ms | 27.3 ms | **29.4 ms** | — |
+| qfn1 2048×2448，360°，102×102 模板 | 5.6 ms | 43.5 ms | **49.1 ms** | 8.38 ms |
+
+> 角度范围是耗时的第一主导因素：data1 只扫 **9** 个（角度×尺度）位姿，case1 要扫 **165** 个。
+> 已知工件只在 ±10° 内转，就把 `angleStart/angleExtent` 收窄，能省 2~3 倍。
 
 **2026-11-13 最新复测（默认 `mean` + 内建软梯度归一化/亚像素采样）见
 [docs/ShapeMatch-vs-Halcon.md](docs/ShapeMatch-vs-Halcon.md) 的「十二、2026-11-13 复测」一节：**

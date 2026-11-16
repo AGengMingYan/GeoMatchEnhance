@@ -388,7 +388,42 @@ python -c "import zipfile;z=zipfile.ZipFile('dl.zip1');print(z.testzip(), len(z.
    先收集所有任务需要的下标并集 → 串行建好 → 并行段只读。
 2. **结果收集不能用 `push_back`**：预分配 vector + 按下标写，再串行合并/排序。
 3. 并行粒度按**总任务数**拆（候选 × 角度），不要按外层循环拆（level-0 可能只有 4 个候选）。
-4. 改完必须验证**确定性**：同一模型连跑 3 次，逐字符比对分数/位置/角度。
+4. **`cv::parallel_for_` 的 `nstripes` 必须 ≥ 线程数，否则等于串行**（2026-11-16 实测，收益最大的一条）：
+   粗扫原本写 `std::max(1.0, poses.size() / 8.0)`，而 data1（±10°）只有 **9 个 pose** →
+   `nstripes = 1.125` → OpenCV 只切 1 块 → **整段粗扫串行**。
+   证据：`topScan` 在 `-threads 1` 和 `-threads 20` 下都是 **10.2 ms**（完全不随线程数变化）；
+   改成「一 pose 一条 stripe」后 data1 search **18.2 → 7.4 ms（2.46×）**、
+   x86 total **23.4 → 10.4 ms**、qfn1（65 poses）**57.6 → 43.5 ms（1.32×）**。
+   148 条结果行（data1/data2/case1/synth/qfn1）逐字符不变。
+   诊断口诀：**跑 `-threads 1 / N / 0`，时间不动就是没并行**。
+   开关 `SM_COARSE_STRIPES=0` 复现旧分组，便于 A/B。
+5. **`-debug 2` 的时间不能用来做 A/B**：里面额外跑 `minMaxSerial`（每 pose 再扫一遍分数图），
+   实测把 9.6 ms 报成 20~30 ms，且 `refine` 会从 2 ms 虚报到 31 ms。用 `-loops N` + 取最小 `search`。
+6. **`phExtract` 是所有 worker 的累加值，不是墙钟**：qfn1 上显示 180.6 ms，而真实墙钟只有
+   **14.6 ms**（用 `SM_NO_EXTRACT=1` 关掉提取，search 52.7 → 38.1 得到差值）。
+   要量化某阶段的墙钟成本，就做个能关掉它的开关跑差值，不要读累加计时。
+   `topScan` 里也混着串行的 `sort + O(n²) 去重`，已用 `merge(sort+dedup,serial)` 单独列出
+   （实测 qfn1 只有 1.7 ms，**不是瓶颈**）。
+7. **这台机器是 6 P + 8 E 混合架构（i7-13700H，14 核 20 线程）**：实测并行在
+   **16 线程就饱和**（5.5×，效率 27%），`-threads 20` 反而略慢。内存带宽
+   在**单线程**就饱和（copy 29.8 GB/s @1 线程 vs 28.4 @20，见 `-bench`）。
+   **不要再假设"加线程=线性加速"**；评估并行收益一律先跑 `-threads 1/4/16/20` 曲线。
+8. ~~**`preprocess` 是纯单线程的**~~（2026-11-16 已并行化，见下条）。
+9. **`gradientHalves` 已按行带并行**（`cv::parallel_for_`），qfn1 preprocess
+   **13.4 → 5.6 ms（2.4×）**，148 条结果行逐字符不变。要点：
+   - 各行独立（只写自己那行），所以唯一要处理的是**每行 scratch（V/D 缓冲）必须每带各一份**，
+     不能提到循环外；
+   - 低于 200k 像素（金字塔粗层）走串行，避免调度开销；
+   - `SM_PREP_SERIAL=1` 强制旧串行路径、`SM_PREP_BAND=N` 调行带高度（默认 32，
+     实测 16/32/64/128 差异在噪声内）；
+   - 剩余时间已接近内存带宽上限（**2.46× 而非 20×**），继续加线程无收益。
+10. **不要在 `findShapeModel` 里重复整图拷贝**：原来是 `gray.convertTo(g8, CV_8U)` +
+    `prepareSource` 里又一次 `gray.convertTo(srcPyramid_[0], CV_8U)`。
+    `srcPyramid_[0]` 只作只读源（pyrDown / gradientHalves），8U 输入直接浅拷贝引用即可。
+11. **OpenCV 在搜索路径上已不是瓶颈**：`cv::pyrDown` x2 只要 **0.53 ms**（内部已多线程，
+    13796 MPix/s），不值得重写。瓶颈是我们自己的 `gradientHalves` / 粗扫点积 / `extract`。
+    判断"要不要重写 OpenCV"前先单独 benchmark 那个调用。
+12. 改完必须验证**确定性**：同一模型连跑 3 次，逐字符比对分数/位置/角度。
 
 ### 7.5 8 位定点粗扫（`ScanInvoker8`）
 
@@ -455,7 +490,28 @@ python -c "import zipfile;z=zipfile.ZipFile('dl.zip1');print(z.testzip(), len(z.
 4. **端到端也要测**：合成图 + 真实图的 `find_*` 都要报出贴回位置，否则问题在搜索链路（金字塔/裁剪/亚像素）。
 5. 旋转必须用 Halcon 或"整图旋转 + 贴模板"的真值 —— `cv::matchTemplate` **没有旋转维度**。
 
-### 7.10 诊断开关（保留，别删）
+### 7.10 OpenCL（2026-11-16 实测：没用上，且路径是坏的）
+
+- **实测结论**：`useOpenCL=true`（默认）在本机 100% 走 CPU。链路是
+  `useOCL_ = fp.useOpenCL && oclUsable()`，`oclUsable()` 返回 false 就整段跳过。
+- **探测别用 `cv::ocl::Context ctx;`**（= `TYPE_DEFAULT`）：Intel OpenCL 3.0 驱动上
+  `ndevices()==0`，而 `cv::ocl::Context ctx(cv::ocl::Device::TYPE_ALL)` 能得到 1 个 device。
+  机器实际有 `Intel(R) Iris(R) Xe Graphics`。`enableOpenCL()` 与 `oclUsable()` 两处都是这个写法。
+- **`prepareSource` 的 OCL 分支从来没跑通过**：`uGx_/uGy_` 是 CV_32F，直接 `copyTo(srcGx_)`，
+  而 `correlateSparseX` 断言 `type()==CV_16F` → **abort 0xC0000409**。
+  实测：把探测改成 `TYPE_ALL` 后 `enableOpenCL(true) -> 1`，紧接着 detect 就崩。
+  同理 `quantizeHalves` 也按 CV_16F 解释内存，32F 进去是位模式垃圾。
+  ⇒ **改探测之前必须先补 `convertTo(CV_16F)`，否则等于把静默降级换成崩溃。**
+- **即便修好也不划算**：OCL 分支走 `normGradients` 的 10 趟全图 + H2D/D2H + 回 CPU 量化，
+  实测 5.1 ms；现有 CPU 融合单趟 `gradientHalves` 只要 2.2~2.4 ms（1280×1024 热态）。
+  要做 GPU 就该把融合内核整体移植成 kernel，而不是沿用 10 趟算子链。
+- **NCC 完全没有 OpenCL**（`NccMatch/` 里 0 处 `UMat`/`ocl::`，也没有开关）。
+- `oclUsable()` 的 `static cached` 与 `enableOpenCL(false)` 不同步：先 true 后 false 时
+  `useOCL_` 仍为 true → UMat 在 OpenCL 已关闭时静默 CPU 回退，还多付拷贝。
+- 复现工具（不入库）：`_ai_tmp/ocl_probe.cpp`（状态+两路径对比）、
+  `_ai_tmp/ocl_force.cpp`（环境变量实验）、`_ai_tmp/ocl_preproc_bench.cpp`（预处理量级）。
+
+### 7.11 诊断开关（保留，别删）
 
 | 开关 | 作用 |
 |---|---|
@@ -465,6 +521,10 @@ python -c "import zipfile;z=zipfile.ZipFile('dl.zip1');print(z.testzip(), len(z.
 | `SM_DUMP_COS=1` | 最终位姿逐点 cos 分布（双峰=弱幅值点被过度惩罚；单峰~0.6=方向系统性偏差） |
 | `SM_DUMP_CELLS=1` / `SM_CELL_KEEP` | 4×4 kept 表 + missShare（校准 `cellMissMax`） |
 | `SM_NO_Q8=1` | 强制半精度路径（A/B 对照） |
+| `SM_COARSE_STRIPES=0` | 粗扫恢复旧的 `poses/8` 分组（A/B 并行调度） |
+| `SM_NO_EXTRACT=1` | 跳过候选提取，量化它的墙钟成本（会 0 命中，仅测量用） |
+| `SM_PREP_SERIAL=1` | `gradientHalves` 退回串行（A/B 预处理并行收益） |
+| `SM_PREP_BAND=N` | 预处理行带高度，默认 32 行 |
 
 ---
 

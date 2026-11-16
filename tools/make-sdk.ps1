@@ -10,17 +10,25 @@ $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $outBase = Join-Path $root 'release_GeoGUIDemo_x64\sdk'
 if (-not (Test-Path $outBase)) { New-Item -ItemType Directory -Path $outBase -Force | Out-Null }
 
-# pick the first existing x64 OpenCV install; x86 uses the in-repo OpenCV455_MSVC32
+# pick the first existing x64 OpenCV install; x86 probes the in-repo copy first,
+# then the本机 standard location (D:/Develop/OpenCV455_32 is a flat layout)
 $ocv64 = @('D:/develop2/OpenCV455/opencv/build', 'D:/Develop/OpenCV455/opencv/build') |
          Where-Object { Test-Path (Join-Path $_ 'x64/vc15/lib/opencv_world455.lib') } |
          Select-Object -First 1
+$ocv32 = @((Join-Path $root 'OpenCV455_MSVC32'), 'D:/Develop/OpenCV455_32', 'D:/develop2/OpenCV455_32') |
+         Where-Object { $_ -and (Test-Path (Join-Path $_ 'opencv_world455.lib')) } |
+         Select-Object -First 1
+if (-not $ocv64) { throw 'x64 OpenCV not found (expect <root>/x64/vc15/lib/opencv_world455.lib)' }
+if (-not $ocv32) { throw 'x86 OpenCV not found (expect a dir containing opencv_world455.lib)' }
+Write-Host "OpenCV x64 = $ocv64"
+Write-Host "OpenCV x86 = $ocv32"
 $archs = @(
     @{ Name = 'win64'; Build = 'build'; BuildScript = 'tools\build-x64.bat';
        Dll = (Join-Path $ocv64 'x64/vc15/bin/opencv_world455.dll');
        Lib = (Join-Path $ocv64 'x64/vc15/lib/opencv_world455.lib') },
     @{ Name = 'win32'; Build = 'build_x86'; BuildScript = 'tools\build-x86.bat';
-       Dll = (Join-Path $root 'OpenCV455_MSVC32\opencv_world455.dll');
-       Lib = (Join-Path $root 'OpenCV455_MSVC32\opencv_world455.lib') }
+       Dll = (Join-Path $ocv32 'opencv_world455.dll');
+       Lib = (Join-Path $ocv32 'opencv_world455.lib') }
 )
 
 foreach ($a in $archs) {

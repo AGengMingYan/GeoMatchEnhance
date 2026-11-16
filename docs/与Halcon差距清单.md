@@ -330,8 +330,28 @@ qfn1（无目标）:  level3 coarse 61.4 ms  mapMax 0.4738 < 0.70 -> 退一层
 
 1. **`metric=2`（ignore_local_polarity）走标量扫描**（`scanLocalPolarity`），
    可改成 `|dot|` 的 `vpmaddwd` 向量化；Halcon 侧这类参数几乎不掉速。
-2. **`useOpenCL` 默认 `true`**，但本机 `haveOpenCL=1 / 0 device`，实际没用上；
-   建议启动时探测，0 device 就静默关闭并打印一行，避免现场误以为「已开 GPU 加速」。
+2. **`useOpenCL` 默认 `true`，但实际 100% 跑在 CPU 上，OpenCL 路径是坏的死代码**（2026-11-16 实测，
+   探针 `_ai_tmp/ocl_probe.cpp` / `ocl_force.cpp` / `ocl_preproc_bench.cpp`）：
+
+   | 结论 | 证据 |
+   |---|---|
+   | 本机**有** GPU | `Intel(R) Iris(R) Xe Graphics`，OpenCL 3.0 平台，`device.available()=1`、`compilerAvailable()=1` |
+   | 库却判定"不可用" | `enableOpenCL(true) -> 0`、`openCLAvailable() -> 0`、`useOCL_` 恒 false |
+   | 根因 1：探测用错 context 类型 | `cv::ocl::Context ctx;`（= `TYPE_DEFAULT`）在 Intel 驱动上 `ndevices()==0`；换成 `Context(Device::TYPE_ALL)` 立刻 `==1`。两处都要改：`ShapeMatch.cpp::oclUsable()` 与 `GeoMatch.cpp::enableOpenCL()` |
+   | 根因 2：`prepareSource` 的 OCL 分支**漏了 CV_16F 转换** | `uGx_/uGy_` 是 CV_32F，直接 `copyTo(srcGx_)`；`correlateSparseX` 断言 `type()==CV_16F` → **abort 0xC0000409**（已复现：修好探测后程序立即崩） |
+   | 根因 3：`quantizeHalves` 也会读错数据 | 它按 `CV_16F` 用 `ptr<unsigned short>` + `_mm256_cvtph_ps` 读，传 32F 进去拿到的是位模式垃圾 |
+   | 即便修好也不划算 | OCL 分支是 `normGradients` 的 **10 趟全图** + H2D/D2H + 再回 CPU 量化；实测 UMat 版 10 趟 **5.1 ms**，而现有 CPU 融合单趟 `gradientHalves` 只要 **2.2~2.4 ms**（1280×1024，热态） |
+
+   另外：**NCC（`NccMatch/`）完全没有 OpenCL 代码**（0 处 `UMat` / `ocl::`），
+   `NccParams`/`NccFindParams` 里也没有开关，只有 Shape 的 `prepareSource` 有 OCL 分支。
+
+   处理建议（按顺序）：
+   1. **先修根因 2/3**（补 `convertTo(CV_16F)`），否则任何人按"修好探测"改一版都会让进程 abort；
+   2. 再把探测改成 `TYPE_ALL`（或 `TYPE_GPU` 回退 `TYPE_ALL`），并缓存结果；
+   3. 修完实测：如果 UMat 路径仍慢于 `gradientHalves`，就把 `useOpenCL` 默认改成 `false`，
+      并在 README/SDK 里写清"仅覆盖预处理、只在 compute 明显便宜的独显上可能有收益"。
+   4. `oclUsable()` 的 `static cached` 与 `enableOpenCL(false)` 不同步：先 true 后 false 时
+      `useOCL_` 仍为 true，会走 UMat 但 OpenCV 已关 OpenCL → 静默 CPU 回退 + 额外拷贝开销。
 3. **NCC 没有 Shape 那套覆盖率闸门**（`minCoverage` / `cellMissMax`）：重复纹理误配只能靠抬高 `minScore`
    （实测相似纹理错配能到 0.70）。NCC 覆盖率可用「模板像素中图像梯度 > 阈值的占比」定义，成本低。
 4. **默认值口径与 Halcon 不一致**：Shape `maxOverlap` 默认 1.0（Halcon 0.5）、`minScore` 默认 0.7（Halcon 0.5）、
@@ -367,20 +387,136 @@ HalconDemo\halcon_ncc_compare.exe   dataset\image\m3.bmp dataset\image\qfn1.bmp 
     -angle-start -180 -angle-extent 360 -minscore 0.3 -max 12     # 本机报 #6001
 ```
 
-### 9.5 更新后的优先级（覆盖 §六）
+### 9.5 耗时到底花在哪（2026-11-16 实测，`-loops 5` 取最小，不开 debug）
+
+先修掉一个**并行调度 bug**（详见 §7.4 第 4 条）：粗扫 `nstripes = poses/8`，
+data1（9 个 pose）被压成 1 条 stripe → **14 核的机器上整段粗扫是串行的**。
+改成「一 pose 一条 stripe」后：
+
+| 场景 | 改前 | 改后 | 倍数 | Halcon 17 |
+|---|---|---|---|---|
+| data1（1280×1024，±10°，140×140） | total 20.4 ms | **9.6 ms** | 2.1× | 4.06 ms（还差 **2.4×**） |
+| data1 x86 SSE2 | total 23.4 ms | **10.4 ms** | 2.2× | — |
+| qfn1（2048×2448，360°，102×102） | total 65.3 ms | **52.2 ms** | 1.3× | 8.38 ms（还差 **6.2×**） |
+
+结果无损：148 条结果行（data1 6 + data2 9 + case1 9 + synth 80 + qfn1 多实例）逐字符一致。
+
+**改后 data1 的 9.6 ms 拆解**：preprocess 2.1（22%）+ 粗扫点积 ~6 + extract 1 + refine/subpixel 2。
+**qfn1 的 52.2 ms 拆解**（`-debug 2` 看占比、`SM_NO_EXTRACT=1` 看墙钟）：
+preprocess 8.2（13%）　粗扫点积 **38.1（62%）**　extract **14.6（24%）**　refine+subpixel 4.2。
+
+**为什么 OpenCL 帮不上**：它只覆盖 preprocess —— 而 preprocess 只占 13~22%，
+且现有 OCL 分支是 `normGradients` 的 10 趟全图 + H2D/D2H（实测 5.1 ms），
+比 CPU 单趟融合 `gradientHalves`（2.2 ms）还慢。**靠 GPU 追 Halcon 是错的方向。**
+真正要动的是「粗扫点积」和「extract」这两块，它们都跑在 CPU 上。
+
+**粗扫点积为什么慢**：qfn1 是 65 个 pose × 313k 个位置 × ~143 个模型点 ≈ 2.9e9 次定点乘加，
+38.1 ms 意味着约 76 GOPS —— 已接近这本笔记本的 L2/L3 带宽上限（每位置要读
+`q8/m8` 约 3 字节/点，`n` 个点 × 位置 = 纯带宽受限，不是 AVX2 算力不够）。
+降低它的唯一有效手段是**减少点数**（`maxPoints` / 粗层抽稀）或**更早的早停**（greediness）。
+
+**能不能做到 Halcon 的几 ms**：
+- 小图 + 小角度（data1 这类）：**能接近**。已从 20.4 → 9.6，再砍掉 extract 的 1 ms、
+  并把粗扫点数从 143 减到 ~72（`SM_CELL_KEEP`/粗层抽稀），理论上可进 **5~6 ms 区间**。
+- 大图 + 360°（qfn1 这类）：**短期内做不到 8 ms**。它 62% 是粗扫点积、24% 是 extract，
+  两者都要数量级优化（把 extract 融进扫描的滚动 3×3、把 65 个 pose 的粗扫按
+  「角度×row band」二维拆细以吃满 20 线程）。现实目标是 **20~25 ms**（1.3× 剩余空间在 extract）。
+- **本质差异**：Halcon 的边缘模型带「边缘链 + 方向索引」，扫描时按图像边缘点做**反向查表**，
+  计算量与「图像边缘像素数」成正比；我们是「所有位置 × 所有模型点」的正向卷积，
+  计算量是「位置数 × 点数」。所以它在大图上天然占优 —— 这是算法结构差，不是常数差。
+
+### 9.6 硬件利用现状（2026-11-16 实测）
+
+本机：i7-13700H（**6 P 核 + 8 E 核 = 14 核 / 20 线程**，2×8 GB LPDDR5-6400）。
+
+#### ① 多核：只用到 27%
+
+qfn1（2048×2448，360°，102×102 模板）search 随线程数变化（`-loops 3` 取最小）：
+
+| 线程 | search | 加速 | 效率 |
+|---|---|---|---|
+| 1 | 212.0 ms | 1.00× | — |
+| 2 | 121.9 | 1.74× | 87% |
+| 4 | 72.3 | 2.93× | 73% |
+| 6 | 57.8 | 3.67× | 61% |
+| 8 | 48.7 | 4.35× | 54% |
+| 12 | 44.9 | 4.72× | 39% |
+| 16 | 38.5 | **5.51×** | 34% |
+| 20 | 38.9 | 5.45× | **27%**（饱和） |
+
+在 16 线程就饱和，`-threads 20` 反而略慢。三个原因（按贡献排序）：
+
+1. **混合架构**：只有 6 个 P 核，其余是 E 核（单核性能约 P 的 50~60%）。
+   OpenCV 线程池把 20 个逻辑核一视同仁，E 核上的 stripe 拖慢整体。
+2. **预处理是纯单线程**：`gradientHalves()` 只有行内 SIMD，外层是
+   `for (int y = 0; y < h; y++)`，没有任何 `parallel_for_`。
+   qfn1 上它是 **8.2 ms 的固定串行成本**，直接压在 Amdahl 关键路径上。
+3. **内存带宽在 1 线程就饱和**：128 MB copy（读+写）实测
+   **29.8 GB/s @1 线程 → 28.4 GB/s @20 线程（完全不涨）**；纯读 40 GB/s @16 线程。
+   粗扫是带宽敏感型，所以"加核"换不到线性加速。
+
+#### ② SIMD：AVX2 已用满，AVX-512 用不了
+
+- `shapeSimdWidth() = 256`，`ScanInvoker8` 一次 16 lane（两个 256-bit 累加器）。
+- CPU 行里 `AVX512-SKX?` 带问号：**13 代酷睿官方已熔断 AVX-512**，不能作为方向。
+- x86 构建走 SSE2/AVX2（`SM_USE_AVX2` 已按 `__AVX2__` 正确启用）。
+
+#### ③ 并行段之后的串行尾巴：1.7 ms（不是瓶颈）
+
+新增诊断（`-debug 2` 的 `merge(sort+dedup,serial)`）实测：
+qfn1 上 `all=4121 → uniq=1638`，sort + O(n²) 去重 **1.7 ms**，
+占 20 线程总耗时 53 ms 的 3%。原先怀疑它是大头，**实测证伪**。
+
+#### ④ GPU：没用上，路径是坏的（详见 §9.3 第 2 条）
+
+而且即使修好也只覆盖预处理（13~22%），OCL 分支本身（10 趟全图 + H2D/D2H）
+比 CPU 单趟融合慢 2 倍。
+
+#### ⑤ 顺手修掉的两个测量工具缺陷
+
+1. **`benchmarkReport()` 的带宽项一直是 1 线程的结果**：原来用
+   `cv::Mat(1, n, CV_32F)` 单行矩阵做 `copyTo`，而 OpenCV 按**行**并行，
+   1 行永远切不出多块 → "20 threads" 那行报的是 1 线程的数。
+   已改成 16384 行的 2D 矩阵。
+2. **`-debug 2` 的 `topScan` 里混着串行段**：已拆出 `merge(sort+dedup,serial)`
+   与 `scan`（= `topScan - merge`），否则无法判断"扫描慢"还是"合并慢"。
+   `extract` 仍然是 **sum-over-workers**，不是墙钟（用 `SM_NO_EXTRACT=1` 测差值）。
+3. **Sobel / 16F 解包两项的线程数扫描无意义**：工作量只有 0.3~0.4 ms，
+   `parallel_for_` 的调度开销比计算本身还大，所以数字随线程数下降。
+   要看这两个内核的扩展性，工作量至少放大 10 倍。
+
+#### ⑥ 结论：还能再压多少
+
+| 手段 | 预期收益 | 风险 | 说明 |
+|---|---|---|---|
+| 预处理并行化（`gradientHalves` 按行带 `parallel_for_`） | qfn1 **-7 ms（-13%）** | 低 | 纯串行→并行，结果不变 |
+| 按 P/E 核亲和调度（或限制线程数为 P 核数） | 5~15% | 中 | 需要 `SetThreadAffinityMask`，可移植性差 |
+| 把粗扫按「角度 × 行带」二维拆细 | 5~10% | 中 | 改善 65 poses / 20 线程的 3.25 的负载不均 |
+| extract 融进扫描滚动行缓冲 | qfn1 **-14.6 ms（-28%）** | 高 | 见 §9.5 |
+| 降低粗层点数（抽稀） | 点积近似线性下降 | 中 | 有召回风险，需 A/B |
+| GPU | ≈0 | — | 只覆盖 13~22%，且现路径更慢 |
+
+**已经吃到的部分**：AVX2 定点内核、8 位粗扫、金字塔、粗扫按 pose 并行、NCC 旋转模板缓存。
+**没吃到的**：预处理多核、P/E 核亲和、GPU（且不该吃）。
+
+### 9.7 更新后的优先级（覆盖 §六）
 
 | 优先级 | 事项 | 依据 | 预估 |
 |---|---|---|---|
-| **P0** | ~~粗扫 extract 剪枝（per-map max）~~ → 只剩「滚动 3×3 融合进扫描内核」 | per-map 剪枝实测证伪（65/65 pose 峰值 ≥0.5）；滚动融合是高风险重构 | 中（1 周） |
+| **P0** | ✅ 已完成：粗扫按 pose 并行（`nstripes = poses`） | data1 20.4 → **9.6 ms（2.1×）**、qfn1 65.3 → 52.2 ms，148 条结果行逐字符不变 | 已完成 |
+| **P0** | 预处理并行化（`gradientHalves` 行带并行） | qfn1 固定串行 **8.2 ms（15%）**，是 Amdahl 上限的主因（§9.6①） | 小（1 天） |
 | **P0** | ✅ 已完成：NCC 退层只在峰值改善时继续 | 无目标 5MP 图 2619 → **347 ms**（x64 7.5×、x86 4.8×），105 张图结果逐字符不变 | 已完成 |
-| **P0** | 搜索 ROI（`detect(gray, roi)` + CLI `-roi` + GUI「搜索区」） | 大图/多工位通用收益，与 extract 剪枝叠加 | 小（2~3 天） |
+| **P0** | extract 融进扫描的滚动 3×3 行缓冲 | qfn1 墙钟 **14.6 ms（24%）**，是小图外第二大项 | 中（1 周） |
+| **P0** | 粗扫点积降本：粗层抽稀 / 更早早停 | qfn1 **38.1 ms（62%）**，纯 L2/L3 带宽受限 | 中 |
+| **P0** | 搜索 ROI（`detect(gray, roi)` + CLI `-roi` + GUI「搜索区」） | 大图/多工位通用收益 | 小（2~3 天） |
 | **P0** | 建模对比度自适应（对齐 Halcon 灰度 30 的口径） | 默认参数下分数差 0.27 | 小（1 天） |
 | **P1** | `FindParams::numLevels`（搜索层数覆盖） | 调速度/召回不必重建模型 | 小（1 天） |
-| **P1** | 结果接口：`contourAt()` + `poseMat()` + 自定义 origin | 上位机/机器人对接必需 | 小（2 天） |
+| **P1** | ✅ 已完成：结果接口 `contourAt()` / `cornersAt()` / `poseMatrix()` / `setOrigin()` | 上位机对接（§9.2(3)） | 已完成 |
 | **P1** | 超时/可中断（`FindParams::timeoutMs` + 返回码） | 产线节拍硬需求 | 小（2 天） |
 | **P1** | 多模型同搜 + 跨模型 NMS + 共享预处理 | 多品种共线；大图预处理不重复 | 中（1 周） |
 | **P1** | 错误码枚举（`bool` → `Status`） | SDK 交付质量 | 小~中（3 天） |
-| **P2** | `metric=2` 向量化 / NCC 覆盖率闸门 / OpenCL 自动探测 | 各自 1 天内 | 小 |
+| **P2** | `metric=2` 向量化 / NCC 覆盖率闸门 | 各自 1 天内 | 小 |
+| **P2** | OpenCL：**先补 CV_16F 再修探测，或直接默认关掉**（§9.3 第 2 条） | 现状是死代码，且修好也无收益 | 小 |
 | **P2** | NCC 旋转模板落盘缓存、按角度紧包围盒画布 | NCC 大图剩余差距 | 中 |
 | **P2** | CI 回归（`dataset/sample` + 极端矩阵 + 双架构） | 防止历史问题回退 | 小（2 天） |
 | **P3** | 各向异性缩放、XLD 建模、颜色、形变/透视、Python·C# 绑定 | 取决于业务 | 大 |

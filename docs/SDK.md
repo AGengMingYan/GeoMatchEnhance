@@ -1,6 +1,6 @@
 # GeoMatch SDK 使用手册
 
-> 版本 **1.1.3** ｜ Windows x64 / x86 ｜ MSVC 2019+ ｜ OpenCV 4.5.5
+> 版本 **1.2.0** ｜ Windows x64 / x86 ｜ MSVC 2019+ ｜ OpenCV 4.5.5
 >
 > 本手册面向**在自己的程序里调用 GeoMatch 库**的场景。只想用现成界面看效果的话，
 > 直接运行发布包里的 `GeoGUIDemo.exe` 即可，不需要读这份文档。
@@ -44,7 +44,7 @@
 ## 2. 包里有什么
 
 ```
-GeoMatch-1.1.0-win64/
+GeoMatch-1.2.0-win64/
 ├── include/
 │   ├── GeoMatch/GeoMatch.h        # 门面（平时只 include 这个）
 │   ├── ShapeMatch/ShapeMatch.h    # 形状匹配底层引擎
@@ -134,7 +134,7 @@ target_link_libraries(myapp PRIVATE GeoMatch::GeoMatch ${OpenCV_LIBS})
 不想装到系统目录、直接给路径也行：
 
 ```cmake
-set(GeoMatch_DIR "C:/sdk/GeoMatch-1.1.0-win64/lib/cmake/GeoMatch")
+set(GeoMatch_DIR "C:/sdk/GeoMatch-1.2.0-win64/lib/cmake/GeoMatch")
 find_package(GeoMatch REQUIRED)
 ```
 
@@ -287,7 +287,7 @@ find_package(GeoMatch REQUIRED)
 
 | 函数 | 说明 |
 |---|---|
-| `const char* versionString()` | `"1.1.3"` |
+| `const char* versionString()` | `"1.2.0"` |
 | `bool isSharedBuild()` | 当前链接的是 DLL 还是静态库 |
 | `std::vector<std::string> listImages(dir, exts)` | 列目录里的图片（已排序） |
 | `bool enableOpenCL(bool)` | 开关 OpenCL，返回实际是否可用 |
@@ -685,7 +685,7 @@ build_x64\example_host_integration.exe dataset\sample\data1\template_pad.jpg ^
 输出示例：
 
 ```
-GeoMatch 1.1.0 (static build)
+GeoMatch 1.2.0 (static build)
 template 154x148   image 1280x1024
 model: 1200 points, 3 levels, 154x148, spread 1.14
 matches: 1   preprocess 2.36 ms   search 46.12 ms
