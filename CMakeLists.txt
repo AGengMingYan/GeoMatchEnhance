@@ -8,7 +8,7 @@ project(GeoMatchDemo VERSION 1.1.3 LANGUAGES C CXX)
 #  x86 :  tools\build-x86.bat          -> build_x86\*.exe
 #
 #  等价的手工命令（Ninja 没有 PLATFORM，架构由 vcvars 决定，必须先 call）：
-#      call "D:\develop2\vs2019\IDE\VC\Auxiliary\Build\vcvars64.bat"
+#      call "<你的 VS2019>\VC\Auxiliary\Build\vcvars64.bat"    (32 位用 vcvars32.bat)
 #      cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -S . -B build
 #      cmake --build build
 #

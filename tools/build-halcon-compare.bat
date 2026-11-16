@@ -27,11 +27,22 @@ if not exist "%HALCON_LIB%\halconcpp.lib" (
     exit /b 1
 )
 
-@rem ---- load the x86 MSVC environment ----
-set "VSVARS=D:\develop2\vs2019\IDE\VC\Auxiliary\Build\vcvars32.bat"
-if not exist "%VSVARS%" (
-    echo [error] vcvars32.bat not found: %VSVARS%
-    echo        edit VSVARS in this script to point at your VS install
+@rem ---- locate vcvars32.bat ---------------------------------------------------
+@rem Checked in order; add your own VS install path at the top if it differs.
+@rem (No "for /f vswhere": the "(x86)" inside that path breaks the parenthesis
+@rem  counting of a surrounding if( ... ) block - see .clinerules.)
+set "VSVARS="
+if not defined VSVARS if exist "D:\Develop\VS2019\Enterprise\VC\Auxiliary\Build\vcvars32.bat" set "VSVARS=D:\Develop\VS2019\Enterprise\VC\Auxiliary\Build\vcvars32.bat"
+if not defined VSVARS if exist "D:\develop2\vs2019\IDE\VC\Auxiliary\Build\vcvars32.bat" set "VSVARS=D:\develop2\vs2019\IDE\VC\Auxiliary\Build\vcvars32.bat"
+if not defined VSVARS if exist "%ProgramFiles%\Microsoft Visual Studio\2019\Enterprise\VC\Auxiliary\Build\vcvars32.bat" set "VSVARS=%ProgramFiles%\Microsoft Visual Studio\2019\Enterprise\VC\Auxiliary\Build\vcvars32.bat"
+if not defined VSVARS if exist "%ProgramFiles%\Microsoft Visual Studio\2019\Professional\VC\Auxiliary\Build\vcvars32.bat" set "VSVARS=%ProgramFiles%\Microsoft Visual Studio\2019\Professional\VC\Auxiliary\Build\vcvars32.bat"
+if not defined VSVARS if exist "%ProgramFiles%\Microsoft Visual Studio\2019\Community\VC\Auxiliary\Build\vcvars32.bat" set "VSVARS=%ProgramFiles%\Microsoft Visual Studio\2019\Community\VC\Auxiliary\Build\vcvars32.bat"
+if not defined VSVARS if exist "%ProgramFiles(x86)%\Microsoft Visual Studio\2019\Enterprise\VC\Auxiliary\Build\vcvars32.bat" set "VSVARS=%ProgramFiles(x86)%\Microsoft Visual Studio\2019\Enterprise\VC\Auxiliary\Build\vcvars32.bat"
+if not defined VSVARS if exist "%ProgramFiles(x86)%\Microsoft Visual Studio\2019\Professional\VC\Auxiliary\Build\vcvars32.bat" set "VSVARS=%ProgramFiles(x86)%\Microsoft Visual Studio\2019\Professional\VC\Auxiliary\Build\vcvars32.bat"
+if not defined VSVARS if exist "%ProgramFiles(x86)%\Microsoft Visual Studio\2019\Community\VC\Auxiliary\Build\vcvars32.bat" set "VSVARS=%ProgramFiles(x86)%\Microsoft Visual Studio\2019\Community\VC\Auxiliary\Build\vcvars32.bat"
+if not defined VSVARS (
+    echo [error] vcvars32.bat not found
+    echo        edit the VSVARS candidates in this script to point at your VS install
     exit /b 1
 )
 echo [info] calling %VSVARS%
