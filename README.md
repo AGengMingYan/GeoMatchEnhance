@@ -233,6 +233,28 @@ for (auto& d : dets)
 cv::imwrite("result.png", m.drawResult(searchGray, dets));
 ```
 
+### 位姿与几何（给上位机 / 机器人）
+
+匹配结果是 `(pos, angle, scale, score)`，但上位机往往需要「模板上的点 → 图像上的点」的变换。
+这几个接口都由同一个 3×3 相似变换导出，彼此自洽：
+
+```cpp
+m.setOrigin(cv::Point2f(20, 40));        // 上报点改成装配基准点（模板坐标）
+
+for (auto& d : dets)
+{
+    cv::Matx33d M = m.poseMatrix(d);     // 模板 -> 图像 3x3（再左乘标定矩阵即世界坐标）
+    auto quad     = m.cornersAt(d);      // 模板四角（TL,TR,BR,BL）
+    cv::Rect2f bb = m.boundsAt(d);       // 正包围盒
+    auto contour  = m.contourAt(d);      // 真实边缘折线（与 drawResult 同源）
+    cv::Point2f p = m.templateToImage(d, cv::Point2f(70, 70));   // 基准孔落点
+}
+```
+
+NCC（`geomatch::NccMatcher`）提供同名同语义的一整套（除 `contourAt()`，NCC 没有边缘链概念）。
+完整说明与自检方法见 [docs/SDK.md 5.6](docs/SDK.md#56-位姿与几何上位机对接)，
+可运行示例 `examples/example_host_integration.cpp`。
+
 ### 结果框样式（`boxMode`）
 
 `drawResult()` 画框的方式可选，**只影响可视化，不影响匹配结果**：

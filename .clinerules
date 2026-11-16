@@ -363,6 +363,18 @@ python -c "import zipfile;z=zipfile.ZipFile('dl.zip1');print(z.testzip(), len(z.
   测试集要故意包含非 2 的幂的边长。**不要改成 `(size-1)` 比例**（分数 0.97→0.56）。
 - **粗层峰值不可信时退一层重扫**：`bestMapVal < max(0.7, min(0.9, minScore*1.2))` 就退，
   但下限 `coarseFloor = max(1, top-2)`，**绝不能退到 level 0**（否则无目标的图从 20 ms 变几秒）。
+- **退层必须要求「细一层峰值更强」，否则会在无目标大图上连退到 floor**（2026-11-16 实测）：
+  只按「峰值 < trust 就退」时，2048×2448 / 360° 无目标图的峰值单调下降
+  （0.4738 → 0.4161 → 0.3844），而每退一层就是一次全图粗扫（63 → 256 → **2272** ms），
+  总耗时 2619 ms 里 87% 花在第二次退层上。判据改成
+  `bestMapVal < prevCoarsePeak + 0.02` 就停（保留当前层候选直接 refine）：
+  **2619 → 347 ms（x64 7.5×、x86 2755 → 579 ms）**，105 张图（data1/data2/case1/synth）
+  的 hits/score/pos/angle 逐字符不变。开关 `SM_NCC_FALLBACK_GAIN`（**负值 = 关闭护栏**，用于 A/B）。
+- **per-map「有没有峰」剪枝对 Shape 无效**：512×612 的分数图配 102×102 模板时，
+  每个 (角度×尺度) 的 map 峰值都在 0.5~0.7（65/65 个 pose），而粗层阈值只有 0.3 ——
+  `mapMax < thresh` 一个都剪不掉。Shape 的 `extract` 占大图搜索 63%，只能靠把 3×3 极大
+  判定融进扫描内核的滚动行缓冲来省（高风险：并行 stripe 需 overlap 行、候选输出顺序
+  必须与现在一致，`std::sort` 不稳定性会让并列分数选到不同候选）。
 - **候选收集不能"收满 N 个就 break"**：扫描自上而下，上半部分的噪点峰会把下半部分的真峰挤掉。
   正确做法：全部局部极大值入表，再按分数全局裁剪（`nth_element` + `resize`）。
 - **金字塔精化只算候选周围的点**，不要每层每候选做整图 `filter2D`（实测 12.24 s → 0.84 s，结果逐位相同）。
@@ -400,7 +412,28 @@ python -c "import zipfile;z=zipfile.ZipFile('dl.zip1');print(z.testzip(), len(z.
   `no readable image to search`。以前返回 0，和「搜了但 0 命中」无法区分。
 - 参数钳制：尺度反序自动交换、`0..0` / 负数 / `angle 720` / `levels 99` 都收敛后正常返回（实测 0 崩溃）。
 
-### 7.7 选型与数据集准备
+### 7.7 对外几何接口（上位机对接，2026-11-16 落地）
+
+- **统一一个变换**：`imagePt = pos + s·R(angle)·(tplPt − origin())`，
+  `R = [cos,sin; −sin,cos]`（与 `buildXForm` 同一约定，图像 y 向下）。
+  所有对外接口（`poseMatrix`/`cornersAt`/`boundsAt`/`contourAt`/`templateToImage`/
+  `imageToTemplate`）都必须由它导出，否则各接口之间会悄悄不一致。
+- **`setOrigin` 用模板绝对像素坐标**，不是 Halcon 那种「相对中心的偏移」；
+  文档里必须写换算（`绝对 = modelCenter() + 偏移`），否则从 Halcon 迁移会差半个模板。
+- **origin 要跟着模型走**：`create()`/`load()`/`createNccModel()`/`deserialize*()` 里必须
+  `resetOrigin()`，否则上一个模型的参考点会静默套到新模型上。
+- **`Detection::pos` 变成参考点后，所有"按 pos 画图"的代码都要改成按模型中心**：
+  `drawResult()` / `getDrawResult()` 里先用 `templateToImage(d, modelCenter())` 把中心
+  求回来再画，否则设了 origin 之后框会整体偏移。NCC 的参考点换算要放在
+  **MaxOverlap 判重之后**，否则换参考点会改变"留下哪几个实例"。
+- `cornersAt()` 的顺序固定为**模板坐标系**的 TL/TR/BR/BL（旋转后不再"朝上"），
+  文档要写清，否则上位机按 `[0]` 当"最上点"用会错。
+- 自检三件套：中心映射到 `pos`、正逆变换闭合、四角边长 = 尺寸×scale；
+  `_ai_tmp/pose_selftest.cpp` 是自动化版本（含 135°/−45° + 0.7 缩放）。
+
+### 7.8 选型与数据集准备
+
+
 
 - **重复目标 / 低纹理块 / 大旋转角（±90°）/ 小尺度范围 → NCC**（与 Halcon NCC 同实例 Δscore ≤0.003）。
 - **有尺度变化 / 大图 / 角度少 → Shape**（NCC 无尺度维度：80 张缩放样本只检出 61/80；大图 360° NCC 2552 ms vs Shape 252 ms）。
@@ -412,7 +445,7 @@ python -c "import zipfile;z=zipfile.ZipFile('dl.zip1');print(z.testzip(), len(z.
 - 相似纹理（焊盘模板 ↔ 通孔图）NCC 错配分能到 **0.70**（Halcon 同样是 0.703）⇒
   用 NCC 时 `minScore` 不要设 0.5~0.6，重复/相似场景建议 ≥0.75 或与 Shape 交叉确认。
 
-### 7.8 匹配类算法的验证顺序（通用）
+### 7.9 匹配类算法的验证顺序（通用）
 
 1. **合成数据做 ground truth**：把模板原样贴回噪声图，正确的匹配器必须报 **1.000000** 且位置精确
    （真实图上的分数很难判断对错，合成图能立刻把「公式错」和「几何错」分开）。
@@ -422,7 +455,7 @@ python -c "import zipfile;z=zipfile.ZipFile('dl.zip1');print(z.testzip(), len(z.
 4. **端到端也要测**：合成图 + 真实图的 `find_*` 都要报出贴回位置，否则问题在搜索链路（金字塔/裁剪/亚像素）。
 5. 旋转必须用 Halcon 或"整图旋转 + 贴模板"的真值 —— `cv::matchTemplate` **没有旋转维度**。
 
-### 7.9 诊断开关（保留，别删）
+### 7.10 诊断开关（保留，别删）
 
 | 开关 | 作用 |
 |---|---|
@@ -486,6 +519,9 @@ python -c "import zipfile;z=zipfile.ZipFile('dl.zip1');print(z.testzip(), len(z.
 4. **`@($L + $p[0], $T + $p[1])` 在函数里会报 op_Addition**：
    先算到中间变量再组装数组。
 5. **`run_commands` 的多条命令可能并行**：有依赖关系（先建模型再加载）必须分两次调用或用 `;` 串起来。
+   **用耗时做 A/B 时这条尤其致命**：同一批 4 个数据集并行跑，case1 从 28 ms 被报成
+   45 ms（+57%），结论直接反了。A/B 必须写在**同一个 `commands` 元素**里串行执行，
+   并且先连跑两次确认波动范围再下结论。
 6. **`editor` 的 `insert_line=<EOF>` 可能插进未闭合的块**（曾把 `add_executable` 全包进 `foreach`）。
    追加后立刻 grep 块关键字核对成对：
    ```powershell

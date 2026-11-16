@@ -101,7 +101,8 @@
 
 > ⚠️ 下表是**旧构建**的数据；2026-11-16 晚用当前 `build\`（x64 AVX2）复测，
 > data1 已从 44.7 ms 降到 **20.2 ms**、大图 Shape 从 251.8 ms 降到 **83.9 ms**，
-> NCC 大图仍是 **2.8 s** 量级。复测明细与新发现的优化点见 **§九**。
+> NCC 大图 **2.8 s → 0.35 s**（退层判据已落地，见 §9.2）。
+> 复测明细与新发现的优化点见 **§九**。
 
 | 场景 | 本项目 | Halcon 17 | 倍数 |
 |---|---|---|---|
@@ -254,6 +255,17 @@ qfn1, m3 模板, 360°:  [dbg2] topScan=63.1 (extract=42.3) refine=2.3 subpixel=
 - 预期：qfn1 search 67.5 → **约 25 ms**，与 Halcon 差距 10× → 约 3×。
 - 验收：`dataset/sample` 全量 + qfn1 的 `pos/angle/scale/score` 逐字符比对（必须完全一致）。
 
+> **2026-11-16 实测：第 1 步（per-map max 剪枝）被证伪，不要按这个做。**
+> 用现成的 `SM_PROBE=1` 探针统计 qfn1 上 65 个 pose 的分数图峰值：
+> `poses=65  below0.3=0  below0.2=0   min 0.5 / mean 0.569 / max 0.7`，
+> 而粗层 `topTarget = minScore*0.55 = 0.3`。也就是说**每个 pose 的 map 都有高于阈值的峰**
+> （512×612 的位置里 102×102 的模板总能偶然对上若干处），`mapMax < thresh` 一个都剪不掉。
+> 剩下的只能是第 2 步（把 3×3 极大判定融进扫描内核的滚动行缓冲）。
+> 注意这需要处理并行 stripe 的边界行（现在 `stripes = rows/4`，overlap 一行就是 +25% 成本，
+> 需同步调大 stripe 高度），且候选的输出顺序必须与现在一致（`std::sort` 不稳定，
+> 分数并列时靠遍历顺序决定谁进 `maxPerMap` 截断），属于高风险改动。
+
+
 **(2) NCC：无目标大图上的「退层重扫」把 67 ms 放大成 2.8 s**
 
 ```
@@ -271,7 +283,38 @@ qfn1（无目标）:  level3 coarse 61.4 ms  mapMax 0.4738 < 0.70 -> 退一层
 - 预期：无目标 5MP 图 **2.8 s → < 0.3 s**；有目标场景必须用 `dataset/sample` + 噪声图 A/B 确认召回不掉。
 - 注意：NCC 的 `minSide=9` 与新退层规则有耦合，改完必须复跑「PCB 重复焊盘」那个用例（0.789 错位回归）。
 
+> **2026-11-16 已落地**（`NccMatch.cpp`，退层判据）：退层前要求「细一层的峰值比上一层**至少高
+> `fallbackGain`**（默认 0.02）」，否则保留当前层候选直接进入 refine。
+> `SM_NCC_FALLBACK_GAIN` 可覆盖该值，**负值 = 关闭护栏**（复现旧行为），便于 A/B。
+>
+> 实测（qfn1 2048×2448，360°，minScore 0.3，无目标）：
+>
+> ```
+> 旧：level3 63 ms (0.4738) -> level2 256 ms (0.4161) -> level1 2272 ms (0.3844) -> refine
+>     总 2619 ms
+> 新：level3 63 ms (0.4738) -> level2 256 ms (0.4161，未改善) -> 停，用 level2 候选
+>     总  347 ms     （x64 7.5×）
+> x86：2755 ms -> 579 ms（4.8×）
+> ```
+>
+> 召回 A/B（`_ai_tmp/ab_ncc.ps1`，105 张：data2 9 + data1 7 + case1 9 + synth 80）：
+> `Compare-Object` 只有 `load xx ms` / `avg xx ms/image` 两行时间差，
+> **每张图的 hits / score / pos / angle 逐字符一致**；qfn1 连跑 3 次结果也完全一致。
+> 批量场景还更快：synth 80 张 18.96 → **8.26 ms/张（2.3×）**，data1 3.66 → 3.25，case1 28.19 → 27.67。
+
+
 **(3) 结果侧对外接口缺三样（接上位机 / 机器人时最先撞到）**
+
+> **2026-11-16 已落地前两项**（`GeoMatch.h` / `NccMatch.h` 的「pose & geometry」段落）：
+> `poseMatrix` / `poseAffine` / `cornersAt` / `boundsAt` / `contourAt`（仅 Shape）/
+> `templateToImage` / `imageToTemplate` / `setOrigin`·`resetOrigin`·`origin`。
+> 统一约定：`imagePt = pos + s·R(angle)·(tplPt − origin())`，`R = [cos,sin;−sin,cos]`。
+> `setOrigin` 取**模板绝对像素坐标**（Halcon 是相对中心的偏移，= 中心 + 偏移）。
+> 已用 `_ai_tmp/pose_selftest.cpp` 在 data1 与 synth（135°/−45°、0.7 缩放）上验证：
+> 中心映射误差 0、正逆变换 < 3e-5 px、四角边长 = 尺寸×scale、换 origin 后 score/angle/四角不变。
+> 文档见 `docs/SDK.md` 5.6（含每个接口的参数表、Halcon 对应、自检方法），
+> 可运行示例 `examples/example_host_integration.cpp`（参与 CMake 构建）。
+> **还剩多模型同搜**未做。
 
 | 缺什么 | Halcon 对应 | 我们的现状 | 影响 |
 |---|---|---|---|
@@ -328,8 +371,8 @@ HalconDemo\halcon_ncc_compare.exe   dataset\image\m3.bmp dataset\image\qfn1.bmp 
 
 | 优先级 | 事项 | 依据 | 预估 |
 |---|---|---|---|
-| **P0** | 粗扫 extract 剪枝（per-map max）+ 滚动 3×3 极大 | 占大图搜索 63%，改完 67.5 → ~25 ms | 小（2~3 天） |
-| **P0** | NCC 退层重扫加预算约束 | 无目标 5MP 图 2.8 s → <0.3 s | 小（1~2 天） |
+| **P0** | ~~粗扫 extract 剪枝（per-map max）~~ → 只剩「滚动 3×3 融合进扫描内核」 | per-map 剪枝实测证伪（65/65 pose 峰值 ≥0.5）；滚动融合是高风险重构 | 中（1 周） |
+| **P0** | ✅ 已完成：NCC 退层只在峰值改善时继续 | 无目标 5MP 图 2619 → **347 ms**（x64 7.5×、x86 4.8×），105 张图结果逐字符不变 | 已完成 |
 | **P0** | 搜索 ROI（`detect(gray, roi)` + CLI `-roi` + GUI「搜索区」） | 大图/多工位通用收益，与 extract 剪枝叠加 | 小（2~3 天） |
 | **P0** | 建模对比度自适应（对齐 Halcon 灰度 30 的口径） | 默认参数下分数差 0.27 | 小（1 天） |
 | **P1** | `FindParams::numLevels`（搜索层数覆盖） | 调速度/召回不必重建模型 | 小（1 天） |

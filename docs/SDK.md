@@ -1,6 +1,6 @@
 # GeoMatch SDK 使用手册
 
-> 版本 **1.1.0** ｜ Windows x64 / x86 ｜ MSVC 2019+ ｜ OpenCV 4.5.5
+> 版本 **1.1.3** ｜ Windows x64 / x86 ｜ MSVC 2019+ ｜ OpenCV 4.5.5
 >
 > 本手册面向**在自己的程序里调用 GeoMatch 库**的场景。只想用现成界面看效果的话，
 > 直接运行发布包里的 `GeoGUIDemo.exe` 即可，不需要读这份文档。
@@ -14,6 +14,7 @@
 - [3. 五分钟上手](#3-五分钟上手)
 - [4. 链接配置](#4-链接配置)
 - [5. 形状匹配 API](#5-形状匹配-api)
+  - [5.6 位姿与几何（上位机对接）](#56-位姿与几何上位机对接)
 - [6. NCC 匹配 API](#6-ncc-匹配-api)
 - [7. 参数调优](#7-参数调优)
 - [8. 线程安全与性能](#8-线程安全与性能)
@@ -260,6 +261,19 @@ find_package(GeoMatch REQUIRED)
 | `float strongestMag()` / `weakestMag()` | 保留点里的最强/最弱梯度幅值 |
 | `ShapeMatcher& core()` | 逃生口，拿底层引擎 |
 
+**位姿与几何（上位机对接用，详见 [5.6](#56-位姿与几何上位机对接)）**
+
+| 方法 | 说明 |
+|---|---|
+| `cv::Matx33d poseMatrix(const Detection&) const` | 模板→图像的 3×3 齐次矩阵 |
+| `cv::Mat poseAffine(const Detection&) const` | 同一个变换的 2×3 形式（给 `cv::warpAffine`） |
+| `std::vector<std::vector<cv::Point2f>> contourAt(const Detection&) const` | 位姿下的模型轮廓折线 |
+| `std::vector<cv::Point2f> cornersAt(const Detection&) const` | 位姿下的模板四角 |
+| `cv::Rect2f boundsAt(const Detection&) const` | 位姿下的正包围盒 |
+| `cv::Point2f templateToImage(const Detection&, cv::Point2f) const` | 单点 模板→图像 |
+| `cv::Point2f imageToTemplate(const Detection&, cv::Point2f) const` | 单点 图像→模板（精确逆） |
+| `void setOrigin(cv::Point2f)` / `resetOrigin()` / `cv::Point2f origin() const` | 改上报的参考点 |
+
 ### 5.4 `geomatch::Timing`
 
 | 字段 | 含义 |
@@ -273,13 +287,191 @@ find_package(GeoMatch REQUIRED)
 
 | 函数 | 说明 |
 |---|---|
-| `const char* versionString()` | `"1.1.0"` |
+| `const char* versionString()` | `"1.1.3"` |
 | `bool isSharedBuild()` | 当前链接的是 DLL 还是静态库 |
 | `std::vector<std::string> listImages(dir, exts)` | 列目录里的图片（已排序） |
 | `bool enableOpenCL(bool)` | 开关 OpenCL，返回实际是否可用 |
 | `std::string environmentReport()` | OpenCV 版本 / CPU 特性 / 设备 |
 | `std::string benchmarkReport()` | 机器基准（1/2/4/全部线程） |
 | `std::vector<std::string> excludeFile(files, tplPath)` | 把模板本身从列表里去掉 |
+
+### 5.6 位姿与几何（上位机对接）
+
+匹配只给出 `(pos, angle, scale, score)`，但上位机 / 机器人真正要的是「模板上的这个点，在
+图像上的哪个位置」。这一节的所有接口都由**同一个变换**导出，所以彼此一定自洽。
+
+#### 5.6.1 坐标系与变换
+
+```
+模板坐标 (u, v)   模板图像自身的像素坐标，(0,0) = 模板左上角
+图像坐标 (x, y)   搜索图像的像素坐标
+```
+
+两者之间的变换是**相似变换**（旋转 + 等比缩放 + 平移）：
+
+```
+[x]     [ s*cosθ   s*sinθ   tx ] [u]
+[y]  =  [-s*sinθ   s*cosθ   ty ] [v]
+[1]     [   0        0       1 ] [1]
+```
+
+- `θ` = `Detection::angle`（弧度）；图像 y 轴向下，所以矩阵里是 `-sinθ` 在左下、
+  `+sinθ` 在右上，这**正好等于把图像逆时针转 θ**（与 Halcon `vector_angle_to_rigid`
+  用 `-θ` 得到的结果一致，交叉核对时注意符号）。
+- `s` = `Detection::scale`。
+- `tx, ty` 由「参考点必须落在 `Detection::pos`」反解出来，见 5.6.4。
+
+> 一句话：**模板中心 + 角度 + 尺度 + 参考点 → 一个 3×3 矩阵，剩下全由它算。**
+
+#### 5.6.2 接口一览
+
+| 接口 | 返回 | Halcon 对应 | 典型用途 |
+|---|---|---|---|
+| `poseMatrix(d)` | `cv::Matx33d` | `hom_mat2d_*` / `vector_angle_to_rigid` | 交给 PLC / 上位机 / 标定链路 |
+| `poseAffine(d)` | `cv::Mat` (2×3) | — | 直接喂 `cv::warpAffine` / `cv::transform` |
+| `cornersAt(d)` | `std::vector<cv::Point2f>`（4 个） | `affine_trans_contour_xld`（矩形轮廓） | 画框、算多边形、给机器人抓取位姿 |
+| `boundsAt(d)` | `cv::Rect2f` | `smallest_rectangle1_xld` | ROI、越界判断、结果落表 |
+| `contourAt(d)` | `std::vector<std::vector<cv::Point2f>>` | `get_shape_model_contours` + `affine_trans_contour_xld` | 真正的边缘折线，做测量/绘图 |
+| `templateToImage(d, p)` | `cv::Point2f` | `affine_trans_point_2d` | 模板上某点（如基准孔）落到图像哪里 |
+| `imageToTemplate(d, p)` | `cv::Point2f` | `affine_trans_point_2d`（逆矩阵） | 反查：图像上的缺陷/测量点对应模板哪个位置 |
+| `setOrigin(p)` | — | `set_shape_model_origin` | 把上报点从"模板中心"改成"装配基准点" |
+| `resetOrigin()` | — | 原点复位 | 回到模板中心 |
+| `origin()` | `cv::Point2f` | `get_shape_model_origin` | 查当前参考点（模板坐标） |
+
+#### 5.6.3 每个接口的参数与返回值
+
+**`cv::Matx33d poseMatrix(const Detection& d) const`**
+
+| 项 | 说明 |
+|---|---|
+| 入参 `d` | 任意一个 `Detection`（必须来自同一个 `Matcher`） |
+| 返回 | 3×3、行主序、`M(2,0)=M(2,1)=0, M(2,2)=1` |
+| 约定 | 图像坐标 = `M * [u, v, 1]ᵀ`（齐次） |
+| 备注 | 只有 6 个自由度，矩阵一定是相似变换，可以直接从中读回 `tx=M(0,2)`、`ty=M(1,2)`、`θ=atan2(M(0,1), M(0,0))`、`s=hypot(M(0,0), M(1,0))` |
+
+**`cv::Mat poseAffine(const Detection& d) const`**
+
+返回 `CV_64F` 的 2×3（`poseMatrix` 的前两行）。给 `cv::warpAffine(img, out, M, size)`、
+`cv::transform(points, out, M)` 直接使用，避免自己裁矩阵。
+
+**`std::vector<std::vector<cv::Point2f>> contourAt(const Detection& d) const`**
+
+| 项 | 说明 |
+|---|---|
+| 返回 | 每条边缘链一条折线（**不是散点**），全部转到图像坐标 |
+| 点数 | 与模型点数同量级（140×140 焊盘约 33 条 / 1900 点） |
+| 空返回 | 模型没有轮廓数据时（`numLevels()==0`，或读的是 v1/v2 版 `.shm`）；此时请改用 `drawResult()` 或 `cornersAt()` |
+| 精度 | `float`，亚像素级（模型点本身是整像素，误差来自变换） |
+| 关联 | 与 `drawResult()` 画的轮廓**完全同源**（同一份 level-0 `chains`） |
+
+**`std::vector<cv::Point2f> cornersAt(const Detection& d) const`**
+
+固定 4 个点，顺序是**模板坐标系下的** 左上、右上、右下、左下（旋转后不再"朝上")。
+边长恒为 `modelSize() * scale`，可直接用来反解尺寸：
+
+```cpp
+auto q = m.cornersAt(d);
+double w = cv::norm(q[1] - q[0]);   // == modelSize().width  * d.scale
+double h = cv::norm(q[2] - q[1]);   // == modelSize().height * d.scale
+```
+
+**`cv::Rect2f boundsAt(const Detection& d) const`**
+
+`cornersAt()` 的正包围盒（`cv::boundingRect`）。角度为 0 时等于
+`(pos - centre*scale, size*scale)`；有角度时会比模板大，这是旋转的必然结果。
+模型未就绪时返回空 `Rect2f`（`width==0`）。
+
+**`cv::Point2f templateToImage(const Detection& d, cv::Point2f tplPt) const`**
+**`cv::Point2f imageToTemplate(const Detection& d, cv::Point2f imgPt) const`**
+
+| 项 | 说明 |
+|---|---|
+| `tplPt` | 模板像素坐标（0..cols-1, 0..rows-1），**不受参考点影响** |
+| `imgPt` | 图像像素坐标，同样与参考点无关 |
+| 关系 | 互为精确逆：`imageToTemplate(d, templateToImage(d, p)) == p`（误差 < 1e-4 px） |
+| 用途 | 模板上的基准孔/字符/测量点在图像中的位置；或反过来把图像上的缺陷映射回模板 |
+
+**`void setOrigin(cv::Point2f tplPoint)` / `void resetOrigin()` / `cv::Point2f origin() const`**
+
+| 项 | 说明 |
+|---|---|
+| `tplPoint` | **模板像素坐标**（不是相对中心的偏移，也不是图像坐标） |
+| 生效范围 | 之后每次 `detect()` / `detectTimed()` 返回的 `Detection::pos` |
+| 不改变 | `score`、`angle`、`scale`、轮廓、四角、包围盒（几何完全不动，只有上报点变了） |
+| 不持久化 | **不写进 `.shm`**，所以 `load()` 之后要重新 `setOrigin()` |
+| `origin()` | 未设置时返回 `modelCenter()`（模板中心） |
+| 线程 | 与 `create()/load()` 同级：不要在一个模型被多线程搜索时改它 |
+
+> 与 Halcon 的差别：Halcon 的 origin 是**相对模板中心的偏移**，这里要求的是**模板绝对像素坐标**。
+> 换算：`绝对 = 中心 + 偏移`，即 `setOrigin(m.modelCenter() + halconOffset)`。
+
+#### 5.6.4 `tx / ty` 是怎么来的（需要自己算时用）
+
+```
+tx = pos.x - s * ( cosθ * o.x + sinθ * o.y)
+ty = pos.y - s * (-sinθ * o.x + cosθ * o.y)
+其中 o = origin()（未设置时 = modelCenter()）
+```
+
+验算：把 `(u,v) = o` 代回，得到 `(x,y) = pos`，即「参考点落在 pos」。
+
+#### 5.6.5 完整用法
+
+```cpp
+#include "GeoMatch/GeoMatch.h"
+
+geomatch::Matcher m;
+m.load("pad.shm");
+
+geomatch::Config c = m.config();      // load 之后改搜索参数的标准姿势
+c.minScore = 0.7;
+m.setConfig(c);
+
+m.setOrigin(cv::Point2f(20.f, 40.f)); // 装配基准点在模板内的像素坐标
+
+auto dets = m.detect(img);
+for (const auto& d : dets)
+{
+    // 1) 给上位机：模板->图像 的变换
+    cv::Matx33d M = m.poseMatrix(d);
+    //    需要 "库坐标 -> 机器人坐标" 时，左乘标定矩阵即可：
+    //    cv::Matx33d T = calib;  cv::Matx33d World = T * M;
+
+    // 2) 给机器人：四个角点（模板 TL,TR,BR,BL）
+    std::vector<cv::Point2f> quad = m.cornersAt(d);
+
+    // 3) 给测量/绘图：真实边缘折线
+    for (const auto& poly : m.contourAt(d))
+        cv::polylines(vis, std::vector<cv::Point>(poly.begin(), poly.end()),
+                      false, cv::Scalar(255, 0, 255), 1);
+
+    // 4) 模板上的基准孔落在图像哪里
+    cv::Point2f hole = m.templateToImage(d, cv::Point2f(70.f, 70.f));
+}
+```
+
+完整可运行版本：`examples/example_host_integration.cpp`（构建出 `example_host_integration.exe`）。
+
+#### 5.6.6 自检方法（自己接的时候照这个验）
+
+```cpp
+// a) poseMatrix 必须把模板中心映射到 pos
+cv::Matx33d M = m.poseMatrix(d);
+cv::Point2f c( (float)(M(0,0)*ctr.x + M(0,1)*ctr.y + M(0,2)),
+               (float)(M(1,0)*ctr.x + M(1,1)*ctr.y + M(1,2)) );
+assert(cv::norm(c - d.pos) < 1e-3);
+
+// b) 正逆变换闭合
+cv::Point2f p(7.f, 13.f);
+assert(cv::norm(m.imageToTemplate(d, m.templateToImage(d, p)) - p) < 1e-3);
+
+// c) 四角边长 = 模板尺寸 * scale
+auto q = m.cornersAt(d);
+assert(std::abs(cv::norm(q[1]-q[0]) - m.modelSize().width * d.scale) < 1e-2);
+```
+
+`_ai_tmp/pose_selftest.cpp` 就是这三条 + `setOrigin` 不改变几何/分数的自动化版本，
+在 data1 与 synth（含 135° 旋转、0.7 缩放）上全部通过。
 
 ---
 
@@ -329,6 +521,36 @@ find_package(GeoMatch REQUIRED)
 | `drawResult(gray, results)` / `drawModelFeatures(scale)` | 可视化 |
 | `lastPreprocessTime()` / `lastSearchTime()` | 最近一次耗时 |
 | `modelSize()` / `modelPixelCount()` / `numLevels()` / `angleCount()` / `angleStep()` | 模型信息 |
+
+**位姿与几何（与形状匹配完全同名同语义，见 [5.6](#56-位姿与几何上位机对接)）**
+
+| 方法 | 说明 |
+|---|---|
+| `cv::Matx33d poseMatrix(const NccResult&) const` | 模板→图像 3×3（NCC 无尺度，`s` 恒为 1） |
+| `cv::Mat poseAffine(const NccResult&) const` | 2×3 形式 |
+| `std::vector<cv::Point2f> cornersAt(const NccResult&) const` | 模板四角 |
+| `cv::Rect2f boundsAt(const NccResult&) const` | 正包围盒 |
+| `cv::Point2f templateToImage(const NccResult&, cv::Point2f) const` | 单点 模板→图像 |
+| `cv::Point2f imageToTemplate(const NccResult&, cv::Point2f) const` | 单点 图像→模板 |
+| `void setOrigin(cv::Point2f)` / `resetOrigin()` / `cv::Point2f origin() const` | 参考点 |
+
+> NCC 没有 `contourAt()`：NCC 模型是整块灰度模板，没有"边缘链"这个概念
+> （Halcon 的 `create_ncc_model` 同样不产生轮廓）。要轮廓就用 `cornersAt()`，
+> 或者改用形状匹配。
+
+```cpp
+geomatch::NccMatcher nm;
+nm.load("via.ncm");
+nm.setOrigin(cv::Point2f(55.f, 55.f));          // 模板坐标
+for (const auto& r : nm.findNccModel(img, fp))
+{
+    cv::Matx33d M = nm.poseMatrix(r);           // 无尺度维度
+    auto quad = nm.cornersAt(r);
+}
+```
+
+NCC 的参考点是在 **MaxOverlap 判重之后**才应用的，所以换参考点不会改变
+"留下哪几个实例"；形状匹配同理。
 
 ---
 
@@ -418,6 +640,21 @@ printf("%s\n", geomatch::benchmarkReport().c_str());
 - 角度范围够不够（模板可能旋转超出了 `angleExtent`）
 - 尺度范围够不够
 
+**Q: 结果坐标是模板中心，但我需要的是装配基准点 / 吸嘴中心**
+`m.setOrigin(cv::Point2f(20, 40))`（**模板像素坐标**，见 [5.6](#56-位姿与几何上位机对接)），
+之后 `Detection::pos` 直接就是该点。注意它不写进 `.shm`，`load()` 之后要重设一次。
+
+**Q: 我要把结果给机器人，该拿哪个数？**
+`poseMatrix(d)` 就是「模板坐标 → 图像坐标」的 3×3；再左乘相机标定矩阵就是机器人坐标。
+只想要四边形就 `cornersAt(d)`（4 个点，模板 TL/TR/BR/BL 顺序）。
+
+**Q: `cornersAt()` 的 4 个点顺序会随角度变化吗？**
+不会。顺序始终按**模板坐标系**的左上、右上、右下、左下；旋转后 `[0]` 可能不再是图像里最上面的点。
+
+**Q: `contourAt()` 返回空**
+模型是旧版 `.shm`（v1/v2 没存轮廓）或该模型没建出边缘链。重建一次模型即可；
+临时方案用 `cornersAt()` 或 `drawResult()`。
+
 **Q: 32 位程序能用吗？**
 能，发布包提供 win32 与 win64 两套。注意两套 OpenCV 二进制不通用，不能混链。
 
@@ -428,18 +665,21 @@ printf("%s\n", geomatch::benchmarkReport().c_str());
 
 ## 10. 完整示例
 
-仓库 `examples/` 下有两份**可编译**的完整程序（构建时会一起编，保证文档不过期）：
+仓库 `examples/` 下有三份**可编译**的完整程序（构建时会一起编，保证文档不过期）：
 
 | 文件 | 内容 |
 |---|---|
 | `examples/example_shape_match.cpp` | 形状匹配：读图 -> 建模 -> 搜索 -> 打印 -> 存标注图 |
 | `examples/example_ncc_match.cpp` | NCC：读图 -> 建模 -> 搜索 -> 打印 -> 存标注图 |
+| `examples/example_host_integration.cpp` | **上位机对接**：位姿矩阵 / 四角 / 包围盒 / 轮廓 / 参考点 / 正逆变换 |
 
 运行：
 
 ```bat
 build_x64\example_shape_match.exe case1\temp.jpg case1\tmp_grab_1762994178.jpg out.png
 build_x64\example_ncc_match.exe   case1\temp.jpg case1\tmp_grab_1762994178.jpg out.png
+build_x64\example_host_integration.exe dataset\sample\data1\template_pad.jpg ^
+    dataset\sample\data1\scan_1783730078944_score.jpg out.png
 ```
 
 输出示例：
@@ -450,6 +690,22 @@ template 154x148   image 1280x1024
 model: 1200 points, 3 levels, 154x148, spread 1.14
 matches: 1   preprocess 2.36 ms   search 46.12 ms
   #0  score 0.981  pos (841.97, 674.43)  angle -0.1 deg  scale 1.000
+```
+
+`example_host_integration` 的输出（每个实例一段）：
+
+```
+origin (template coords) = (20.0, 40.0)
+matches = 4
+  #0  score 0.952  模板->图像 3x3:
+        [   1.0000    0.0011   1038.444 ]
+        [  -0.0011    1.0000     84.790 ]
+        [   0.0000    0.0000      1.000 ]
+        => 平移 (1038.444, 84.790)  旋转 0.06 deg  尺度 1.0000
+        四角(模板 TL,TR,BR,BL) -> (1038.4,84.8) (1178.4,84.6) (1178.6,224.6) (1038.6,224.8)
+        正包围盒: x=1038.0 y=84.0 w=141.0 h=141.0
+        模板(0.0,0.0) -> 图像(1038.44,84.79) -> 回到模板(-0.000,0.000)
+        轮廓: 33 条折线 / 1938 点
 ```
 
 更多进阶用法（批量、基准、自检、可视化）见仓库 `main.cpp`（`GeoMatchDemo`）
