@@ -614,6 +614,16 @@ int main(int argc, char** argv)
         }
     }
 
+    // An unreadable -s (or an empty / unreadable -d) used to fall through to
+    // "results written to ..." with exit code 0, which is indistinguishable
+    // from "searched, found nothing".  Report it as an error instead.
+    if (rep.images <= 0)
+    {
+        std::cerr << "no readable image to search: "
+                  << (searchFile.empty() ? searchDir : searchFile) << "\n";
+        return -1;
+    }
+
     if (show && !rep.detections.empty())
     {
         cv::Mat img = cv::imread(rep.files[0], cv::IMREAD_GRAYSCALE);

@@ -251,6 +251,13 @@ int main(int argc, char** argv)
         }
     }
 
+    if (nImg == 0)
+    {
+        std::fprintf(stderr, "[ncc] no readable image to search (%d path(s) given)\n",
+                     (int)files.size());
+        return -1;
+    }
+
     if (nImg > 0)
         std::printf("----\nimages %d   hits %d   avg %.2f ms/image (preprocess+search)\n",
                     nImg, nHit, sumMs / nImg);
