@@ -261,6 +261,72 @@ public:
     // repeat the search n times and keep the timings of the last run
     std::vector<Detection> detectTimed(const cv::Mat& gray, int loops, Timing* timing = nullptr) const;
 
+    //---- pose & geometry (host / robot integration) ----------------------
+    //
+    // Everything below answers the question a host program actually asks
+    // after a match: "where is this thing, in MY coordinates".  All of it is
+    // built on one 3x3 matrix, so the numbers are consistent by construction.
+    //
+    // COORDINATE CONVENTION
+    //   template coordinates (u, v)  : pixel coordinates of the template image,
+    //                                  (0,0) = its top-left corner
+    //   image coordinates    (x, y)  : pixel coordinates of the search image
+    //   the pose maps one to the other with a similarity transform
+    //       [x]     [ s*cos   s*sin   tx ] [u]
+    //       [y]  =  [-s*sin   s*cos   ty ] [v]
+    //       [1]     [   0       0      1 ] [1]
+    //   i.e. rotate by -angle (image y points down), scale, then translate so
+    //   that the reference point lands on Detection::pos.
+    //
+    // Halcon equivalents are given per function so a port stays mechanical.
+
+    // template -> image as a homogeneous 3x3 (Halcon: hom_mat2d_* built from
+    // vector_angle_to_rigid; also what cv::warpPerspective expects).
+    cv::Matx33d poseMatrix(const Detection& d) const;
+
+    // same matrix as the 2x3 form cv::warpAffine / cv::transform take.
+    cv::Mat poseAffine(const Detection& d) const;
+
+    // The model contour (the level-0 edge chains that drawResult() shows)
+    // transformed into the search image at this pose.  Float precision, one
+    // polyline per edge chain, in image coordinates.
+    // (Halcon: get_shape_model_contours + affine_trans_contour_xld)
+    // Empty when the model has no chains (a .shm written before version 3)
+    // or when the matcher has no model.
+    std::vector<std::vector<cv::Point2f>> contourAt(const Detection& d) const;
+
+    // The four corners of the template rectangle at this pose, in the order
+    // top-left, top-right, bottom-right, bottom-left OF THE TEMPLATE.
+    // Cheaper than contourAt() and never empty for a valid model - this is
+    // what most host programs want (draw a quad, compute a polygon, feed a
+    // handling robot).
+    std::vector<cv::Point2f> cornersAt(const Detection& d) const;
+
+    // Axis-aligned bounding box of the instance in the search image
+    // (= bounding rect of cornersAt()).
+    cv::Rect2f boundsAt(const Detection& d) const;
+
+    // single point, same mapping as poseMatrix(); imageToTemplate() is its
+    // exact inverse, so templateToImage(imageToTemplate(p)) == p.
+    cv::Point2f templateToImage(const Detection& d, cv::Point2f tplPt) const;
+    cv::Point2f imageToTemplate(const Detection& d, cv::Point2f imgPt) const;
+
+    // Reference point (Halcon: set_shape_model_origin).
+    // Detection::pos reports the model centre by default.  When the host needs
+    // a different point - the nozzle of a pick-and-place head, a corner of the
+    // part, a fiducial - set it once in TEMPLATE pixel coordinates and every
+    // later Detection::pos (and poseMatrix / cornersAt / ...) follows it, so
+    // no post-processing is needed in the host loop.
+    //
+    //   m.setOrigin(cv::Point2f(20, 40));   // template pixel (20, 40)
+    //   ... auto dets = m.detect(img);      // dets[0].pos == that point
+    //   m.resetOrigin();                    // back to the model centre
+    //
+    // The value is NOT stored in the .shm, so set it after load() as well.
+    void        setOrigin(cv::Point2f tplPoint);
+    void        resetOrigin();
+    cv::Point2f origin() const;
+
     //---- visualisation --------------------------------------------------
     // model image (x3) with the selected edge points, gradients and a
     // parameter panel on the right
@@ -347,9 +413,18 @@ public:
     const ShapeMatcher& core() const { return *core_; }
 
 private:
+    // reference point of a Detection, in template pixel coordinates:
+    // the value given to setOrigin(), or the model centre otherwise.
+    cv::Point2f refPoint() const;
+    // shift Detection::pos from the model centre to the reference point
+    // (no-op when no origin was set).  Called by detect()/detectTimed().
+    void        applyOrigin(std::vector<Detection>& dets) const;
+
     std::unique_ptr<ShapeMatcher> core_;
     Config cfg_;
     std::string modelLabel_;   // shown in drawModelInfo()
+    cv::Point2f origin_;       // setOrigin() value, template coordinates
+    bool        hasOrigin_ = false;
 };
 
 //-----------------------------------------------------------------------

@@ -165,6 +165,9 @@ float       Matcher::normalPeakShare()  const { return ready() ? core_->normalPe
 bool Matcher::create(const cv::Mat& gray, const Config& cfg)
 {
     cfg_ = cfg;
+    // a reference point belongs to ONE model (its template size/centre), so it
+    // must not leak into the next one
+    resetOrigin();
     if (gray.empty()) return false;
     cv::Mat g8;
     if (gray.channels() == 3) cv::cvtColor(gray, g8, cv::COLOR_BGR2GRAY);
@@ -175,6 +178,7 @@ bool Matcher::create(const cv::Mat& gray, const Config& cfg)
 bool Matcher::load(const std::string& file)
 {
     if (!core_->readShapeModel(file)) return false;
+    resetOrigin();          // see create(): the origin belongs to one model
     cfg_ = Config();
     const MatchParams& p = core_->params();
     cfg_.angleStart  = p.angleStart;
@@ -209,6 +213,141 @@ std::vector<Detection> Matcher::detect(const cv::Mat& gray, Timing* timing) cons
     }
     out.reserve(res.size());
     for (const MatchResult& r : res) out.push_back(Detection(r));
+    applyOrigin(out);
+    return out;
+}
+
+//=======================================================================
+//  pose & geometry: everything a host program needs to consume a Detection
+//
+//  One mapping, used by every helper below:
+//      imagePt = Detection::pos + s * R(angle) * (tplPt - refPoint())
+//  with R(a) = [cos a, sin a; -sin a, cos a], which is the matcher's own pose
+//  convention (see buildXForm); all helpers therefore agree by construction.
+//=======================================================================
+cv::Point2f Matcher::refPoint() const
+{
+    if (hasOrigin_) return origin_;
+    return ready() ? core_->modelCenter() : cv::Point2f(0.f, 0.f);
+}
+
+void Matcher::setOrigin(cv::Point2f tplPoint)
+{
+    origin_    = tplPoint;
+    hasOrigin_ = true;
+}
+
+void Matcher::resetOrigin()
+{
+    hasOrigin_ = false;
+    origin_    = cv::Point2f(0.f, 0.f);
+}
+
+cv::Point2f Matcher::origin() const { return refPoint(); }
+
+void Matcher::applyOrigin(std::vector<Detection>& dets) const
+{
+    if (!hasOrigin_ || !ready()) return;
+    const cv::Point2f ctr = core_->modelCenter();
+    const cv::Point2f dlt(origin_.x - ctr.x, origin_.y - ctr.y);
+    if (std::abs(dlt.x) < 1e-6f && std::abs(dlt.y) < 1e-6f) return;
+
+    for (size_t i = 0; i < dets.size(); i++)
+    {
+        Detection& d = dets[i];
+        const float ca = (float)std::cos(d.angle), sa = (float)std::sin(d.angle);
+        const float s  = d.scale;
+        d.pos.x += s * (dlt.x * ca + dlt.y * sa);
+        d.pos.y += s * (-dlt.x * sa + dlt.y * ca);
+    }
+}
+
+cv::Matx33d Matcher::poseMatrix(const Detection& d) const
+{
+    const double ca = std::cos((double)d.angle), sa = std::sin((double)d.angle);
+    const double s  = (double)d.scale;
+    const cv::Point2f o = refPoint();
+
+    const double tx = (double)d.pos.x - s * (ca * o.x + sa * o.y);
+    const double ty = (double)d.pos.y - s * (-sa * o.x + ca * o.y);
+
+    return cv::Matx33d( s * ca,  s * sa, tx,
+                       -s * sa,  s * ca, ty,
+                            0.0,     0.0, 1.0);
+}
+
+cv::Mat Matcher::poseAffine(const Detection& d) const
+{
+    const cv::Matx33d M = poseMatrix(d);
+    return (cv::Mat_<double>(2, 3) << M(0, 0), M(0, 1), M(0, 2),
+                                      M(1, 0), M(1, 1), M(1, 2));
+}
+
+cv::Point2f Matcher::templateToImage(const Detection& d, cv::Point2f p) const
+{
+    const cv::Point2f o = refPoint();
+    const double ca = std::cos((double)d.angle), sa = std::sin((double)d.angle);
+    const double s  = (double)d.scale;
+    const double u  = (double)p.x - o.x, v = (double)p.y - o.y;
+    return cv::Point2f((float)(d.pos.x + s * (ca * u + sa * v)),
+                       (float)(d.pos.y + s * (-sa * u + ca * v)));
+}
+
+cv::Point2f Matcher::imageToTemplate(const Detection& d, cv::Point2f p) const
+{
+    const cv::Point2f o = refPoint();
+    const double ca = std::cos((double)d.angle), sa = std::sin((double)d.angle);
+    const double s  = (d.scale != 0.f) ? (double)d.scale : 1.0;
+    // the inverse of R is its transpose, so rotate by +angle then unscale
+    const double dx = (double)p.x - d.pos.x, dy = (double)p.y - d.pos.y;
+    const double u  = (ca * dx - sa * dy) / s;
+    const double v  = (sa * dx + ca * dy) / s;
+    return cv::Point2f((float)(u + o.x), (float)(v + o.y));
+}
+
+std::vector<cv::Point2f> Matcher::cornersAt(const Detection& d) const
+{
+    std::vector<cv::Point2f> q;
+    if (!ready()) return q;
+    const cv::Size tsz = core_->modelSize(0);
+    const float w = (float)tsz.width, h = (float)tsz.height;
+    q.reserve(4);
+    q.push_back(templateToImage(d, cv::Point2f(0.f, 0.f)));   // template top-left
+    q.push_back(templateToImage(d, cv::Point2f(w,   0.f)));   // top-right
+    q.push_back(templateToImage(d, cv::Point2f(w,   h)));     // bottom-right
+    q.push_back(templateToImage(d, cv::Point2f(0.f, h)));     // bottom-left
+    return q;
+}
+
+cv::Rect2f Matcher::boundsAt(const Detection& d) const
+{
+    const std::vector<cv::Point2f> q = cornersAt(d);
+    if (q.empty()) return cv::Rect2f();
+    return cv::boundingRect(q);
+}
+
+std::vector<std::vector<cv::Point2f>> Matcher::contourAt(const Detection& d) const
+{
+    std::vector<std::vector<cv::Point2f>> out;
+    if (!ready()) return out;
+
+    const std::vector<std::vector<cv::Point>>& chains = core_->modelChains(0);
+    if (chains.empty()) return out;
+
+    // chains are stored relative to the model centre
+    const cv::Point2f ctr = core_->modelCenter();
+    out.reserve(chains.size());
+    for (size_t c = 0; c < chains.size(); c++)
+    {
+        const std::vector<cv::Point>& ch = chains[c];
+        if (ch.size() < 2) continue;
+        std::vector<cv::Point2f> poly;
+        poly.reserve(ch.size());
+        for (size_t k = 0; k < ch.size(); k++)
+            poly.push_back(templateToImage(d, cv::Point2f((float)ch[k].x + ctr.x,
+                                                          (float)ch[k].y + ctr.y)));
+        out.push_back(poly);
+    }
     return out;
 }
 
@@ -373,11 +512,15 @@ cv::Mat Matcher::drawResult(const cv::Mat& gray, const std::vector<Detection>& d
         const cv::Scalar col = (k == 0) ? cv::Scalar(0, 255, 0) : cv::Scalar(0, 200, 255);
         const float ca = (float)std::cos(d.angle), sa = (float)std::sin(d.angle);
         const float s  = d.scale;
+        // Everything below is drawn at the MODEL CENTRE.  Detection::pos holds
+        // the reference point (setOrigin()), which is the model centre unless
+        // the caller moved it, so it has to be mapped back through the pose.
+        const cv::Point2f ctr = templateToImage(d, tplCtr);
 
         //---- 1) overlay the template texture at the match pose ----------
-        // affine map:  searchPos = d.pos + s * R * (p - tplCtr)
-        const double tx = d.pos.x - s * (ca * tplCtr.x + sa * tplCtr.y);
-        const double ty = d.pos.y - s * (-sa * tplCtr.x + ca * tplCtr.y);
+        // affine map:  searchPos = ctr + s * R * (p - tplCtr)
+        const double tx = ctr.x - s * (ca * tplCtr.x + sa * tplCtr.y);
+        const double ty = ctr.y - s * (-sa * tplCtr.x + ca * tplCtr.y);
         cv::Mat Mwarp = (cv::Mat_<double>(2, 3) <<
             s * ca,  s * sa, tx,
            -s * sa,  s * ca, ty);
@@ -411,8 +554,8 @@ cv::Mat Matcher::drawResult(const cv::Mat& gray, const std::vector<Detection>& d
                 {
                     const float px = (float)ch[i].x, py = (float)ch[i].y;
                     poly.push_back(cv::Point(
-                        cvRound(s * (px * ca + py * sa) + d.pos.x),
-                        cvRound(s * (-px * sa + py * ca) + d.pos.y)));
+                        cvRound(s * (px * ca + py * sa) + ctr.x),
+                        cvRound(s * (-px * sa + py * ca) + ctr.y)));
                 }
                 cv::polylines(vis, poly, false, col, thick, cv::LINE_AA);
             }
@@ -423,8 +566,8 @@ cv::Mat Matcher::drawResult(const cv::Mat& gray, const std::vector<Detection>& d
         {
             for (const ModelPoint& mp : modelPts)
             {
-                const float x = s * (mp.x * ca + mp.y * sa) + d.pos.x;
-                const float y = s * (-mp.x * sa + mp.y * ca) + d.pos.y;
+                const float x = s * (mp.x * ca + mp.y * sa) + ctr.x;
+                const float y = s * (-mp.x * sa + mp.y * ca) + ctr.y;
                 cv::circle(vis, cv::Point(cvRound(x), cvRound(y)), 1,
                            cv::Scalar(0, 0, 255), -1, cv::LINE_AA);
             }
@@ -435,8 +578,8 @@ cv::Mat Matcher::drawResult(const cv::Mat& gray, const std::vector<Detection>& d
         {
             for (const ModelPoint& mp : modelPts)
             {
-                const float x = s * (mp.x * ca + mp.y * sa) + d.pos.x;
-                const float y = s * (-mp.x * sa + mp.y * ca) + d.pos.y;
+                const float x = s * (mp.x * ca + mp.y * sa) + ctr.x;
+                const float y = s * (-mp.x * sa + mp.y * ca) + ctr.y;
                 const float gx = mp.gx * ca + mp.gy * sa;
                 const float gy = -mp.gx * sa + mp.gy * ca;
                 const float gn = std::sqrt(gx * gx + gy * gy);
@@ -454,15 +597,15 @@ cv::Mat Matcher::drawResult(const cv::Mat& gray, const std::vector<Detection>& d
         const cv::Size tsz = core_->modelSize(0);
         const float bw = (float)tsz.width  * s;
         const float bh = (float)tsz.height * s;
-        const float bx = d.pos.x - tplCtr.x * s;      // level box, top-left
-        const float by = d.pos.y - tplCtr.y * s;
+        const float bx = ctr.x - tplCtr.x * s;        // level box, top-left
+        const float by = ctr.y - tplCtr.y * s;
         cv::Rect box;                                 // used by the caption
 
         if (cfg_.boxMode == 2)
         {
             // old behaviour: convex hull of the model points
             MatchResult mr;
-            mr.pos = d.pos; mr.angle = d.angle; mr.scale = d.scale; mr.score = d.score;
+            mr.pos = ctr; mr.angle = d.angle; mr.scale = d.scale; mr.score = d.score;
             core_->drawContours(vis, mr, col, 2);
             box = cv::Rect(cvRound(bx), cvRound(by), cvRound(bw), cvRound(bh));
         }
@@ -472,9 +615,9 @@ cv::Mat Matcher::drawResult(const cv::Mat& gray, const std::vector<Detection>& d
             // [ca sa; -sa ca], i.e. a rotation of -angle; in the image (y down)
             // RotatedRect counts the angle the other way round, hence -angle.
             const cv::Point2f lc(bw * 0.5f - tplCtr.x * s, bh * 0.5f - tplCtr.y * s);
-            const cv::Point2f ctr(d.pos.x + (lc.x * ca + lc.y * sa),
-                                  d.pos.y + (-lc.x * sa + lc.y * ca));
-            cv::RotatedRect rr(ctr, cv::Size2f(bw, bh), -(double)d.angle * 180.0 / CV_PI);
+            const cv::Point2f ctr2(ctr.x + (lc.x * ca + lc.y * sa),
+                                   ctr.y + (-lc.x * sa + lc.y * ca));
+            cv::RotatedRect rr(ctr2, cv::Size2f(bw, bh), -(double)d.angle * 180.0 / CV_PI);
             cv::Point2f q[4];
             rr.points(q);
             std::vector<cv::Point> poly;
@@ -489,7 +632,9 @@ cv::Mat Matcher::drawResult(const cv::Mat& gray, const std::vector<Detection>& d
             box = cv::Rect(cvRound(bx), cvRound(by), cvRound(bw), cvRound(bh));
             cv::rectangle(vis, box, col, 2, cv::LINE_AA);
         }
-        // the localisation point, always drawn on top of the box
+        // the localisation point, always drawn on top of the box.
+        // It is the reference point the caller asked for (detection pos), which
+        // coincides with the model centre unless setOrigin() moved it.
         cv::circle(vis, cv::Point(cvRound(d.pos.x), cvRound(d.pos.y)), 2, col, -1, cv::LINE_AA);
 
         //---- 4) caption under the box ----------------------------------
@@ -537,11 +682,13 @@ std::vector<cv::Point2d> Matcher::getDrawResult(const std::vector<Detection>& de
     for (size_t k = 0; k < dets.size(); k++)
     {
         const Detection& d = dets[k];
+        // Detection::pos may be a custom origin, so go through the pose
         const float ca = (float)std::cos(d.angle), sa = (float)std::sin(d.angle);
         const float s  = d.scale;
+        const cv::Point2f ctr = templateToImage(d, tplCtr);
         for (const ModelPoint& mp : modelPts) {
-            const float x = s * (mp.x * ca + mp.y * sa) + d.pos.x;
-            const float y = s * (-mp.x * sa + mp.y * ca) + d.pos.y;
+            const float x = s * (mp.x * ca + mp.y * sa) + ctr.x;
+            const float y = s * (-mp.x * sa + mp.y * ca) + ctr.y;
             res.push_back(cv::Point2d(x, y));
         }
     }

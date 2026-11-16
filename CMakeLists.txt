@@ -256,8 +256,12 @@ if(GEOMATCH_BUILD_EXAMPLES AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/examples")
     target_link_libraries(example_shape_match PRIVATE GeoMatch)
     add_executable(example_ncc_match examples/example_ncc_match.cpp)
     target_link_libraries(example_ncc_match PRIVATE GeoMatch)
+    # 上位机对接：位姿矩阵 / 四角 / 轮廓 / 参考点（docs/SDK.md 5.6 的代码）
+    add_executable(example_host_integration examples/example_host_integration.cpp)
+    target_link_libraries(example_host_integration PRIVATE GeoMatch)
     geomatch_copy_opencv_dll(example_shape_match)
     geomatch_copy_opencv_dll(example_ncc_match)
+    geomatch_copy_opencv_dll(example_host_integration)
 endif()
 
 #===============================================================================

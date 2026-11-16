@@ -128,6 +128,34 @@ public:
     // score at one exact pose (tuning / verification, no search)
     double probe(const cv::Mat& gray, cv::Point2f pos, double angle) const;
 
+    //---- pose & geometry (host / robot integration) ----------------------
+    // Same set as geomatch::Matcher, so the two matchers are used the same
+    // way.  NCC has no scale dimension, so the pose is a rotation plus a
+    // translation:
+    //     imagePt = pos + R(angle) * (tplPt - origin())
+    //     R(a)    = [cos a, sin a; -sin a, cos a]
+    // The reported NccResult::pos is the reference point, the template centre
+    // by default.
+    //
+    //   poseMatrix()  [vector_angle_to_rigid]  template -> image, 3x3
+    //   poseAffine()  the same as the 2x3 form cv::warpAffine wants
+    //   cornersAt()   the 4 template corners at this pose
+    //   boundsAt()    axis-aligned box around cornersAt()
+    //   templateToImage() / imageToTemplate()   one point, exact inverse
+    //   setOrigin()   [set_ncc_model_origin]   move the reported point
+    cv::Matx33d poseMatrix(const NccResult& r) const;
+    cv::Mat     poseAffine(const NccResult& r) const;
+    std::vector<cv::Point2f> cornersAt(const NccResult& r) const;
+    cv::Rect2f  boundsAt(const NccResult& r) const;
+    cv::Point2f templateToImage(const NccResult& r, cv::Point2f tplPt) const;
+    cv::Point2f imageToTemplate(const NccResult& r, cv::Point2f imgPt) const;
+
+    // reference point in TEMPLATE pixel coordinates (Halcon:
+    // set_ncc_model_origin).  Not stored in the .ncm - set it after load().
+    void        setOrigin(cv::Point2f tplPoint);
+    void        resetOrigin();
+    cv::Point2f origin() const;
+
     //---- model facts ---------------------------------------------------
     cv::Mat     modelGray()   const;
     cv::Size    modelSize()   const;      // template size at level 0
@@ -146,10 +174,16 @@ public:
     double lastSearchTime() const;
 
 private:
+    // reference point of a result, in template pixel coordinates:
+    // the value given to setOrigin(), or the template centre otherwise.
+    cv::Point2f refPoint() const;
+
     struct Impl;
     Impl* impl_ = nullptr;
     bool  created_ = false;
     NccParams params_;
+    cv::Point2f origin_;                    // setOrigin() value, template coords
+    bool        hasOrigin_ = false;
 };
 
 } // namespace geomatch

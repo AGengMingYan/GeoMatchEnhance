@@ -315,6 +315,9 @@ NccMatcher::~NccMatcher() { delete impl_; }
 bool NccMatcher::createNccModel(const cv::Mat& gray, const NccParams& p)
 {
     created_ = false;
+    // a reference point belongs to ONE model (its template size/centre), so it
+    // must not leak into the next one
+    resetOrigin();
     if (gray.empty()) return false;
 
     cv::Mat g8;
@@ -1345,6 +1348,27 @@ std::vector<NccResult> NccMatcher::findNccModel(const cv::Mat& gray, const NccFi
                         im.rotCacheHits, im.rotCacheMiss);
     }
 
+    // The reference point (setOrigin) is applied LAST, so the MaxOverlap test
+    // above still works on the model centre - the overlap fraction must not
+    // depend on where the caller put the reference point.
+    if (hasOrigin_ && !results.empty())
+    {
+        const cv::Point2f ctr = im.levels.empty() ? cv::Point2f(0.f, 0.f)
+                                                  : im.levels[0].srcCentre;
+        const double dx = (double)origin_.x - ctr.x;
+        const double dy = (double)origin_.y - ctr.y;
+        if (std::abs(dx) > 1e-6 || std::abs(dy) > 1e-6)
+        {
+            for (size_t i = 0; i < results.size(); i++)
+            {
+                NccResult& r = results[i];
+                const double ca = std::cos(r.angle), sa = std::sin(r.angle);
+                r.pos.x = (float)(r.pos.x + (dx * ca + dy * sa));
+                r.pos.y = (float)(r.pos.y + (-dx * sa + dy * ca));
+            }
+        }
+    }
+
     return results;
 }
 
@@ -1387,6 +1411,93 @@ int NccMatcher::angleCount() const
 }
 
 const NccParams& NccMatcher::params() const { return params_; }
+
+//=======================================================================
+//  pose & geometry: same set as geomatch::Matcher (see GeoMatch.h).
+//  NCC has no scale dimension, so the mapping is
+//      imagePt = NccResult::pos + R(angle) * (tplPt - refPoint())
+//  with R(a) = [cos a, sin a; -sin a, cos a] - the convention the search itself
+//  uses (buildRotTpl rotates the template by getRotationMatrix2D(srcCentre,
+//  +angle), which is exactly this R plus the centre shift).
+//=======================================================================
+cv::Point2f NccMatcher::refPoint() const
+{
+    if (hasOrigin_) return origin_;
+    return created_ ? modelCenter() : cv::Point2f(0.f, 0.f);
+}
+
+void NccMatcher::setOrigin(cv::Point2f tplPoint)
+{
+    origin_    = tplPoint;
+    hasOrigin_ = true;
+}
+
+void NccMatcher::resetOrigin()
+{
+    hasOrigin_ = false;
+    origin_    = cv::Point2f(0.f, 0.f);
+}
+
+cv::Point2f NccMatcher::origin() const { return refPoint(); }
+
+cv::Matx33d NccMatcher::poseMatrix(const NccResult& r) const
+{
+    const double ca = std::cos(r.angle), sa = std::sin(r.angle);
+    const cv::Point2f o = refPoint();
+    // scale is 1 by definition: Halcon's NCC has no scale dimension
+    const double tx = (double)r.pos.x - (ca * o.x + sa * o.y);
+    const double ty = (double)r.pos.y - (-sa * o.x + ca * o.y);
+    return cv::Matx33d( ca,  sa, tx,
+                       -sa,  ca, ty,
+                       0.0, 0.0, 1.0);
+}
+
+cv::Mat NccMatcher::poseAffine(const NccResult& r) const
+{
+    const cv::Matx33d M = poseMatrix(r);
+    return (cv::Mat_<double>(2, 3) << M(0, 0), M(0, 1), M(0, 2),
+                                      M(1, 0), M(1, 1), M(1, 2));
+}
+
+cv::Point2f NccMatcher::templateToImage(const NccResult& r, cv::Point2f p) const
+{
+    const cv::Point2f o = refPoint();
+    const double ca = std::cos(r.angle), sa = std::sin(r.angle);
+    const double u = (double)p.x - o.x, v = (double)p.y - o.y;
+    return cv::Point2f((float)(r.pos.x + (ca * u + sa * v)),
+                       (float)(r.pos.y + (-sa * u + ca * v)));
+}
+
+cv::Point2f NccMatcher::imageToTemplate(const NccResult& r, cv::Point2f p) const
+{
+    const cv::Point2f o = refPoint();
+    const double ca = std::cos(r.angle), sa = std::sin(r.angle);
+    const double dx = (double)p.x - r.pos.x, dy = (double)p.y - r.pos.y;
+    // the inverse of R is its transpose
+    return cv::Point2f((float)((ca * dx - sa * dy) + o.x),
+                       (float)((sa * dx + ca * dy) + o.y));
+}
+
+std::vector<cv::Point2f> NccMatcher::cornersAt(const NccResult& r) const
+{
+    std::vector<cv::Point2f> q;
+    if (!created_) return q;
+    const cv::Size tsz = modelSize();
+    const float w = (float)tsz.width, h = (float)tsz.height;
+    q.reserve(4);
+    q.push_back(templateToImage(r, cv::Point2f(0.f, 0.f)));   // template top-left
+    q.push_back(templateToImage(r, cv::Point2f(w,   0.f)));   // top-right
+    q.push_back(templateToImage(r, cv::Point2f(w,   h)));     // bottom-right
+    q.push_back(templateToImage(r, cv::Point2f(0.f, h)));     // bottom-left
+    return q;
+}
+
+cv::Rect2f NccMatcher::boundsAt(const NccResult& r) const
+{
+    const std::vector<cv::Point2f> q = cornersAt(r);
+    if (q.empty()) return cv::Rect2f();
+    return cv::boundingRect(q);
+}
 
 double NccMatcher::lastPreprocessTime() const { return impl_ ? impl_->lastPre : 0.0; }
 double NccMatcher::lastSearchTime()     const { return impl_ ? impl_->lastSearch : 0.0; }
@@ -1504,6 +1615,7 @@ std::vector<uchar> NccMatcher::serializeNccModel() const
 bool NccMatcher::deserializeNccModel(const std::vector<uchar>& data)
 {
     created_ = false;
+    resetOrigin();          // see createNccModel(): one origin per model
     Reader r(data);
 
     uint32_t magic = 0, ver = 0;
@@ -1633,9 +1745,13 @@ cv::Mat NccMatcher::drawResult(const cv::Mat& gray, const std::vector<NccResult>
         const NccResult& r = res[k];
         const cv::Scalar col = (k == 0) ? cv::Scalar(0, 255, 0) : cv::Scalar(0, 200, 255);
 
-        // Halcon draws the rotated model rectangle; same pause mapping as the
+        // The box is drawn around the MODEL CENTRE.  r.pos is the reference
+        // point (template centre unless setOrigin() moved it), so map it back.
+        const cv::Point2f ctr = templateToImage(r, modelCenter());
+
+        // Halcon draws the rotated model rectangle; same pose mapping as the
         // matcher, i.e. a rotation of -angle in image coordinates
-        cv::RotatedRect rr(r.pos, cv::Size2f((float)tsz.width, (float)tsz.height),
+        cv::RotatedRect rr(ctr, cv::Size2f((float)tsz.width, (float)tsz.height),
                            -r.angle * 180.0 / kPi);
         cv::Point2f q[4];
         rr.points(q);
