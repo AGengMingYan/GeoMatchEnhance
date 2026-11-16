@@ -28,9 +28,9 @@
 //  an application can log what it actually linked against.
 //-----------------------------------------------------------------------
 #define GEOMATCH_VERSION_MAJOR 1
-#define GEOMATCH_VERSION_MINOR 1
-#define GEOMATCH_VERSION_PATCH 3
-#define GEOMATCH_VERSION_STRING "1.1.3"
+#define GEOMATCH_VERSION_MINOR 2
+#define GEOMATCH_VERSION_PATCH 0
+#define GEOMATCH_VERSION_STRING "1.2.0"
 
 
 //-----------------------------------------------------------------------
