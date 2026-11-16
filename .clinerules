@@ -183,6 +183,32 @@ $b = [System.IO.File]::ReadAllBytes('_ai_tmp\v_after.jpg')
    （本机报「找不到中央目录结尾记录」，即使包是好的）、❌ 不要用 `Get-FileHash` 对 `.zip` 做校验
    （拿到的是密文哈希），校验统一用 python `hashlib` 或先命名成 `.zip1`。
 
+### 4.1 打包必须用 python，不能用 PowerShell/.NET（2026-11-16 发现的血坑）
+
+**1.1.0 / 1.2.0 的 SDK 包 `include/*.h`、`examples/*.cpp` 全是密文**（头 `E0 A8 91 E7`），
+发出去的 SDK 一直是坏的。原因：
+
+| 步骤 | 谁在读 | 读到的是 |
+|---|---|---|
+| `cmake --install` 装 `include/*.h` | cmake.exe | **密文** |
+| `Copy-Item examples\*.cpp` | PowerShell | **密文** |
+| `[.NET] ZipFile::CreateFromDirectory` | .NET / PS | **密文** |
+| `[IO.File]::ReadAllBytes('.h')` | PowerShell | **密文**（连断言都写不了） |
+| python `open(..,'rb')` / `git show` / `cat.exe` | — | 明文 ✅ |
+
+规则：
+
+1. **装头文件 / 拷示例**：装完用 `cmd /c "cd /d <repo> && git show HEAD:<rel> > <dst>"` 重导一次
+   （已验证：cmd 重定向落盘是明文）。已内建在 `tools/make-sdk.ps1`。
+2. **打 zip**：一律走 `python tools/make-zip1.py <src_dir> <out.zip1>`（读明文 + 自校验包内无密文）。
+   已内建在 `tools/make-release-zips.ps1` 的 `New-Zip1`。
+3. **校验**：`python tools/check-sdk-plaintext.py <dir>`。**不要用 PowerShell 的
+   `ReadAllBytes` 判断**——它对源码永远返回密文，断言必然假失败（本次踩了两轮）。
+4. 收尾必须**真实消费者测试**（`.clinerules` §11.7）：把打出来的 SDK 解到源码树外，
+   `find_package(GeoMatch REQUIRED)` + `GeoMatch::GeoMatch`（注意名字不是 `geomatch::`），
+   加自己的 OpenCV include/lib，能编能跑出 `linked version = 1.2.1` 才算过关。
+
+
 ---
 
 ## 5. 构建与测试
@@ -523,7 +549,37 @@ python -c "import zipfile;z=zipfile.ZipFile('dl.zip1');print(z.testzip(), len(z.
 - 复现工具（不入库）：`_ai_tmp/ocl_probe.cpp`（状态+两路径对比）、
   `_ai_tmp/ocl_force.cpp`（环境变量实验）、`_ai_tmp/ocl_preproc_bench.cpp`（预处理量级）。
 
-### 7.11 诊断开关（保留，别删）
+### 7.11 OpenMP（2026-11-16 实测：没必要，本项目一处都没用）
+
+- **现状**：`0` 处 `#include <omp.h>` / `parallel for`，`build.ninja` 的 FLAGS 里 `0` 处 `/openmp`。
+  并行全部走 `cv::parallel_for_`（OpenCV 自己的线程池）。
+- **只加 `/openmp` 编译选项而不写 omp pragma**：收益 0（只会多链一个 `vcomp140.dll`）。
+- **把并行点换成 `omp parallel for`**：合成 bench（`_ai_tmp/omp_vs_parallel.cpp`，
+  复刻 q8/m8 + int16 点积 + 贪心早停，165 pose × 282×218 map × 143 点）：
+
+  | 调度 | 耗时 | 相对项目现状 |
+  |---|---|---|
+  | `cv::parallel_for_` per-pose（项目现状） | 70.4 ms | — |
+  | `omp schedule(static)` | 71.6 ms | 持平 |
+  | `omp schedule(dynamic)` | 60.8 ms | **-14%** |
+  | `omp schedule(guided)` | 64.5 ms | -8% |
+
+  收益来自 **dynamic/guided 的动态负载均衡**（早停让各 pose 耗时不同），
+  与"OpenMP 本身更快"无关 —— `static` 就完全持平。
+- **同样的收益可以用二维任务拆分在 `parallel_for_` 上拿到**（`pose × 行带`，
+  任务数 ×2，静态切分的负载不均被稀释）：实测 62.0 ms（**-12%**），
+  不需要第二套线程池。
+- **但二维拆分会让结果变化，已回退**：`extractCandidates` 的 `maxPerMap = 64`
+  原本作用于"整个 pose 的 map"，按行带拆开后变成"每段各 64 个"，
+  候选池从 94 涨到 100+，`keep = 48` 的全局截断会选到不同候选
+  （实测 case1 的 148 条结果行里有 18 条不同）。要无损必须让 NMS 跨段可见，
+  那就等于没有并行收益。**除非先改 `maxPerMap` 语义，否则不要做二维拆分。**
+- **真正的瓶颈不是调度器**：qfn1 上 `-threads 1/16/20` = 212/38.5/38.9 ms，
+  16 线程就饱和（混合架构 + 内存带宽单线程即饱和，见 7.4 第 7 条）。
+  换调度器最多回收"负载不均"那 8~14%，碰不到带宽墙。
+- 复现工具（不入库）：`_ai_tmp/omp_vs_parallel.cpp` + `_ai_tmp/build_omp_bench.bat`。
+
+### 7.12 诊断开关（保留，别删）
 
 | 开关 | 作用 |
 |---|---|

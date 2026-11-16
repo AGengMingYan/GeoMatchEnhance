@@ -15,17 +15,14 @@ $rel  = Join-Path $root 'release_GeoGUIDemo_x64'
 
 function New-Zip1 {
     param([string]$SrcDir, [string]$ZipPath, [string]$TopName)
-    # CreateFromDirectory 的源目录必须就是最终顶层目录，否则包里会多一层
-    if (Test-Path -LiteralPath $ZipPath) { Remove-Item -LiteralPath $ZipPath -Force }
-    [System.IO.Compression.ZipFile]::CreateFromDirectory(
-        $SrcDir, $ZipPath, [System.IO.Compression.CompressionLevel]::Optimal, $true)
-    $b = [System.IO.File]::ReadAllBytes($ZipPath)
-    $disk = (Get-Item $ZipPath).Length
-    Write-Host ("  {0}  {1:N2} MB  head={2}" -f (Split-Path $ZipPath -Leaf), ($disk/1MB),
-                (($b[0..3] | ForEach-Object { $_.ToString('X2') }) -join ' '))
-    if ($b.Length -ne $disk -or $b[0] -ne 0x50 -or $b[1] -ne 0x4B) {
-        throw "zip not plaintext / truncated: $ZipPath"
-    }
+    # 本机 .zip 落盘即密文，所以输出名一律用 .zip1（下载方自己改回 .zip）。
+    # 必须用 python 打：PowerShell / .NET 的 ZipFile::CreateFromDirectory 在本机
+    # 读到的是源码的"加密态视图"，打出来的包里 .h/.cpp 是密文
+    # （1.1.0 / 1.2.0 的 SDK 都中招过）。tools\make-zip1.py 读明文并自校验。
+    $py = Get-Command python -ErrorAction SilentlyContinue
+    if (-not $py) { throw 'python not found: packaging needs tools\make-zip1.py' }
+    & $py.Source (Join-Path $PSScriptRoot 'make-zip1.py') $SrcDir $ZipPath
+    if ($LASTEXITCODE -ne 0) { throw "zip failed: $ZipPath" }
 }
 
 # ---------------- SDK 包 ----------------

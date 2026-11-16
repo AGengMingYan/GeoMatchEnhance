@@ -66,7 +66,30 @@ foreach ($a in $archs) {
     }
     $exDir = Join-Path $sdk 'examples'
     New-Item -ItemType Directory -Path $exDir -Force | Out-Null
-    Copy-Item -Path (Join-Path $root 'examples\*.cpp') -Destination $exDir -Force -ErrorAction SilentlyContinue
+    Copy-Item -Path (Join-Path $root 'examples\*.cpp') -Destination $exDir -Force -ErrorAction SilentlyContinue    # 本机 DLP 驱动：cmake --install 与 Copy-Item 复制的是"加密态字节"，
+    # 包里的 .h / .cpp 到别的机器上就是乱码（1.1.0 / 1.2.0 的 SDK 都中了这个坑）。
+    # 用 git blob 重新导出一次（git show 经 cmd 重定向落盘是明文，已验证）。
+    $plainList = @(
+        'GeoMatch/GeoMatch.h', 'ShapeMatch/ShapeMatch.h', 'NccMatch/NccMatch.h',
+        'examples/example_shape_match.cpp', 'examples/example_ncc_match.cpp',
+        'examples/example_host_integration.cpp'
+    )
+    foreach ($rel in $plainList) {
+        $dst = Join-Path $sdk ($rel -replace '/', '\')
+        if (-not (Test-Path -LiteralPath $dst)) { continue }
+        cmd /c "cd /d `"$root`" && git show HEAD:$rel > `"$dst`" 2>nul"
+    }
+    # 断言：include / examples 里不能残留密文。
+    # PowerShell 自己 [IO.File]::ReadAllBytes 读 .h/.cpp 只会看到"加密态视图"，
+    # 用它判定必然误报；交给 tools\check-sdk-plaintext.py（读到的是明文）。
+    $py = Get-Command python -ErrorAction SilentlyContinue
+    if ($py) {
+        $r = & $py.Source (Join-Path $PSScriptRoot 'check-sdk-plaintext.py') $sdk
+        if ($LASTEXITCODE -ne 0) { throw "SDK 里仍然是密文:`n$r" }
+        Write-Host "  明文校验: $r"
+    } else {
+        Write-Host "  [warn] 未找到 python，跳过 .h/.cpp 密文校验（发布前请手动确认）"
+    }
 
     $files = Get-ChildItem -LiteralPath $sdk -Recurse -File
     $total = ($files | Measure-Object -Property Length -Sum).Sum
