@@ -15,6 +15,7 @@
 - [4. 链接配置](#4-链接配置)
 - [5. 形状匹配 API](#5-形状匹配-api)
   - [5.6 位姿与几何（上位机对接）](#56-位姿与几何上位机对接)
+  - [5.7 minChainLen：抑制散斑/密集纹理的碎边缘](#57-minchainlen抑制散斑密集纹理的碎边缘halcon-没有这个参数)
 - [6. NCC 匹配 API](#6-ncc-匹配-api)
 - [7. 参数调优](#7-参数调优)
 - [8. 线程安全与性能](#8-线程安全与性能)
@@ -192,7 +193,7 @@ find_package(GeoMatch REQUIRED)
 | `maxPoints` | `1200` | 最多保留多少个模型点 |
 | `numLevels` | `0` | 金字塔层数；`0` = 自动。**不要填 1** |
 | `mask` | 空 | `CV_8U`，非零 = 参与建模 |
-| `minChainLen` | `2` | 丢弃短于这个长度（像素）的孤立边缘链 |
+| `minChainLen` | `2` | 丢弃短于这个长度（像素）的孤立边缘链。**散斑/密集纹理模板的关键参数，详见 5.7** |
 
 **搜索参数**
 
@@ -207,7 +208,7 @@ find_package(GeoMatch REQUIRED)
 | `metric` | `0` | `0` 要求极性 / `1` 忽略整体反转 / `2` 忽略逐点极性 |
 | `scoreMode` | `0` | `0` mean（**与 Halcon 一致**）/ `2` trimmed / `1` positive-mean（**会虚高**）/ `3` clipped |
 | `minCoverage` | `0` | 最小覆盖率，`0` = 关闭 |
-| `skipWeight` | `0.9` | 评分时跳过图像梯度幅值低于 `minContrast` 的模型点（**对齐 Halcon 语义**），分母用有效点数；`0` = 关闭。修复前模糊/弱对比帧分数会系统性低 ~0.3 |
+| `skipWeight` | `0` | 评分时分母的口径。`0` = 全部模型点参与平均（**Halcon 口径**，默认）；`>0` = 只对"图像梯度幅值 ≥ 该值"的点取平均，分母换成有效点数。模糊/弱对比帧的分数会高 0.1~0.3，但"只对上模板一部分"的位姿也会被抬到 0.82+（实测同一错位：`0.9` → 0.971，`0` → 0.475，Halcon 0.556），**追召回时才用** |
 | `cellMissMax` | `0.35` | 与 `skipWeight` 配套：把模板分 4×4 格，若"图像上几乎没梯度的格"占比超过此值则拒绝该匹配。**防止"只对上模板一部分"的错位实例被 skipWeight 抬到 0.9+**；`0` = 关闭 |
 | `useOpenCL` | `true` | 是否尝试 GPU 预处理 |
 | `debug` | `0` | >0 打印调试信息 |
@@ -475,6 +476,138 @@ assert(std::abs(cv::norm(q[1]-q[0]) - m.modelSize().width * d.scale) < 1e-2);
 
 ---
 
+### 5.7 `minChainLen`：抑制散斑/密集纹理的碎边缘（**Halcon 没有这个参数**）
+
+#### 5.7.1 它解决什么问题
+
+建模时点集是这样产生的：滞后双阈值选边 → NMS 细化 → 连通成"链" → 按预算采样成模型点。
+`minChainLen` 就是**在连通成链之后，丢掉长度小于 N 个像素的链**。
+
+先明确一件事：**`create_shape_model` 没有这个旋钮**。Halcon 只有 8 个参数
+
+```
+create_shape_model(Template, NumLevels, AngleStart, AngleExtent, AngleStep,
+                   Optimization, Metric, Contrast, MinContrast, ModelID)
+```
+
+其中 `Contrast`/`MinContrast` 是滞后阈值（灰度差），`Optimization` 只改"点怎么存"
+（实测 `auto`/`none`/`point_reduction_high` 三种模式**模型点数完全相同**）。
+它能容忍散斑，是因为**它没有点数上限**——碎边缘点是"额外加上去"的，不会挤掉别的点。
+
+本库有 `maxPoints` 预算（默认 1200），预算按**每条链的 Σ梯度幅值**分配。于是出现这个问题：
+
+| | 焊盘/晶粒散斑模板 | 普通结构模板 |
+|---|---|---|
+| 链的数量 | 极多（几百上千） | 少（几十） |
+| 每条链长度 | 很短（几个像素） | 长（几十~几百像素） |
+| 每条链的梯度强度 | **很亮** | 中等 |
+| Σ梯度幅值合计 | **占绝对多数** | 少数 |
+
+结果：散斑链把 1200 的预算吃掉约 79%，结构化边缘只剩零头。
+而散斑在"模板 PNG ↔ 搜索图 JPG"之间有损压缩 + 光照微变后，梯度方向基本随机，
+方向余弦均值被拉到 0.5 附近 → **明明有目标，分数却低于 `minScore`，直接漏检**。
+
+实测（`case4/ScanPlaneTemplate.png`，400×400 焊盘散斑，同参数 Halcon `0.676`）：
+
+| `maxPoints` | 最终分数 | 说明 |
+|---|---|---|
+| 1200（默认） | **0.511** ❌ | 低于 `minScore=0.6`，0 命中 |
+| 4000 | 0.652 | 追平 Halcon，但 search 从 9 ms → 29 ms |
+| 0（不限） | 0.651 | 追平，但 68 ms |
+
+把 `minChainLen` 从 2 提到 8：**分数 0.511 → 0.708（比 Halcon 还高），耗时不变（8.7 ms）**。
+因为它不增加点数，只是**把预算从碎链手里拿回来**。
+
+#### 5.7.2 怎么定这个值（别按模板尺寸判）
+
+直觉是"模板大 → 目标大 → `minChainLen` 大"，**实测会误判**，三个反例：
+
+**反例 1｜同尺寸结论相反**。同为 200×200：纯直线结构（链数 ~5）必须保持 `2`；
+密散斑（链数 ~300）必须 `6~8`。尺寸相同，最优值差 3 倍。
+
+**反例 2｜链长也不是判据**。`data2/template_via.jpg` 的平均链长 `14.4`，
+比 `case4` 的 `17.0` **还小**，但 data2 只有 35 条链（预算充裕），
+剪枝反而会丢掉真实结构。
+
+**反例 3｜大模板不等于要剪**。`docs/ShapeMatch-vs-Halcon.md` 7.6 节的 die 颗粒模板，
+链长达**数百像素**（长连通的高频纹理，不是碎散斑），
+`minChainLen ≥ 50` 会**直接崩溃**（分数全 0）。按"模板大就调大"给到 50+ 就是灾难。
+
+**正确的判据是「链数 vs 点数预算」**：
+
+```cpp
+// maxPoints <= 0（不限点数）→ 没有预算压力，返回 2
+const double per = (double)maxPoints / (double)chains;   // 每条链平均能分到几个点
+if (per >= 8.0) return 2;   // 预算充裕，不动
+if (per >= 4.0) return 4;
+if (per >= 2.0) return 6;
+return 8;                   // 严重不足（上限 8）
+```
+
+`per` 很小说明"每条链平均分不到 2 个点"，即模型会被"每链各取一两点"填满 ——
+碎链多的模板正是这种形态。实测四个模板：
+
+| 模板 | 尺寸 | 链数 | 1200 点下的 `per` | 判定 | 和 `minChainLen=2` 比点数 |
+|---|---|---|---|---|---|
+| `case4/ScanPlaneTemplate.png`（焊盘散斑） | 400×400 | **726** | **1.7** | **8** | — |
+| `dataset/sample/data2/template_via.jpg`（通孔） | 110×110 | 35 | 34.3 | 2 | 504，一致 |
+| `case1/temp.jpg`（蛇形走线 U 弯） | 154×148 | 33 | 36.4 | 2 | 1190，一致 |
+| `dataset/sample/data1/template_pad.jpg`（焊盘） | 140×140 | 30 | 40.0 | 2 | 1198，一致 |
+
+`per` 相差 20 倍，判据很干净：普通模板全部判 2（与默认完全一致，**零影响**），
+只有散斑模板判 8。**上限锁在 8**，就是为避开上面"反例 3"的崩溃区。
+
+> 这个自动判定是**应用层策略**，没有塞进库里——库只提供 `minChainLen` 参数本身。
+> 参考实现见 prober 工程的 `halcontool.cpp::geoAutoChainLen()`。
+
+#### 5.7.3 怎么用
+
+```cpp
+geomatch::Config cfg;
+cfg.contrast    = 120;        // 高阈值（Sobel 幅值；≈ 灰度差 ×4）
+cfg.minContrast = 48;         // 低阈值
+cfg.maxPoints   = 1200;
+
+// 普通结构模板：保持默认
+cfg.minChainLen = 2;
+
+// 散斑 / 密集颗粒纹理模板：先试 8
+cfg.minChainLen = 8;
+
+geomatch::Matcher m;
+if (!m.create(tpl, cfg)) { /* 建不出来：见下面的"调过头" */ }
+```
+
+**注意 `minChainLen` 只在建模时生效**，模型文件里存的是"已经选好的点集"。
+改了它必须重建模型（重新 `create()` 或重新生成 `.shm`），
+`load()` 一个旧 `.shm` 不会重新选点。
+
+#### 5.7.4 三个必须知道的坑
+
+1. **调过头会崩**：阈值太大时会把真实结构的短段也丢掉，点集只剩大片纹理，
+   `create()` 仍可能成功但分数全 0（实测 die 模板 `chainLen=50` 直接 0 命中）。
+   判据：`modelPointCount()` 掉到平时的 1/3 以下就说明剪过头了。
+2. **它不能替代掩码**：掩码是"空间上排除某块区域"，`minChainLen` 是"长度上排除"。
+   如果散斑是**长连通的高频纹理**（不是碎散斑），`minChainLen` 帮不上
+   （`docs/ShapeMatch-vs-Halcon.md` 7.6 节：掩码能把 ≥0.70 提到 100%，
+   `minChainLen` 最多到 43%）。先试 `minChainLen`（便宜），再考虑掩码。
+3. **自动判定要先用 `minChainLen=2` 建一次数链数**。链数只能用"不过滤"的模型拿到
+   （`minChainLen>2` 会把短链丢掉，数不准）。
+   所以自动流程是"建两次"：第一次探链数、第二次用判定值正式建。
+   只在**建模板 / 首次加载**时发生（约 2×18 ms），不影响检索耗时。
+
+#### 5.7.5 相关参数
+
+| 参数 | 与 `minChainLen` 的关系 |
+|---|---|
+| `maxPoints` | 预算总量。`0` = 不限（Halcon 口径），此时不需要剪枝 |
+| `contrast` / `minContrast` | 决定"哪些像素算边"。先把这两个调对，再动 `minChainLen` |
+| `mask` | 空间排除。和 `minChainLen` 是两条正交的路 |
+| `minChainLen` 也影响 `modelChains()` | `drawModelFeatures()` 画的轮廓就是过滤后的链 |
+
+
+---
+
 ## 6. NCC 匹配 API
 
 头文件：`NccMatch/NccMatch.h`
@@ -561,10 +694,12 @@ NCC 的参考点是在 **MaxOverlap 判重之后**才应用的，所以换参考
 
 1. **`scoreMode` 保持 0**（mean）。想要 Halcon 可比分数就只能用这个。
 2. **别把 `minContrast` 推过头**。以点数为准：`modelPointCount()` 掉到 150 以下就回退。
-3. **模板要有二维结构**：转角、字符、缺口。纯直线段/纯边缘带救不了（孔径问题）。
-4. **确认模板真在场景里**：用 NCC 自检一次，正常应 ≥0.8；只有 0.2 说明"找不到"才是正确答案。
-5. **收窄 ROI 或涂掩码**，只留唯一结构。
-6. `minCoverage` 与 `scoreMode=3` 只在**点够多**时有用。
+3. **模板含散斑/密集纹理（焊盘、颗粒、砂面）→ 先看 `pts/chain`**，
+   预算被碎链抢走时调 `minChainLen`（详见 5.7），它比"加大 `maxPoints`"便宜 3~7 倍。
+4. **模板要有二维结构**：转角、字符、缺口。纯直线段/纯边缘带救不了（孔径问题）。
+5. **确认模板真在场景里**：用 NCC 自检一次，正常应 ≥0.8；只有 0.2 说明"找不到"才是正确答案。
+6. **收窄 ROI 或涂掩码**，只留唯一结构。掩码是"空间排除"，与 `minChainLen` 正交。
+7. `minCoverage` 与 `scoreMode=3` 只在**点够多**时有用。
 
 ### 7.2 建完模型先自检
 
@@ -572,6 +707,21 @@ NCC 的参考点是在 **MaxOverlap 判重之后**才应用的，所以换参考
 printf("points %d  spread %.2f  normalPeak %.2f\n",
        m.modelPointCount(), m.pointSpreadRatio(), m.normalPeakShare());
 ```
+
+**再加一条散斑自检**（模板含焊盘/颗粒/砂面这类高频纹理时必看）：
+
+```cpp
+// 每条链平均能分到几个点；< 8 说明碎链在抢预算，该调大 minChainLen
+const int chains = (int)m.core().modelChains(0).size();
+printf("chains %d  pts/chain %.1f\n", chains,
+       chains > 0 ? (double)m.modelPointCount() / chains : 0.0);
+```
+
+| pts/chain | 含义 | 建议 |
+|---|---|---|
+| >= 8 | 预算充裕 | `minChainLen = 2`（保持默认） |
+| 2 ~ 8 | 偏紧 | 试 `4` 或 `6` |
+| < 2 | 碎链在抢预算 | 试 `8`（上限，别更高） |
 
 | 指标 | 健康 | 危险 | 含义 |
 |---|---|---|---|

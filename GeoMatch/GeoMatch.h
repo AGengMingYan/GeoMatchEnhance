@@ -77,7 +77,37 @@ struct Config
                                   // which is what Halcon's create_shape_model does
     int    numLevels    = 0;      // 0 = auto
     cv::Mat mask;                 // CV_8U, non-zero = region that may contribute edge points
-    int    minChainLen = 2;       // drop edge chains shorter than this (pixels)
+    // Drop edge chains shorter than this (pixels).  Halcon's create_shape_model
+    // has NO such parameter -- it has no point budget at all, so the fragmented
+    // edges of a speckled target are simply added on top instead of stealing
+    // budget from the structural edges.
+    //
+    // Here maxPoints IS a budget, and it is handed out per chain in proportion
+    // to sum(gradient magnitude).  A speckled pad / grainy surface produces
+    // hundreds of SHORT but BRIGHT chains, which take ~79% of the budget; the
+    // structural edges are left with the remainder.  Speckle decorrelates
+    // between the template PNG and the search JPEG (lossy + lighting), so the
+    // mean direction cosine drops to ~0.5 and a present target scores BELOW
+    // minScore -- measured on case4/ScanPlaneTemplate.png (400x400 pads):
+    //   minChainLen 2 -> score 0.511 (Halcon 0.676) -> 0 hits
+    //   minChainLen 8 -> score 0.708 (better than Halcon), same 8.7 ms
+    //
+    // How to pick it -- NOT by template size:
+    //   same 200x200: straight-line structure needs 2, dense speckle needs 6~8;
+    //   chain LENGTH is no guide either (a via template averages 14.4 px vs the
+    //   speckle template's 17.0, yet needs no pruning).
+    // The signal is  points-per-chain = maxPoints / chainCount:
+    //   >= 8  -> 2 (budget is fine)     4..8 -> 4      2..4 -> 6      < 2 -> 8
+    // Keep the ceiling at 8: a dense die-grain template (chains of hundreds of
+    // px, see docs/ShapeMatch-vs-Halcon.md 7.6) collapses to 0 hits at 50.
+    //
+    // Measured on four templates: via/u-bend/pad all judge to 2 (identical to
+    // the default, zero impact), only the speckled pad template goes to 8.
+    //
+    // Building with minChainLen=2 first is how chainCount is counted (pruning
+    // would hide the short chains).  Applies at CREATE time only -- a .shm
+    // stores the already-selected point set, so changing this needs a rebuild.
+    int    minChainLen = 2;
 
     // ---- search ----
     // 0.7: 默认评分阈值。默认 scoreMode 是 0（mean，Halcon 语义），同一位姿的
@@ -340,7 +370,16 @@ public:
     // The contour polylines are the model (Halcon's get_shape_model_contours);
     // the gradient arrows are an annotation and are off by default because a
     // 1 px contour disappears under a field of 9 px arrows.
-    cv::Mat drawModelFeatures(double scaleFactor = 3.0, bool showGradients = false) const;
+    //
+    // showPoints = false (recommended for a host's template preview) draws the
+    // contour polylines only.  Each scoring point is a 3x3 px anti-aliased dot,
+    // so a few thousand points on a textured template merge into a solid red
+    // blob that hides the shape - and a preview is there to show the shape.
+    // Halcon's inspect_shape_model shows only the region border for the same
+    // reason.  A model with no chains (written before .shm version 3) still
+    // falls back to the points, so the preview is never empty.
+    cv::Mat drawModelFeatures(double scaleFactor = 3.0, bool showGradients = false,
+                              bool showPoints = true) const;
 
     // search image with the template texture overlaid at each match pose,
     // the model points, their gradients and the outline

@@ -36,18 +36,28 @@ namespace
     //   blue dot        - model centre
     // The canvas must already be enlarged by sf; every coordinate here is in
     // model-centre-relative pixels.
+    //
+    // showPoints = false draws the contour polylines only.  That is what a
+    // host program's "template preview" wants (see halcontool.cpp in prober):
+    // a sampling point is 3x3 px with LINE_AA, so on a textured template a few
+    // thousand points turn into a solid red blob and hide the shape, while
+    // Halcon's inspect_shape_model only shows the region border anyway.
+    // When a model has no chains (a .shm written before version 3) the points
+    // are drawn regardless - otherwise the preview would come out empty.
     void drawModelOverlay(cv::Mat& bgr,
                           const std::vector<std::vector<cv::Point>>& chains,
                           const std::vector<ModelPoint>& pts,
                           const cv::Point2f& ctr,
                           double sf,
-                          bool showGradients)
+                          bool showGradients,
+                          bool showPoints = true)
     {
         const float cx = ctr.x * (float)sf, cy = ctr.y * (float)sf;
 
         // NMS leaves the edges 1 px wide, so the stroke has to grow with the
         // enlargement; otherwise it disappears between the point dots.
         const int stroke = (sf >= 3.0) ? 3 : ((sf >= 2.0) ? 2 : 1);
+        int drawnChains = 0;
         for (size_t c = 0; c < chains.size(); c++)
         {
             const std::vector<cv::Point>& ch = chains[c];
@@ -57,14 +67,22 @@ namespace
             for (size_t k = 0; k < ch.size(); k++)
                 poly.push_back(cv::Point(cvRound(cx + ch[k].x * (float)sf),
                                          cvRound(cy + ch[k].y * (float)sf)));
-            cv::polylines(bgr, poly, false, cv::Scalar(60, 255, 60), stroke, cv::LINE_AA);
+            // thickness must stay >= 1: cv::polylines asserts 0 <= thickness,
+            // so cv::FILLED (-1) aborts.  LINE_8 keeps a 1 px polyline solid
+            // (LINE_AA would make it fade out after the host scales the image).
+            cv::polylines(bgr, poly, false, cv::Scalar(60, 255, 60), stroke, cv::LINE_8);
+            drawnChains++;
         }
 
         // the sampled scoring points, kept small so they do not hide the line
-        for (size_t k = 0; k < pts.size(); k++)
+        const bool drawPts = showPoints || drawnChains == 0;
+        if (drawPts)
         {
-            const cv::Point2f pp(cx + pts[k].x * (float)sf, cy + pts[k].y * (float)sf);
-            cv::circle(bgr, pp, 1, cv::Scalar(40, 40, 255), -1, cv::LINE_AA);
+            for (size_t k = 0; k < pts.size(); k++)
+            {
+                const cv::Point2f pp(cx + pts[k].x * (float)sf, cy + pts[k].y * (float)sf);
+                cv::circle(bgr, pp, 1, cv::Scalar(40, 40, 255), -1, cv::LINE_AA);
+            }
         }
 
         if (showGradients)
@@ -460,7 +478,7 @@ cv::Mat Matcher::drawModelInfo(const std::string& title) const
 //=======================================================================
 //  model visualisation without the info panel: template + points + dirs
 //=======================================================================
-cv::Mat Matcher::drawModelFeatures(double scaleFactor, bool showGradients) const
+cv::Mat Matcher::drawModelFeatures(double scaleFactor, bool showGradients, bool showPoints) const
 {
     if (!ready()) return cv::Mat();
 
@@ -479,7 +497,7 @@ cv::Mat Matcher::drawModelFeatures(double scaleFactor, bool showGradients) const
     // contour polylines first: these are what make the model read as a shape.
     // The gradient arrows are off by default - a 1 px contour disappears under
     // a field of arrows.
-    drawModelOverlay(modelColor, chains, pts, ctr, sf, showGradients);
+    drawModelOverlay(modelColor, chains, pts, ctr, sf, showGradients, showPoints);
 
     return modelColor;
 }

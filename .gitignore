@@ -87,6 +87,16 @@ dataset/*
 case2/
 case3/
 
+# case4（2026-11-16 新增）：焊盘散斑模板 + 现场帧 + 调试截图，用于复现
+# "散斑模板 maxPoints 预算被碎链吃光，漏检" 的问题（见 docs/SDK.md 5.7）。
+# 数据不入库（同 case2/case3），结论与复现方法已写进文档。
+case4/
+
+# 本地临时物 / 私密凭据：绝不能进仓库
+HalconCompare.obj
+test
+test.pub
+
 # GUI「复现留痕」目录：运行期落盘 logs/<app>_<时间>/{log.txt, template*.png, target, result}
 # 每次启动新建一个，含数百 KB 截图，属于运行产物，不入库（详见 docs 与 .clinerules）
 logs/
