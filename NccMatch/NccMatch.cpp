@@ -41,6 +41,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <limits>
@@ -811,8 +812,26 @@ std::vector<NccResult> NccMatcher::findNccModel(const cv::Mat& gray, const NccFi
     // images and ~0.55 on pure noise, so anything below ~0.6 means "no signal".
     std::vector<Cand> cands;
     int coarseTop = top;
+    // Peak of the previous (one-level-coarser) scan, -2 = none yet.  Used by the
+    // "does falling back actually help?" test further down.
+    double prevCoarsePeak = -2.0;
     {
         const double trust = std::max(0.7, std::min(0.9, fp.minScore * 1.2));
+
+        // A fallback to a finer level only makes sense when the finer level sees
+        // a STRONGER peak: that is what "the coarsest level blurred the target
+        // away" looks like.  The minimum improvement is this absolute margin
+        // (0.02 by default).
+        //
+        // SM_NCC_FALLBACK_GAIN=<0..1> overrides the margin; a NEGATIVE value
+        // disables the guard entirely (= the old "always fall back" behaviour),
+        // so the two can be A/B compared on the same images.
+        double fallbackGain = 0.02;
+        if (const char* gv = std::getenv("SM_NCC_FALLBACK_GAIN"))
+        {
+            const double v = std::atof(gv);
+            if (v >= -1.0 && v <= 1.0) fallbackGain = v;
+        }
 
         // Never fall back further than two levels: level 0 means a full-resolution
         // score map for every angle (seconds per image), which would turn a
@@ -942,6 +961,28 @@ std::vector<NccResult> NccMatcher::findNccModel(const cv::Mat& gray, const NccFi
         }
 
         if (bestMapVal >= trust || ct == coarseFloor) break;
+
+        // A fallback is only worth its price when the FINER level sees a
+        // stronger peak; that is exactly what "the coarsest level blurred the
+        // target away" looks like.  When the peak stays flat or drops, no target
+        // is there and every further fallback just repeats a full-image scan at
+        // double resolution.
+        //
+        // Measured on 2048x2448 (no target, 360 degrees, minScore 0.30): peaks
+        // 0.4738 -> 0.4161 -> 0.3844, i.e. monotonically falling, and 87% of the
+        // 2.6 s search time was the SECOND fallback (73x73 canvas x 180 angles).
+        // Real targets do the opposite: the finer level resolves them and the
+        // peak rises well above this margin.
+        if (fallbackGain >= 0.0 && prevCoarsePeak > -2.0 &&
+            bestMapVal < prevCoarsePeak + fallbackGain)
+        {
+            if (fp.debug >= 1)
+                std::printf("[ncc] coarse peak %.4f at level %d does not improve on "
+                            "level %d (%.4f): keeping the candidates found here\n",
+                            bestMapVal, ct, ct + 1, prevCoarsePeak);
+            break;
+        }
+        prevCoarsePeak = bestMapVal;
 
         if (fp.debug >= 1)
             std::printf("[ncc] coarse peak %.4f at level %d is below %.2f, "
