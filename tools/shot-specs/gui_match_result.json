@@ -1,0 +1,13 @@
+{
+  "src": "_ai_tmp/gui_raw/06_result.png",
+  "out": "docs/gui_match_result.jpg",
+  "crop": { "x": 214, "y": 40, "w": 792, "h": 730 },
+  "scale": 1.0,
+  "padBottom": 76,
+  "quality": 88,
+  "texts": [
+    { "x": 16, "y": 736, "abs": true, "text": "绿框 = 命中目标（尺寸 = 模板 × 缩放）    框内绿线 = 模型轮廓", "size": 24, "bold": true, "color": "#006000" },
+    { "x": 16, "y": 774, "abs": true, "text": "框下方那一行 = 分数 s / 覆盖率 c / 角度 a / 缩放 k", "size": 24, "bold": true, "color": "#006000" }
+  ]
+}
+

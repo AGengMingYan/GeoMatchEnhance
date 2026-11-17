@@ -1,0 +1,11 @@
+{
+  "src": "_ai_tmp/gui_raw/03_useroi.png",
+  "out": "docs/img/step3_useroi.png",
+  "crop": { "x": 1005, "y": 178, "w": 490, "h": 170 },
+  "scale": 1.7,
+  "padTop": 8,
+  "rects": [
+    { "x": 1022, "y": 269, "w": 470, "h": 22, "color": "#FF2020", "lw": 3,
+      "label": "点这里：用目标图的 ROI 当模板", "size": 24, "bold": true }
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "src": "_ai_tmp/gui_raw/02_roi.png",
+  "out": "docs/img/step2_roi.png",
+  "crop": { "x": 214, "y": 40, "w": 792, "h": 700 },
+  "scale": 0.95,
+  "padTop": 0,
+  "rects": [
+    { "x": 379, "y": 329, "w": 262, "h": 232, "color": "#00C8FF", "lw": 4 },
+    { "x": 232, "y": 50, "w": 100, "h": 26, "color": "#FF2020", "lw": 3 }
+  ],
+  "texts": [
+    { "x": 620, "y": 470, "text": "松开鼠标 → 青色框就是 ROI", "size": 24, "bold": true, "color": "#00A0FF" },
+    { "x": 250, "y": 100, "text": "① 先点「目标图」标签", "size": 24, "bold": true, "color": "#FF2020" },
+    { "x": 250, "y": 140, "text": "② 再在图上按住左键拖出一个框", "size": 24, "bold": true, "color": "#FF2020" }
+  ]
+}

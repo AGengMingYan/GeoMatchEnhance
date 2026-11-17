@@ -1,0 +1,23 @@
+{
+  "src": "_ai_tmp/gui_raw/00_overview.png",
+  "out": "docs/img/step0_overview.png",
+  "crop": { "x": 0, "y": 0, "w": 1500, "h": 920 },
+  "scale": 0.66,
+  "padTop": 34,
+  "padBottom": 112,
+  "rects": [
+    { "x": 14, "y": 34, "w": 196, "h": 868, "color": "#FF2020", "lw": 3 },
+    { "x": 214, "y": 34, "w": 792, "h": 868, "color": "#FF2020", "lw": 3 },
+    { "x": 1010, "y": 34, "w": 482, "h": 868, "color": "#FF2020", "lw": 3 }
+  ],
+  "texts": [
+    { "x": 8, "y": 6, "abs": true, "text": "① 图片目录", "size": 18, "bold": true, "color": "#FF2020" },
+    { "x": 160, "y": 6, "abs": true, "text": "② 图像视图", "size": 18, "bold": true, "color": "#FF2020" },
+    { "x": 730, "y": 6, "abs": true, "text": "③ 参数面板", "size": 18, "bold": true, "color": "#FF2020" },
+    { "x": 10, "y": 704, "abs": true, "text": "① 图片目录：点缩略图或「上一张 / 下一张」切图", "size": 16, "bold": true, "color": "#0060C0" },
+    { "x": 10, "y": 736, "abs": true, "text": "② 图像视图：4 个页签（匹配结果 / 目标图 / 模板源图 / 模板模型），可拖框选模板、滚轮缩放", "size": 16, "bold": true, "color": "#0060C0" },
+    { "x": 10, "y": 768, "abs": true, "text": "③ 参数面板：5 个页签；「① 匹配」页里就是 1~4 四块操作，滚轮上下滚", "size": 16, "bold": true, "color": "#0060C0" }
+  ]
+}
+
+

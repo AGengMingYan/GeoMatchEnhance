@@ -198,6 +198,13 @@ GeoMatchDemo -bench
 
 > 📖 **[GeoGUIDemo 使用说明](docs/GeoGUIDemo使用说明.md)**
 
+界面分三栏：最左「图片目录」缩略图竖排、中间「图像视图」4 个标签页、右侧「参数面板」5 个页签：
+
+![GeoGUIDemo 界面总览](docs/img/step0_overview.png)
+
+快速上手（选目录 → 框模板 → 执行匹配）见
+[docs/快速上手-三步测试Demo.md](docs/快速上手-三步测试Demo.md)。
+
 启动方式：
 
 ```bash

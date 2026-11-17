@@ -1,0 +1,17 @@
+{
+  "src": "_ai_tmp/gui_raw/06_result.png",
+  "out": "docs/img/step5_result.png",
+  "crop": { "x": 345, "y": 302, "w": 360, "h": 310 },
+  "scale": 1.7,
+  "padTop": 56,
+  "padBottom": 46,
+  "rects": [
+    { "x": 379, "y": 329, "w": 262, "h": 231, "color": "#FF2020", "lw": 3 },
+    { "x": 379, "y": 556, "w": 262, "h": 21, "color": "#FFA000", "lw": 3 }
+  ],
+  "texts": [
+    { "x": 10, "y": 10, "abs": true, "text": "红框 = 找到的位置（尺寸 = 模板 × 缩放）", "size": 20, "bold": true, "color": "#FF2020" },
+    { "x": 10, "y": 590, "abs": true, "text": "橙框那行字 = 分数 s / 覆盖率 c / 角度 a / 缩放 k", "size": 19, "bold": true, "color": "#E07000" }
+  ]
+}
+

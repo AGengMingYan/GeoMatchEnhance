@@ -1,0 +1,11 @@
+{
+  "src": "_ai_tmp/gui_raw/01_dir.png",
+  "out": "docs/img/step1_dir.png",
+  "crop": { "x": 1005, "y": 372, "w": 490, "h": 130 },
+  "scale": 1.6,
+  "padTop": 8,
+  "rects": [
+    { "x": 1022, "y": 387, "w": 470, "h": 22, "color": "#FF2020", "lw": 3,
+      "label": "点这里：选择图片目录", "size": 24, "bold": true }
+  ]
+}

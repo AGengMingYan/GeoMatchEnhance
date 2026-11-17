@@ -59,10 +59,32 @@
 
 ## 图片
 
-`docs/*.jpg` / `*.png` 是 README 引用的实测截图，均由 **CLI 画出来的**（不是 GUI 截图）：
+`docs/*.jpg` / `*.png` 分两类：
 
-```bat
-build\GeoMatchDemo.exe -t case1\temp.jpg -d case1 -o _ai_tmp\docout -loops 5 -minscore 0.70 -max 12 -noshow
-```
+1. **CLI 画出来的实测图**（`model_info.png`、`match_result*.jpg`、`synth_*.png`、`template*.jpg`、`mask_overlay_*.png`、`model_points_compare.png`）：
+   ```bat
+   build\GeoMatchDemo.exe -t case1\temp.jpg -d case1 -o _ai_tmp\docout -loops 5 -minscore 0.70 -max 12 -noshow
+   ```
+   取 `out\model_info.png` 与结果图即可（`-o` 目录要先存在）。
+   `mask_overlay_*.png` / `model_points_compare.png` 由 `python tools\gen_doc_images.py` 用掩码图合成。
+   （它读 `build_x64/tools/tpl_cross176.png` + `mask_street/nodie.png`，那几个文件是历史产物，须先存在。）
+2. **GUI 真实截图**（`docs/img/step*.png`、`docs/gui_model_info.png`、`docs/gui_match_result.jpg`）：
+   全部由 `GeoGUIDemo.exe` 真实界面截取，**一条命令重拍全部**：
 
-取 `out\model_info.png` 与结果图即可。`docs/img/` 是 GUI 分步截图，供 `快速上手-三步测试Demo.md` 使用。
+   ```bat
+   powershell -File tools\update-doc-images.ps1              :: 重拍 + 重标注 + 自检
+   powershell -File tools\update-doc-images.ps1 -SkipCapture :: 只用已有原图重标注
+   ```
+
+   流程：`tools\shot-gui-docs.ps1` 用合成鼠标事件走一遍
+   「切图 → 目标图 → 拖框 → 用 ROI 当模板 → 滚到执行匹配 → 看结果 / 模板模型」，
+   把整窗 PNG 落到 `_ai_tmp\gui_raw\`；再由 `tools\annotate-shot.ps1` 按
+   `tools\shot-specs\*.json` 裁剪 + 画框 + 写中文标注；
+   最后 `tools\verify-doc-images.py`（明文/标注/裁切）与 `tools\check-doc-links.py`（链接有效性）自检。
+
+   > 两个 `.ps1` 保持**纯 ASCII**，中文标注全部放在 JSON 里——PS 5.1 会把无 BOM 的
+   > 中文脚本按 GBK 解析，报一串假语法错误。窗口坐标是按 1500×920 标定的，
+   > 改了布局要用 `tools\calib-rows.py`（按钮行）/ `calib-tabs.py`（页签）/
+   > `find-box.py`（绿框、青框）重新标定。
+   > 生成的 PNG/JPG 都是 System.Drawing 写的，落盘即明文（本机加密驱动只对
+   > python / PowerShell 文本重定向 / 解压产物加密）。

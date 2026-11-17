@@ -723,7 +723,22 @@ python -c "import zipfile;z=zipfile.ZipFile('dl.zip1');print(z.testzip(), len(z.
 - 合成样本重生成：`python tools\gen_synth.py --template case1/temp.jpg --out dataset/sample/synth`
   （16 角度 × 5 缩放 = 80 张 700×700 q92 ≈12 MB；文件名真值用宽松正则 `[+-]\d+\.\d` 解析，
   `%+05.1f` 的 5 是含符号总宽度，`+45.0` 只有 5 字符）。
-- `docs/img/step*.png` 等 GUI 截图需要真实界面 + 鼠标自动化，重新生成要按 §8.1 的流程。
+- **GUI 截图一套脚本一条命令重拍**（2026-11-17 落地）：
+  `powershell -File tools\update-doc-images.ps1 [-SkipCapture]`（末尾自动跑两个自检）
+  - `tools\shot-gui-docs.ps1` 合成鼠标走流程 → `_ai_tmp\gui_raw\0*.png`；
+  - `tools\annotate-shot.ps1 -Spec tools\shot-specs\*.json` 裁剪+画框+写中文标注 → `docs/img/step*.png`、`docs/gui_*.{png,jpg}`；
+  - `tools\verify-doc-images.py` 查明文/标注有无/右边界裁切；`tools\check-doc-links.py` 查 md 图片链接；
+  - CLI 那几张（`mask_overlay_*`、`model_points_compare`）由 `tools\gen_doc_images.py` 合成。
+  - 两个 `.ps1` **必须纯 ASCII**（PS 5.1 把无 BOM 中文脚本按 GBK 解析 → 一串假语法错误），
+    中文标注放 JSON。像素坐标是 **原图（整窗）坐标**，`annotate-shot.ps1` 内部按 `crop` 自行换算；
+    `"abs": true` 表示不换算、直接用输出图像素（用于 padTop/padBottom 留白上的标题/图例）。
+  - 坐标按 **1500×920 窗口**标定：视图页签 x=255/316/371/434、y=66；右栏按钮中心 x=1257；
+    「下一张」y=490、「用目标图的 ROI 当模板」y=280、滚到底后「执行匹配」y=628。
+    布局一变就用 `tools\calib-rows.py`（按钮蓝行）/ `calib-tabs.py`（页签）/ `find-box.py`（绿框、青框）重新标定。
+  - **录制前先切到能命中的图**（启动首图 `ScanPlaneTemplate.png` 是 `matches=0`，总览图上不好看）：
+    点两次「下一张」到第 3 张 `tmp_grab_1762994178.jpg`。
+- **图片上传前必查明文**：`[IO.File]::ReadAllBytes` 头必须是 `89 50 4E 47` / `FF D8 FF`；
+  System.Drawing 存出来的都是明文，python / PS 文本重定向 / 解压产物是密文（§1.2）。
 
 ---
 

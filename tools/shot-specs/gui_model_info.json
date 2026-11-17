@@ -1,0 +1,12 @@
+{
+  "src": "_ai_tmp/gui_raw/07_model.png",
+  "out": "docs/gui_model_info.png",
+  "crop": { "x": 214, "y": 40, "w": 792, "h": 740 },
+  "scale": 1.0,
+  "padBottom": 74,
+  "texts": [
+    { "x": 16, "y": 746, "abs": true, "text": "绿线 = 模型轮廓（Halcon 风格）    蓝点 = 模板中心", "size": 21, "bold": true, "color": "#006000" },
+    { "x": 16, "y": 778, "abs": true, "text": "红点 = 参与评分的采样点（直径 1 px，放大后可见）", "size": 21, "bold": true, "color": "#C00000" }
+  ]
+}
+

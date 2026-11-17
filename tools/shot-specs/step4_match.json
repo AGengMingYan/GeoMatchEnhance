@@ -1,0 +1,11 @@
+{
+  "src": "_ai_tmp/gui_raw/04_panel_bottom.png",
+  "out": "docs/img/step4_match.png",
+  "crop": { "x": 1005, "y": 600, "w": 490, "h": 130 },
+  "scale": 1.7,
+  "padTop": 8,
+  "rects": [
+    { "x": 1022, "y": 617, "w": 470, "h": 22, "color": "#FF2020", "lw": 3,
+      "label": "点这里：执行匹配", "size": 24, "bold": true }
+  ]
+}
