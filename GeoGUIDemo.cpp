@@ -181,6 +181,25 @@ static std::wstring pickImageFile(const wchar_t* title)
     return ::GetOpenFileNameW(&ofn) ? std::wstring(buf) : std::wstring();
 }
 
+// 模型文件选择框。模型(.shm/.ncm)不是图片，pickImageFile 的图片滤镜会把它滤掉，
+// 所以单独一个；defaultExt 让编辑框里不写扩展名时自动补上。
+static std::wstring pickModelFile(bool ncc)
+{
+    wchar_t buf[MAX_PATH * 4] = L"";
+    OPENFILENAMEW ofn;
+    ZeroMemory(&ofn, sizeof(ofn));
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner   = g_hwnd;
+    ofn.lpstrFilter = ncc ? L"NCC 模型 (*.ncm)\0*.ncm\0所有文件\0*.*\0"
+                          : L"形状模型 (*.shm)\0*.shm\0所有文件\0*.*\0";
+    ofn.lpstrFile   = buf;
+    ofn.nMaxFile    = MAX_PATH * 4;
+    ofn.lpstrTitle  = ncc ? L"选择 NCC 模型文件" : L"选择形状模型文件";
+    ofn.lpstrDefExt = ncc ? L"ncm" : L"shm";
+    ofn.Flags       = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER | OFN_NOCHANGEDIR;
+    return ::GetOpenFileNameW(&ofn) ? std::wstring(buf) : std::wstring();
+}
+
 // 用 ifstream + imdecode 读图，避免 OpenCV 在非 ASCII 路径上的问题
 static bool loadGrayImage(const std::wstring& path, cv::Mat& gray)
 {
@@ -462,6 +481,7 @@ struct App
 
     //---- 本次搜索结果里的耗时统计(点"重复 20 次计时"时是累计值) ----
     bool   showResultOnce = false;     // 跑完搜索后自动切到「匹配结果」页签
+    bool   showModelOnce  = false;     // 载入模型后自动切到「模板模型」页签
     double searchTotalMs = 0;          // 搜索总耗时 = 每次搜索 × 重复次数
     double benchWallMs   = 0;          // 整次 detect 调用的墙钟耗时(含预处理/重复)
     int    searchLoops   = 0;          // 这次搜索重复了几次
@@ -527,6 +547,13 @@ struct App
     //---- 模板掩码(非零 = 参与建模的区域) ----
     std::string maskPath;
     cv::Mat     mask;
+
+    //---- 模型文件(保存 / 加载)的结果反馈 ----
+    // 这两个字段只为了一件事：按钮点完当场给出一句话。以前保存/加载的结果
+    // 只写进「⑤ 界面/日志」页，而默认停在「④ 掩码/模型」页，看起来就是
+    // "点「加载模型」没反应"（实测日志里其实已经打印了"模型已加载: ..."）。
+    std::string modelFileMsg;          // 上一次保存/加载的结果文字
+    int         modelFileOk = -1;      // 1 = 成功, 0 = 失败, -1 = 还没操作过
 
     //---- 掩码涂抹 ----
     bool  paintMask    = false;   // 涂抹模式开关
@@ -1489,6 +1516,11 @@ static void drawViewPane()
         ImGuiTabItemFlags resFlags = ImGuiTabItemFlags_None;
         if (a.showResultOnce) resFlags |= ImGuiTabItemFlags_SetSelected;
 
+        // 刚载入模型时切到「模板模型」：加载本身不改画面，不切页签的话
+        // 「④ 掩码/模型」上点完只能靠日志才知道成功（实测就是这个反馈）。
+        ImGuiTabItemFlags modelFlags = ImGuiTabItemFlags_None;
+        if (a.showModelOnce) modelFlags |= ImGuiTabItemFlags_SetSelected;
+
         if (ImGui::BeginTabItem("匹配结果", nullptr, resFlags))
         {
             snprintf(info, sizeof(info), "匹配结果  %dx%d  命中 %d",
@@ -1518,13 +1550,14 @@ static void drawViewPane()
             a.viewTab = 2;
             ImGui::EndTabItem();
         }
-        if (ImGui::BeginTabItem("模板模型"))
+        if (ImGui::BeginTabItem("模板模型", nullptr, modelFlags))
         {
             snprintf(info, sizeof(info), "模板模型(绿=轮廓 红=采样点 蓝=中心)  %dx%d",
                      a.texModel.w, a.texModel.h);
             drawImageView("##area_model", info, a.texModel, 0, 3);
             a.viewTab = 3;
             ImGui::EndTabItem();
+            a.showModelOnce = false;        // 只在这一次请求后清除
         }
         ImGui::EndTabBar();
     }
@@ -1660,6 +1693,15 @@ static void textDimWrapped(const char* s)
 static void textWarnWrapped(const char* s)
 {
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.70f, 0.25f, 1.0f));
+    ImGui::TextWrapped("%s", s);
+    ImGui::PopStyleColor();
+}
+
+// 绿色成功提示 + 自动换行：保存/加载模型这类"动作成功但画面本身不变"的操作
+// 全靠它和失败提示给出反馈（日志在「⑤ 界面/日志」页，默认看不见）
+static void textOkWrapped(const char* s)
+{
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.45f, 0.90f, 0.45f, 1.0f));
     ImGui::TextWrapped("%s", s);
     ImGui::PopStyleColor();
 }
@@ -2007,24 +2049,68 @@ static void drawPanel()
             modelPath[sizeof(modelPath) - 1] = '\0';
         }
 
-        ImGui::SetNextItemWidth(-1);
+        // 路径框 + 「浏览...」。
+        // 以前这里只有一个手打路径的输入框：路径打错、或者相对路径在当前工作目录下
+        // 不存在时，点「加载模型」只在「⑤ 界面/日志」留一行"加载失败"，
+        // 而人停在「④ 掩码/模型」页 —— 看到的就是"点击后没反应"。
+        ImGui::SetNextItemWidth(-90 * g_scale);
         ImGui::InputText("##modelpath", modelPath, sizeof(modelPath));
+        ImGui::SameLine();
+        if (ImGui::Button("浏览...", ImVec2(-1, 0)))
+        {
+            const std::wstring p = pickModelFile(a.matchMode == 1);
+            if (!p.empty())
+            {
+                const std::string s = ws2s(p);
+                strncpy(modelPath, s.c_str(), sizeof(modelPath) - 1);
+                modelPath[sizeof(modelPath) - 1] = '\0';
+            }
+        }
+
+        // 结果反馈：成功/失败都当场显示在按钮下面（同时照旧写日志）
+        auto reportModelFile = [&](bool ok, const std::string& msg)
+        {
+            a.modelFileOk  = ok ? 1 : 0;
+            a.modelFileMsg = msg;
+            logLine(msg);
+        };
+        // 加载失败最常见的原因是路径不对：把"相对路径按哪个目录解析"直接说出来
+        auto loadFailMsg = [&]() -> std::string
+        {
+            std::string s = "加载失败: ";
+            s += modelPath;
+            if (!cv::utils::fs::exists(modelPath))
+            {
+                s += "  —— 文件不存在。相对路径按程序工作目录 ";
+                s += cv::utils::fs::getcwd();
+                s += " 解析，点「浏览...」直接选文件";
+                return s;
+            }
+            s += "  —— 文件存在但解析失败（格式不对/被截断），"
+                 "形状模型请用 .shm、NCC 模型请用 .ncm";
+            return s;
+        };
 
         if (ImGui::Button("保存模型", ImVec2(-120, 0)))
         {
             if (a.matchMode == 1)
             {
-                if (!a.nccReady) logLine("没有 NCC 模型可保存");
-                else if (a.ncc.writeNccModel(modelPath)) logf("NCC 模型已保存: %s", modelPath);
-                else logf("保存失败: %s", modelPath);
+                if (!a.nccReady) reportModelFile(false, "没有 NCC 模型可保存（先创建或加载一个）");
+                else if (a.ncc.writeNccModel(modelPath))
+                    reportModelFile(true, std::string("NCC 模型已保存: ") + modelPath);
+                else reportModelFile(false, std::string("保存失败: ") + modelPath +
+                                          "  —— 目录不存在或无写权限");
             }
-            else if (!a.modelReady) logLine("没有模型可保存");
-            else if (a.matcher.save(modelPath)) logf("模型已保存: %s", modelPath);
-            else logf("保存失败: %s", modelPath);
+            else if (!a.modelReady) reportModelFile(false, "没有模型可保存（先创建或加载一个）");
+            else if (a.matcher.save(modelPath))
+                reportModelFile(true, std::string("模型已保存: ") + modelPath);
+            else reportModelFile(false, std::string("保存失败: ") + modelPath +
+                                      "  —— 目录不存在或无写权限");
         }
         ImGui::SameLine();
         if (ImGui::Button("加载模型", ImVec2(-1, 0)))
         {
+            bool loadedOk = false;
             if (a.matchMode == 1)
             {
                 if (a.ncc.readNccModel(modelPath))
@@ -2042,10 +2128,15 @@ static void drawPanel()
                     a.nccMetric         = np.metric;
                     a.modelVis = a.ncc.drawModelFeatures(2.0);
                     a.texModel.set(toBGRA(a.modelVis));
-                    logf("NCC 模型已加载: %s  (%d 像素 / %d 层 / %d 角度)", modelPath,
-                         a.ncc.modelPixelCount(), a.ncc.numLevels(), a.ncc.angleCount());
+                    char msg[512];
+                    snprintf(msg, sizeof(msg),
+                             "NCC 模型已加载: %s  (%d 像素 / %d 层 / %d 角度)",
+                             modelPath, a.ncc.modelPixelCount(), a.ncc.numLevels(),
+                             a.ncc.angleCount());
+                    reportModelFile(true, msg);
+                    loadedOk = true;
                 }
-                else logf("加载失败: %s (NCC 模型请用 .ncm)", modelPath);
+                else reportModelFile(false, loadFailMsg());
             }
             else if (a.matcher.load(modelPath))
             {
@@ -2054,11 +2145,31 @@ static void drawPanel()
                 a.syncFromConfig(a.matcher.config());
                 a.modelVis = a.matcher.drawModelFeatures(2.0);
                 a.texModel.set(toBGRA(a.modelVis));
-                logf("模型已加载: %s  (%d 点 / %d 层)", modelPath,
-                     a.matcher.modelPointCount(), a.matcher.numLevels());
+                char msg[512];
+                snprintf(msg, sizeof(msg), "模型已加载: %s  (%d 点 / %d 层)",
+                         modelPath, a.matcher.modelPointCount(), a.matcher.numLevels());
+                reportModelFile(true, msg);
+                loadedOk = true;
             }
-            else logf("加载失败: %s", modelPath);
+            else reportModelFile(false, loadFailMsg());
+
+            // 加载成功后必须让画面有变化，否则和"没反应"没区别：
+            //   1) 有目标图且开了自动刷新 -> 立刻用新模型识别一次（结果页会自动切过去）；
+            //   2) 否则把图像区切到「模板模型」，直接看模型特征。
+            // 注意判 loadedOk 而不是 modelReady：失败时旧模型还在，modelReady 仍是 true。
+            if (loadedOk)
+            {
+                if (a.autoRun && !a.tgtGray.empty()) needMatch = true;
+                else                                 a.showModelOnce = true;
+            }
         }
+
+        if (a.modelFileOk >= 0)
+        {
+            if (a.modelFileOk) textOkWrapped(a.modelFileMsg.c_str());
+            else               textWarnWrapped(a.modelFileMsg.c_str());
+        }
+        textDimWrapped("路径相对程序工作目录解析；保存前请确认目录已存在（不会自动建目录）。");
         endGroup();
     }
 
