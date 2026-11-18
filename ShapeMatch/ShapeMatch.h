@@ -7,8 +7,14 @@
 //  directly is the escape hatch geomatch::Matcher::core().
 //
 //  Threading: createShapeModel / readShapeModel mutate the object and are not
-//  thread safe.  findShapeModel() const only reads, so one built model may be
-//  searched from several threads.
+//  thread safe.  findShapeModel() is NOT safe to share either, despite the
+//  historical comment here: prepareSource() writes the per-frame buffers
+//  (srcPyramid_ / srcGx_ / srcGy_ / srcQ8_ / srcM8_) that live on the object,
+//  and cv::Mat::create() may reallocate them.  Measured with two threads on one
+//  matcher: different images of the same size -> 80% of the searches returned
+//  the OTHER image's result; different sizes -> 0xC0000005 crash.  Give every
+//  thread its own ShapeMatcher (loading the same .shm is fine); see the
+//  SearchContext refactor in docs/SDK.md 8.
 //***********************************************************************
 #pragma once
 #include <opencv2/opencv.hpp>
@@ -68,6 +74,41 @@ struct ModelPoint
 struct MatchParams
 {
     int    numLevels   = 0;    // 0 = auto
+
+    // 金字塔最粗一层的最短边下限（像素）：模型会一直 pyrDown，直到下一层的
+    // 短边小于它。这是「模型能有多深」的开关，和 FindParams::numLevels
+    // （搜索实际用几层）配套使用。
+    //   24（默认 = 历史值）：101x102 模板 -> 3 层，顶层 26x26
+    //   12                ：101x102 模板 -> 4 层，顶层 12x13
+    // 层越深，粗扫的位置数按 4 倍递减。实测 4096x4096 纯平背景、360°：
+    //   3 层 53.8 ms / 4 层 12.0 ms（顶层模板都是 26x26，位置数 99.7 万 vs 23.6 万）
+    // Halcon 没有暴露这个参数（它用 find_shape_model 的 NumLevels 在搜索时选），
+    // 我们两个都开放，因为它同时决定「模型体积」和「能不能从更粗层开始」。
+    // 代价：层越粗，弱/小目标越容易被糊掉而漏检 —— 调小必须验召回。
+    int    minSide     = 24;
+
+    // Halcon create_shape_model 的 Optimization：'none' / 'auto' /
+    // 'point_reduction_low' / 'medium' / 'high'。
+    //
+    // Halcon 用它控制「点怎么存」，实测在我们的模板上三种模式**点数完全相同**，
+    // 所以这里不为它造一条独立的实现，而是映射到点数预算 maxPoints（这是本库
+    // 真正的控点旋钮）：
+    //   none / auto        -> maxPoints 不变
+    //   point_reduction_low     -> maxPoints x 0.75
+    //   point_reduction_medium  -> maxPoints x 0.50
+    //   point_reduction_high    -> maxPoints x 0.33
+    // 目的只有一个：让 Halcon 配方能原样搬过来不报错。要精确控点请直接用
+    // maxPoints；空字符串等同 'none'。非法值会被忽略（保留 maxPoints）。
+    std::string optimization = "";
+
+    // Halcon Contrast 的**多段幅值区间**语义：[lo1,hi1,lo2,hi2,...]。
+    // 空（默认）= 用下面 contrast/minContrast 的单段滞后阈值（历史行为，
+    // 种子要求 mag>=contrast、连接要求 mag>=minContrast，无上限）。
+    // 非空 = 种子和连接都要求 mag 落在**任意一段** [lo,hi] 内（含上下界），
+    // 用来「只要中等强度边、丢掉最强的高光边」这类需求。
+    // 每两项一对（lo,hi）；元素个数为奇数时最后一个被忽略。
+    std::vector<double> contrastBands;
+
     double angleStart  = -CV_PI;
     double angleExtent = 2 * CV_PI;
     double angleStep   = 0;    // 0 = auto (radians)
@@ -98,6 +139,43 @@ struct FindParams
     // minCoverage / scoreMode 抑制误检（见 README 的"误检抑制"章节）。
     double minScore    = 0.7;
     int    maxMatches  = 20;
+
+    // Halcon 的 find_shape_model(..., NumLevels, ...)：搜索最多用模型的多少层，
+    // 从最细的一层往粗数。0（默认）= 用模型的全部层，即历史行为。
+    //   * 调小 → 从更细的层开始：位置数变多、变慢，但弱/小目标不容易被粗层糊掉
+    //     （Halcon 的 4096² 纯平实测 NumLevels 2/3/4/5 = 190.8/19.1/7.68/9.65 ms）
+    //   * 调大 → 从更粗的层开始（上限是模型层数），每多一层位置数 ÷4、角度数 ÷2
+    // 与 MatchParams::numLevels（建模层数）不同：这个**不需要重建模型**。
+    int    numLevels   = 0;
+
+    // ---- Halcon find_shape_model 的搜索期角度/尺度子范围 ----
+    // Halcon 在**搜索时**再给一次 AngleStart / AngleExtent / ScaleMin / ScaleMax，
+    // 允许是建模范围的子集（find_shape_model / find_scaled_shape_model 的签名）。
+    // 我们原来没有这些字段，`-load` + `-angle` 只能告警拒绝、必须重建模型。
+    //
+    // 语义：
+    //   angleExtent <= 0（默认）  -> 用模型自己的整个角度范围（历史行为）
+    //   angleExtent  > 0          -> 只搜 [angleStart, angleStart+angleExtent]
+    //                                角度按 2*pi 取模，所以 170°..190° 这种跨 ±180
+    //                                的区间也能正确表达
+    //   scaleMax <= 0（默认）     -> 用模型自己的整个尺度范围
+    //   scaleMin/scaleMax > 0     -> 只搜这个尺度区间（会与模型范围取交集）
+    //
+    // 精度：位姿集合是模型网格的**子集**，不会凭空产生新位姿；但结果列表可能变
+    // （范围外若还有近乎等分的角度位姿，NMS 的胜者会换，分数差通常 < 0.01）。
+    // 亚像素会以 ±1 个网格步长向内/外微调，所以落在边界附近的位姿可能略出范围。
+    double angleStart  = 0.0;
+    double angleExtent = -1.0;
+    double scaleMin    = 0.0;
+    double scaleMax    = 0.0;
+
+    // 超时（毫秒），0 = 不限（默认）。对齐 Halcon 的
+    // set_shape_model_param('timeout', ...)：超时后**返回已经找到的结果**
+    // （不是报错），并用 lastSearchTimedOut() 告诉调用方结果不完整。
+    // 检查点在粗扫的每个位姿和 refine 的每个候选之间。
+    int    timeoutMs   = 0;
+
+
     // 0 = off.  Minimum centre distance between two reported instances, in
     // pixels at the search image scale.  Kept for compatibility; prefer
     // maxOverlap below because it is scale independent.
@@ -278,6 +356,10 @@ public:
 
     double lastPreprocessTime() const { return lastPreprocessTime_; }
     double lastSearchTime() const { return lastSearchTime_; }
+    // true = 上一次 findShapeModel() 因为 FindParams::timeoutMs 提前结束，
+    // 返回的结果是"到目前为止找到的"，不完整。
+    bool   lastSearchTimedOut() const { return timedOut_; }
+
     static bool openCLAvailable();
 
 private:
@@ -335,6 +417,8 @@ private:
     std::vector<cv::UMat> uGx_, uGy_;
     bool useOCL_;
     double lastPreprocessTime_, lastSearchTime_;
+    bool timedOut_ = false;      // FindParams::timeoutMs 触发的提前结束
+
 
     void buildAngleScaleGrids();
     void selectEdgePoints(LevelData& ld, const cv::Mat& grayLevel, const cv::Mat& mask, int level) const;
@@ -364,7 +448,7 @@ private:
     void extractCandidates(const cv::Mat& scoreMap, int level, int aIdx, int sIdx, int R,
                            double thresh, std::vector<Candidate>& out, int maxPerMap, int nmsRadius);
     void refineLevel(int level, std::vector<Candidate>& cands, int maxKeep, double minScore,
-                     int metric = 0);
+                     int metric = 0, int64_t deadline = 0, bool* timedOut = nullptr);
     // mode 1 = parabola interpolation (default), mode 2 = least squares
     void subpixelRefine(int level, Candidate& c, int mode, int metric);
 

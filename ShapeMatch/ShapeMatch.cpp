@@ -268,7 +268,10 @@ bool ShapeMatcher::createShapeModel(const cv::Mat& gray, const MatchParams& p)
     }
 
     // ---- pyramid levels -------------------------------------------------
-    int minSide = 24;
+    // 最粗一层的最短边下限，可配置（MatchParams::minSide）。钳到 [4, 256]：
+    // 小于 4 时 pyrDown 会把模板糊成几个像素、边缘点全糊掉；大于 256 等于
+    // 禁用金字塔（只剩 level 0），只会更慢。
+    const int minSide = std::max(4, std::min(256, params_.minSide));
     int lv = 0;
     std::vector<cv::Mat> pyr;
     pyr.push_back(modelGray0_);
@@ -341,7 +344,18 @@ namespace
 
     // hysteresis: a ridge that reaches hi is a seed, everything connected to
     // it stays while it is above lo -> weak but continuous edges survive
-    void growEdges(const cv::Mat& mag, const cv::Mat& thin, float lo, float hi, cv::Mat& edge)
+    // Halcon Contrast 的「多段幅值区间」：非空时种子和连接都要求幅值落在
+    // 任意一段 [lo,hi] 里（含上下界）。空 = 老的单段滞后阈值行为。
+    typedef std::vector<std::pair<float, float>> Bands;
+    inline bool inBands(const Bands& b, float v)
+    {
+        for (size_t i = 0; i < b.size(); i++)
+            if (v >= b[i].first && v <= b[i].second) return true;
+        return false;
+    }
+
+    void growEdges(const cv::Mat& mag, const cv::Mat& thin, float lo, float hi, cv::Mat& edge,
+                   const Bands* bands = nullptr)
     {
         const int w = mag.cols, h = mag.rows;
         edge.create(h, w, CV_8U);
@@ -351,12 +365,16 @@ namespace
 
         uchar* pe = edge.ptr<uchar>();
         std::vector<int> stack;
+        const bool useBands = (bands && !bands->empty());
+        // 单段口径没有幅值上限（历史行为）；多段口径要求落在某一段内。
         for (int i = 0; i < w * h; i++)
-            if (pt[i] && pm[i] >= hi && !pe[i])
-            {
-                pe[i] = 1;
-                stack.push_back(i);
-            }
+        {
+            if (!pt[i] || pe[i]) continue;
+            const bool seed = useBands ? inBands(*bands, pm[i]) : (pm[i] >= hi);
+            if (!seed) continue;
+            pe[i] = 1;
+            stack.push_back(i);
+        }
 
         while (!stack.empty())
         {
@@ -374,7 +392,8 @@ namespace
                 {
                     const int xx = x + dx;
                     if (xx < 0 || xx >= w) continue;
-                    if (er[xx] || !tr[xx] || mr[xx] < lo) continue;
+                    if (er[xx] || !tr[xx]) continue;
+                    if (useBands ? !inBands(*bands, mr[xx]) : (mr[xx] < lo)) continue;
                     er[xx] = 1;
                     stack.push_back(yy * w + xx);
                 }
@@ -579,6 +598,18 @@ void ShapeMatcher::selectEdgePoints(LevelData& ld, const cv::Mat& grayLevel, con
     // coarser levels scale down from that natural count by 2^level, so their
     // share of the points stays the same as with an explicit budget.
     int maxPts = params_.maxPoints;
+    // Halcon 的 Optimization 映射到点数预算（见 MatchParams::optimization）：
+    // 目的只是让配方能原样搬过来，本库真正的控点旋钮仍是 maxPoints。
+    if (maxPts > 0 && !params_.optimization.empty())
+    {
+        const std::string& o = params_.optimization;
+        double f = 1.0;
+        if      (o == "point_reduction_low")    f = 0.75;
+        else if (o == "point_reduction_medium") f = 0.50;
+        else if (o == "point_reduction_high")   f = 0.33;
+        // "none" / "auto" / 其它 -> f = 1（不改）
+        maxPts = std::max(32, (int)std::lround(maxPts * f));
+    }
     if (maxPts <= 0)
         maxPts = (level == 0) ? 0 : std::max(64, (int)modelLevels_[0].points.size() / (1 << level));
     else if (level > 0)
@@ -604,7 +635,21 @@ void ShapeMatcher::selectEdgePoints(LevelData& ld, const cv::Mat& grayLevel, con
     const float lo = (float)std::max(params_.minContrast, 1.0);
     const float hi = (float)std::max(params_.contrast, (double)lo);
     thinRidges(mag, gx, gy, thin);
-    growEdges(mag, thin, lo, hi, edge);
+    // 多段幅值区间（Halcon Contrast 的元组语义）：模板里存的 Contrast 是
+    // Sobel 幅值，界面上的 "灰度差" 已经乘过 kSobelPerGray，所以这里直接用。
+    Bands bands;
+    if (params_.contrastBands.size() >= 2)
+    {
+        bands.reserve(params_.contrastBands.size() / 2);
+        for (size_t i = 0; i + 1 < params_.contrastBands.size(); i += 2)
+        {
+            float a = (float)params_.contrastBands[i];
+            float b = (float)params_.contrastBands[i + 1];
+            if (a > b) std::swap(a, b);
+            bands.push_back(std::make_pair(std::max(0.f, a), b));
+        }
+    }
+    growEdges(mag, thin, lo, hi, edge, bands.empty() ? nullptr : &bands);
 
     // mask off edges outside the region of interest
     if (!mask.empty())
@@ -2160,8 +2205,10 @@ void ShapeMatcher::computeGeometryFacts(const LevelData& ld) const
 }
 
 void ShapeMatcher::refineLevel(int level, std::vector<Candidate>& cands,
-                               int maxKeep, double minScore, int metric)
+                               int maxKeep, double minScore, int metric,
+                               int64_t deadline, bool* timedOut)
 {
+    (void)deadline; (void)timedOut;   // 逐候选超时检查见下方 parallel 循环
     const int stride = 1 << level;
     const int nA = (int)angleGrid_.size();
     const int nS = (int)scaleGrid_.size();
@@ -2208,6 +2255,13 @@ void ShapeMatcher::refineLevel(int level, std::vector<Candidate>& cands,
             const Window& w = wins[ci];
             const int na = w.na, ns = w.ns;
             const Candidate sc = cands[ci];
+
+            // 超时：本候选直接跳过（found[ci] 保持 0，会被下游丢弃）
+            if (deadline && cv::getTickCount() > deadline)
+            {
+                if (timedOut) *timedOut = true;
+                continue;
+            }
 
             Candidate best;
             best.score = -2.f;
@@ -3060,12 +3114,21 @@ std::vector<MatchResult> ShapeMatcher::findShapeModel(const cv::Mat& gray, const
     const int nLevels = (int)modelLevels_.size();
     useOCL_ = fp.useOpenCL && oclUsable();
 
+    // Halcon 的 NumLevels：搜索最多用模型的多少层（从最细层数起），0 = 全部。
+    // 只影响"从哪层开始粗扫"，refine 仍然逐层走到 level 0，所以精度不变。
+    // 传进来比模型层数大时按模型层数截断（Halcon 内部也是 capping）。
+    int searchLevels = nLevels;
+    if (fp.numLevels > 0) searchLevels = std::min(nLevels, fp.numLevels);
+    if (searchLevels < 1) searchLevels = 1;
+    // 只建到用得到的最高层：更粗的层没人读，建了就是白付预处理
+    const int top = searchLevels - 1;
+
     // skipWeight（对齐 Halcon 的"弱梯度点不评分"语义）：本次调用的全部评分
     // 路径（SIMD 扫描/单点评分/亚像素/最终复评）都会读它。0 = 关闭。
     skipWeight_ = std::min(1.f, std::max(0.f, fp.skipWeight));
 
     int64 t0 = cv::getTickCount();
-    prepareSource(g8, nLevels, useOCL_);
+    prepareSource(g8, searchLevels, useOCL_);
     int64 t1 = cv::getTickCount();
     lastPreprocessTime_ = (double)(t1 - t0) * 1000.0 / cv::getTickFrequency();
 
@@ -3074,9 +3137,62 @@ std::vector<MatchResult> ShapeMatcher::findShapeModel(const cv::Mat& gray, const
     double phTop = 0, phExtract = 0, phRefine = 0, phSubpixel = 0, phRescore = 0;
     double phMerge = 0;   // the serial sort + near-duplicate pass after the scan
 
-    const int top = nLevels - 1;
     const int nA = (int)angleGrid_.size();
     const int nS = (int)scaleGrid_.size();
+
+    //---- 搜索期角度/尺度子范围（Halcon find_shape_model 的 AngleStart/AngleExtent、
+    //     find_scaled_shape_model 的 ScaleMin/ScaleMax）----
+    // 只筛"从哪些位姿开始粗扫"，位姿本身仍取自模型的网格，因此不会产生新位姿。
+    // 角度按 2*pi 取模，所以跨 ±180 的区间也能正确表达。
+    timedOut_ = false;
+    const int64 tDeadline = (fp.timeoutMs > 0)
+        ? (cv::getTickCount() + (int64)((double)fp.timeoutMs * cv::getTickFrequency() / 1000.0))
+        : 0;
+
+    std::vector<int> selA, selS;
+    selA.reserve(nA);
+    selS.reserve(nS);
+    {
+        const bool angRestrict = (fp.angleExtent > 0.0);
+        const double qs = fp.angleStart;
+        const double qe = std::min(fp.angleExtent, 2 * CV_PI);
+        const double qc = qs + qe * 0.5;                 // 请求范围中心
+        int nearestA = 0;
+        double nearestD = 1e30;
+        for (int i = 0; i < nA; i++)
+        {
+            if (angRestrict)
+            {
+                // 归一化到 [0, 2pi) 后比较，天然处理跨越 ±pi 的区间
+                double d = std::fmod(angleGrid_[i] - qs, 2 * CV_PI);
+                if (d < 0) d += 2 * CV_PI;
+                double dc = std::fmod(angleGrid_[i] - qc, 2 * CV_PI);
+                if (dc > CV_PI) dc = 2 * CV_PI - dc;
+                if (dc < nearestD) { nearestD = dc; nearestA = i; }
+                if (d > qe + 1e-9) continue;
+            }
+            selA.push_back(i);
+        }
+        const bool scRestrict = (fp.scaleMax > 0.0);
+        const double sLo = std::min(fp.scaleMin, fp.scaleMax);
+        const double sHi = std::max(fp.scaleMin, fp.scaleMax);
+        int nearestS = 0;
+        double nearestDS = 1e30;
+        const double sc = 0.5 * (sLo + sHi);
+        for (int j = 0; j < nS; j++)
+        {
+            const double ds = std::fabs(scaleGrid_[j] - sc);
+            if (ds < nearestDS) { nearestDS = ds; nearestS = j; }
+            if (scRestrict && (scaleGrid_[j] < sLo - 1e-9 || scaleGrid_[j] > sHi + 1e-9)) continue;
+            selS.push_back(j);
+        }
+        // 请求范围比本层网格步长还窄时一个点都落不进来。退回"全部"会让窄范围
+        // 反而变慢，所以取离范围中心最近的那一个：粗层本就允许 ±1 个粗步长的
+        // 误差，refine 会把它收敛回来。
+        if (selA.empty()) selA.push_back(nearestA);
+        if (selS.empty()) selS.push_back(nearestS);
+    }
+    const bool subRange = ((int)selA.size() != nA) || ((int)selS.size() != nS);
 
     // the model has to fit into the search image
     {
@@ -3089,6 +3205,13 @@ std::vector<MatchResult> ShapeMatcher::findShapeModel(const cv::Mat& gray, const
     }
     const int strideA = 1 << top;
     const int strideS = 1 << top;
+
+    // 在**选中的**索引列表上再抽稀，而不是在整个网格上按 1<<top 取模：
+    // 只在整个网格上取模时，一旦请求范围窄于粗层角度步长（例如 360° 模型要 ±2°），
+    // 可能一个粗层位姿都选不到。这里保证至少 2 个采样。
+    const int kA = (int)selA.size(), kS = (int)selS.size();
+    const int stepA = std::min(strideA, std::max(1, kA / 2));
+    const int stepS = std::min(strideS, std::max(1, kS / 2));
 
     // at the coarsest level a lower score must be accepted
     const double topTarget = std::max(0.10, fp.minScore * 0.55);
@@ -3103,9 +3226,9 @@ std::vector<MatchResult> ShapeMatcher::findShapeModel(const cv::Mat& gray, const
 
         // all (angle, scale) poses of the coarsest level
         std::vector<std::pair<int, int>> poses;
-        for (int si = 0; si < nS; si += strideS)
-            for (int ai = 0; ai < nA; ai += strideA)
-                poses.emplace_back(ai, si);
+        for (int js = 0; js < kS; js += stepS)
+            for (int ja = 0; ja < kA; ja += stepA)
+                poses.emplace_back(selA[ja], selS[js]);
 
         // 诊断探针（仅环境变量 SM_PROBE=1 时生效）：按角度打印粗层分数图的峰值
         // 及其位置，用来判断"正确的（大角度）位姿在粗层是否拿到了足够分数"。
@@ -3156,6 +3279,7 @@ std::vector<MatchResult> ShapeMatcher::findShapeModel(const cv::Mat& gray, const
             // which is not thread safe -> keep this one serial
             for (size_t p = 0; p < poses.size(); p++)
             {
+                if (tDeadline && cv::getTickCount() > tDeadline) { timedOut_ = true; break; }
                 const int ai = poses[p].first, si = poses[p].second;
                 int R = 0;
                 const XForm& xf = getXForm(top, ai, si);
@@ -3199,6 +3323,13 @@ std::vector<MatchResult> ShapeMatcher::findShapeModel(const cv::Mat& gray, const
                     double exMs = 0;
                     for (int i = r.start; i < r.end; i++)
                     {
+                        // 超时：整个进程共用一个截止时刻，任意 worker 发现超时就停
+                        if (tDeadline && cv::getTickCount() > tDeadline)
+                        {
+                            cv::AutoLock tl(mtx);
+                            timedOut_ = true;
+                            break;
+                        }
                         const int ai = poses[i].first, si = poses[i].second;
                         int R = 0;
                         // read only lookup: a worker thread must never insert
@@ -3253,6 +3384,11 @@ std::vector<MatchResult> ShapeMatcher::findShapeModel(const cv::Mat& gray, const
         if (fp.debug)
         {
             std::cout << "  [dbg] levels=" << nLevels << " top=" << top
+                      << " searchLevels=" << searchLevels
+                      << " poses=" << poses.size() << " (A " << selA.size() << "/" << nA
+                      << " x S " << selS.size() << "/" << nS << ")"
+                      << (subRange ? " [sub-range]" : "")
+                      << (timedOut_ ? " [TIMEOUT]" : "")
                       << " topTarget=" << topTarget
                       << " angles=" << nA << " scales=" << nS
                       << " dense=" << nDense
@@ -3331,8 +3467,9 @@ std::vector<MatchResult> ShapeMatcher::findShapeModel(const cv::Mat& gray, const
     const int maxKeep = std::max(fp.maxMatches * 3, 30);
     for (int l = top - 1; l >= 0; l--)
     {
+        if (tDeadline && cv::getTickCount() > tDeadline) { timedOut_ = true; break; }
         int64 tr0 = cv::getTickCount();
-        refineLevel(l, cands, maxKeep, fp.minScore, fp.metric);
+        refineLevel(l, cands, maxKeep, fp.minScore, fp.metric, tDeadline, &timedOut_);
         phRefine += msSince(tr0);
         if (fp.debug && !cands.empty())
         {
@@ -3708,7 +3845,10 @@ int ShapeMatcher::modelPointCount() const
 //  Layout (little endian, all fields written one by one so the file does
 //  not depend on struct padding):
 //    header   : magic 'SHM1' | uint32 version
-//    params   : MatchParams
+//    params   : MatchParams (numLevels, angle*, scale*, contrast*,
+//               maxPoints, minScore, maxMatches, minDistance, subpixel,
+//               minSide from version 4 on,
+//               optimization + contrastBands from version 5 on)
 //    modelGray0_
 //    levels   : uint32 nLevels, then per level
 //                 Size | Point2f center | int activePoints | uint32 n
@@ -3725,7 +3865,12 @@ int ShapeMatcher::modelPointCount() const
 namespace
 {
     const uint32_t SM_MAGIC   = 0x314D4853;   // 'SHM1'
-    const uint32_t SM_VERSION = 3;
+    // 4: MatchParams 末尾追加 minSide（金字塔最粗层最短边下限）。
+    //    读 v1..v3 的老模型时该字段回落 MatchParams 的默认 24 —— 正好是当时
+    //    硬编码的值，所以老模型的层数和行为都不变。
+    // 5: 追加 optimization（int32 编码）+ contrastBands（uint32 对数 + f64 对）。
+    //    读 v1..v4 时两者保持默认（空 = 历史行为）。
+    const uint32_t SM_VERSION = 5;
     const uint32_t SM_VERSION_MIN = 1;        // oldest layout we can read
 
     struct ByteWriter
@@ -3789,6 +3934,22 @@ std::vector<uchar> ShapeMatcher::serializeShapeModel() const
     w.i32(params_.maxMatches);
     w.f64(params_.minDistance);
     w.i32(params_.subpixel);
+    // version >= 4
+    w.i32(params_.minSide);
+    // version >= 5: optimization（0 = 空/none, 1 = auto, 2/3/4 = low/medium/high）
+    int opt = 0;
+    if      (params_.optimization == "auto")                  opt = 1;
+    else if (params_.optimization == "point_reduction_low")    opt = 2;
+    else if (params_.optimization == "point_reduction_medium") opt = 3;
+    else if (params_.optimization == "point_reduction_high")   opt = 4;
+    w.i32(opt);
+    // version >= 5: contrastBands
+    w.u32((uint32_t)(params_.contrastBands.size() / 2));
+    for (size_t i = 0; i + 1 < params_.contrastBands.size(); i += 2)
+    {
+        w.f64(params_.contrastBands[i]);
+        w.f64(params_.contrastBands[i + 1]);
+    }
 
     // ---- modelGray0_ (CV_8U, continuous) ----
     cv::Mat mg = modelGray0_.isContinuous() ? modelGray0_ : modelGray0_.clone();
@@ -3871,6 +4032,34 @@ bool ShapeMatcher::deserializeShapeModel(const std::vector<uchar>& data)
     r.i32(p.maxMatches);
     r.f64(p.minDistance);
     r.i32(p.subpixel);
+    // version >= 4; older models keep the default (24 = the value that used to
+    // be hard coded, so their level count stays exactly the same)
+    if (version >= 4) r.i32(p.minSide);
+    // version >= 5: optimization + contrastBands（老模型保持默认 = 历史行为）
+    if (version >= 5)
+    {
+        int opt = 0;
+        r.i32(opt);
+        switch (opt)
+        {
+            case 1: p.optimization = "auto"; break;
+            case 2: p.optimization = "point_reduction_low"; break;
+            case 3: p.optimization = "point_reduction_medium"; break;
+            case 4: p.optimization = "point_reduction_high"; break;
+            default: break;                 // 0 / 非法 -> 空
+        }
+        uint32_t nBands = 0;
+        r.u32(nBands);
+        if (nBands > 64) return false;      // 防损坏文件
+        p.contrastBands.resize((size_t)nBands * 2);
+        for (uint32_t i = 0; i < nBands; i++)
+        {
+            double a = 0, b = 0;
+            r.f64(a); r.f64(b);
+            p.contrastBands[(size_t)i * 2]     = a;
+            p.contrastBands[(size_t)i * 2 + 1] = b;
+        }
+    }
 
     int rows = 0, cols = 0, type = 0;
     r.i32(rows); r.i32(cols); r.i32(type);

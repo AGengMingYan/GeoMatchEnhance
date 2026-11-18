@@ -83,6 +83,8 @@ namespace
             "     -max N          default 1                           (num_matches)\n"
             "     -overlap F      default 0.5                         (max_overlap)\n"
             "     -subpix 0|1     default 1                           (sub_pixel)\n"
+            "     -find-angle DEG / -find-angle-extent DEG           search-time angle sub-range\n"
+            "     -timeout MS     abort after MS, return what was found\n"
             "     -levels N       search from this level, 0 = all     (num_levels)\n"
             "\n"
             "search a whole directory:\n"
@@ -191,6 +193,14 @@ int main(int argc, char** argv)
     fp.subpixel   = (int)argD(a, "-subpix", 1);
     fp.numLevels  = (int)argD(a, "-levels", 0);
     fp.debug      = (int)argD(a, "-debug", 0);
+    // 搜索期角度子范围（Halcon find_ncc_model 的 AngleStart/AngleExtent）。
+    // 只在给出时才覆盖，未给出就是"用模型自己的整个角度范围"。
+    if (has(a, "-find-angle"))
+        fp.angleStart = argD(a, "-find-angle", 0.0) * CV_PI / 180.0;
+    if (has(a, "-find-angle-extent"))
+        fp.angleExtent = argD(a, "-find-angle-extent", 0.0) * CV_PI / 180.0;
+    // 超时（毫秒），0 = 不限
+    if (has(a, "-timeout")) fp.timeoutMs = (int)argD(a, "-timeout", 0);
 
     const std::string one    = arg(a, "-s", "");
     const std::string dir    = arg(a, "-d", "case1");

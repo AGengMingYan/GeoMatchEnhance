@@ -129,6 +129,7 @@ struct NccMatcher::Impl
     mutable std::unordered_map<uint64_t, RotTpl> rotCache;
     size_t   rotCacheLimit = 256;
     mutable int rotCacheHits = 0, rotCacheMiss = 0;
+    mutable bool timedOut = false;      // NccFindParams::timeoutMs 触发的提前结束
 };
 
 namespace
@@ -801,6 +802,13 @@ std::vector<NccResult> NccMatcher::findNccModel(const cv::Mat& gray, const NccFi
     const int64 t1 = cv::getTickCount();
     double tCoarse = 0, tRefine = 0, tSub = 0;      // per-stage split, for fp.debug
 
+    // 超时（Halcon set_ncc_model_param('timeout') 语义）：超时返回已找到的结果。
+    im.timedOut = false;
+    const int64 tDeadline = (fp.timeoutMs > 0)
+        ? (cv::getTickCount() + (int64)((double)fp.timeoutMs * cv::getTickFrequency() / 1000.0))
+        : 0;
+    cv::Mutex tmtx;                 // 只用于 timedOut 的并发置位
+
     //---- coarse scan, with a fallback to a finer level ----
     //
     // The coarsest level can be unusable without looking broken: for a 154x148
@@ -875,12 +883,59 @@ std::vector<NccResult> NccMatcher::findNccModel(const cv::Mat& gray, const NccFi
         const int nAng = (int)ld.angles.size();
         std::vector<AngleOut> outs((size_t)nAng);
 
+        // 搜索期角度子范围（Halcon find_ncc_model 的 AngleStart/AngleExtent）。
+        // 只筛"用哪些角度粗扫"，位姿仍取自模型网格，不会产生新位姿。
+        //
+        // 注意本层角度步长是 angleStep*2^level（3 层时 16°），请求范围可能比它
+        // 还窄，此时网格上一个点都落不进来。退回"全部角度"会让窄范围反而变慢
+        // （实测 extent=4° -> 23 个角度、coarse 3.36 ms；extent=20° -> 1 个角度、
+        // 0.93 ms）。正确做法是取**离请求范围中心最近的那个粗角度**：粗层本就
+        // 允许 ±1 个粗步长的误差，refine 的 ±2 步窗口能把它收敛回来。
+        std::vector<char> angSel((size_t)nAng, 1);
+        if (fp.angleExtent > 0.0)
+        {
+            const double qs = fp.angleStart;
+            const double qe = std::min(fp.angleExtent, 2 * kPi);
+            int hit = 0, nearest = 0;
+            double nearestD = 1e30;
+            const double qc = qs + qe * 0.5;          // 请求范围中心
+            for (int ai = 0; ai < nAng; ai++)
+            {
+                const double a = ld.angles[(size_t)ai];
+                double d = std::fmod(a - qs, 2 * kPi);
+                if (d < 0) d += 2 * kPi;
+                if (d <= qe + 1e-9) { angSel[(size_t)ai] = 1; hit++; }
+                else                 angSel[(size_t)ai] = 0;
+
+                double dc = std::fmod(a - qc, 2 * kPi);   // 到范围中心的距离
+                if (dc > kPi) dc = 2 * kPi - dc;
+                if (dc < nearestD) { nearestD = dc; nearest = ai; }
+            }
+            if (hit == 0)
+            {
+                angSel[(size_t)nearest] = 1;
+                if (fp.debug >= 1)
+                    std::printf("[ncc] angle range %.1f..%.1f deg is narrower than this "
+                                "level's %.1f deg step: scanning the nearest coarse angle "
+                                "%.1f deg (refine recovers the rest)\n",
+                                qs * 180 / kPi, (qs + qe) * 180 / kPi,
+                                ld.angleStep * 180 / kPi, ld.angles[(size_t)nearest] * 180 / kPi);
+            }
+        }
+
         cv::parallel_for_(cv::Range(0, nAng), [&](const cv::Range& rng)
         {
             cv::Mat map;
             for (int ai = rng.start; ai < rng.end; ai++)
             {
                 AngleOut& ao = outs[(size_t)ai];
+                if (!angSel[(size_t)ai]) continue;
+                if (tDeadline && cv::getTickCount() > tDeadline)
+                {
+                    cv::AutoLock tl(tmtx);
+                    im.timedOut = true;
+                    break;
+                }
                 scoreMapFor(ld, fpy[ct], two, ld.angles[ai], map);
                 applyMetric(map, params_.metric);
                 if (map.empty()) continue;
@@ -1002,6 +1057,7 @@ std::vector<NccResult> NccMatcher::findNccModel(const cv::Mat& gray, const NccFi
     {
         const LevelData& ld = im.levels[l];
         if (!usable[l] || cands.empty()) continue;
+        if (tDeadline && cv::getTickCount() > tDeadline) { im.timedOut = true; break; }
 
         const int nA = (int)ld.angles.size();
         if (nA <= 0) continue;
@@ -1404,6 +1460,7 @@ int NccMatcher::modelPixelCount() const
 }
 
 double NccMatcher::angleStep() const { return created_ ? impl_->angleStep0 : 0.0; }
+bool   NccMatcher::lastSearchTimedOut() const { return impl_->timedOut; }
 
 int NccMatcher::angleCount() const
 {

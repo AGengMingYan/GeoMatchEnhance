@@ -19,6 +19,13 @@
 //                 [-gentest N]                 synthetic angle/scale test
 //                 [-selftest 1]                pose round trip check
 //                 [-loops N] [-nodraw] [-show] [-debug 1]  (2 = phase timing)
+//                 [-min-side N]   create: coarsest pyramid short side (default 24)
+//                 [-find-levels N] search: how many model levels to use (0 = all)
+//                 [-find-angle DEG] [-find-angle-extent DEG]  search-time angle sub-range
+//                 [-find-smin X] [-find-smax X]              search-time scale sub-range
+//                 [-timeout MS]    search: abort after MS, return what was found
+//                 [-optimization S] create: Halcon Optimization (mapped to maxPoints)
+//                 [-bands "lo1,hi1,.."] create: multi-band Contrast
 //***********************************************************************
 #define _CRT_SECURE_NO_WARNINGS
 #include <iostream>
@@ -92,6 +99,34 @@ namespace
                   << "  " << std::setw(8) << s.sum << "\n";
     }
 
+    // "lo1,hi1,lo2,hi2" -> 多段幅值区间（Halcon Contrast 的元组语义）。
+    // 元素个数不足一对时清空（= 用单段滞后阈值）；奇数个时丢掉最后一个。
+    void parseBands(const std::string& s, std::vector<double>& out)
+    {
+        out.clear();
+        const char* p = s.c_str();
+        while (*p)
+        {
+            while (*p == ',' || *p == ' ' || *p == ';') p++;
+            if (!*p) break;
+            char* end = nullptr;
+            const double v = std::strtod(p, &end);
+            if (end == p) break;                     // 解析不动就停，避免死循环
+            out.push_back(v);
+            p = end;
+        }
+        if (out.size() < 2)
+        {
+            std::cerr << "[warn] -bands needs at least one lo,hi pair; ignored\n";
+            out.clear();
+        }
+        else if (out.size() % 2)
+        {
+            std::cerr << "[warn] -bands has an odd value count; the last one is ignored\n";
+            out.pop_back();
+        }
+    }
+
     // angle / scale range of the model, shared by t1 and main()
     void applyModelRange(Config& cfg, const std::vector<std::string>& a)
     {
@@ -120,6 +155,11 @@ namespace
         cfg.maxPoints   = (int)gArgD(a, "-points", 1200.0);
         cfg.minChainLen = (int)gArgD(a, "-chain", 2.0);
         if (gHas(a, "-levels")) cfg.numLevels = (int)gArgD(a, "-levels", 0);
+        if (gHas(a, "-min-side")) cfg.minSide = (int)gArgD(a, "-min-side", cfg.minSide);
+        // Halcon create_shape_model 的 Optimization（映射到 maxPoints）
+        if (gHas(a, "-optimization")) cfg.optimization = gArg(a, "-optimization", cfg.optimization);
+        // Halcon Contrast 的多段幅值区间
+        if (gHas(a, "-bands")) parseBands(gArg(a, "-bands", ""), cfg.contrastBands);
         applyModelRange(cfg, a);
 
         const std::string maskFile = gArg(a, "-mask", "");
@@ -237,6 +277,8 @@ namespace
         cfg.metric     = (int)gArgD(a, "-metric", 0);
         cfg.maxOverlap = gArgD(a, "-max-overlap", 1.0);
         cfg.subpixel   = (int)gArgD(a, "-subpix", 1);
+        // 搜索层数（Halcon find_shape_model 的 NumLevels）：0 = 模型的全部层
+        if (gHas(a, "-find-levels")) cfg.findLevels = (int)gArgD(a, "-find-levels", cfg.findLevels);
         cfg.boxMode    = (int)gArgD(a, "-box", 0);
         cfg.showContour   = !gFlag(a, "-no-contour");
         cfg.showPoints    = gFlag(a, "-show-points");
@@ -329,6 +371,27 @@ int main(int argc, char** argv)
     cfg.maxMatches  = (int)gArgD(args, "-max", 12);
     cfg.minContrast = gArgD(args, "-contrast", 12.0);
     cfg.contrast    = gArgD(args, "-hi", 30.0);
+    // 建模参数在主路径上原来完全不解析（-points / -chain / -levels 只对 -t1
+    // 生效），于是 `GeoMatchDemo -points 4000` 静默无效、拿不到 A/B 结论。
+    // 这里补上，且只在显式给出时覆盖（默认值只应有一处定义 = Config）。
+    if (gHas(args, "-points"))  cfg.maxPoints   = (int)gArgD(args, "-points", cfg.maxPoints);
+    if (gHas(args, "-chain"))   cfg.minChainLen = (int)gArgD(args, "-chain", cfg.minChainLen);
+    if (gHas(args, "-levels"))  cfg.numLevels   = (int)gArgD(args, "-levels", cfg.numLevels);
+    if (gHas(args, "-min-side")) cfg.minSide    = (int)gArgD(args, "-min-side", cfg.minSide);
+    // 搜索层数（Halcon find_shape_model 的 NumLevels），不需要重建模型
+    if (gHas(args, "-find-levels")) cfg.findLevels = (int)gArgD(args, "-find-levels", cfg.findLevels);
+    // 搜索期角度/尺度子范围（Halcon find_shape_model / find_scaled_shape_model
+    // 的 AngleStart/AngleExtent/ScaleMin/ScaleMax）：可以对 -load 的模型用，不必重建。
+    if (gHas(args, "-find-angle"))        cfg.findAngleStartDeg  = (float)gArgD(args, "-find-angle", cfg.findAngleStartDeg);
+    if (gHas(args, "-find-angle-extent")) cfg.findAngleExtentDeg = (float)gArgD(args, "-find-angle-extent", cfg.findAngleExtentDeg);
+    if (gHas(args, "-find-smin"))         cfg.findScaleMin       = (float)gArgD(args, "-find-smin", cfg.findScaleMin);
+    if (gHas(args, "-find-smax"))         cfg.findScaleMax       = (float)gArgD(args, "-find-smax", cfg.findScaleMax);
+    // 超时（毫秒，0 = 不限）：Halcon set_shape_model_param('timeout')
+    if (gHas(args, "-timeout")) cfg.timeoutMs = (int)gArgD(args, "-timeout", cfg.timeoutMs);
+    // Halcon create_shape_model 的 Optimization（映射到 maxPoints，见 MatchParams）
+    if (gHas(args, "-optimization")) cfg.optimization = gArg(args, "-optimization", cfg.optimization);
+    // Halcon Contrast 的多段幅值区间：-bands "lo1,hi1,lo2,hi2"（内部 Sobel 幅值 = 灰度差x4）
+    if (gHas(args, "-bands")) parseBands(gArg(args, "-bands", ""), cfg.contrastBands);
     cfg.useOpenCL   = (int)gArgD(args, "-ocl", 1) != 0;
     cfg.debug       = (int)gArgD(args, "-debug", 0);
     cfg.scoreMode   = (int)gArgD(args, "-score-mode", 0);
@@ -431,6 +494,15 @@ int main(int argc, char** argv)
         merged.metric      = cfg.metric;
         merged.maxOverlap  = cfg.maxOverlap;
         merged.subpixel    = cfg.subpixel;
+        // 搜索层数（-find-levels）不依赖模型的建层，加载后照样能改
+        merged.findLevels  = cfg.findLevels;
+        // 搜索期角度/尺度子范围 + 超时：都是**搜索期**参数，-load 后同样有效
+        // （这正是对 Halcon find_shape_model 语义的补齐）
+        merged.findAngleStartDeg  = cfg.findAngleStartDeg;
+        merged.findAngleExtentDeg = cfg.findAngleExtentDeg;
+        merged.findScaleMin       = cfg.findScaleMin;
+        merged.findScaleMax       = cfg.findScaleMax;
+        merged.timeoutMs          = cfg.timeoutMs;
         merged.boxMode     = cfg.boxMode;
         merged.showContour   = cfg.showContour;
         merged.showPoints    = cfg.showPoints;
@@ -446,13 +518,16 @@ int main(int argc, char** argv)
         matcher.setConfig(merged);
 
         // The angle/scale grids are fixed when the model is created, so asking
-        // for a different range after -load cannot take effect.  Say so instead
-        // of silently searching the model's own range.
+        // for a different range after -load cannot change the MODEL.  Since
+        // 2026-11-18 there is a search-time sub-range (-find-angle /
+        // -find-angle-extent / -find-smin / -find-smax) that works on a loaded
+        // model, which is what Halcon's find_shape_model does.
         if (gHas(args, "-angle") || gHas(args, "-smin") || gHas(args, "-smax"))
         {
-            std::cerr << "[warn] -angle / -smin / -smax do not apply to a loaded model "
-                         "(the angle and scale grids are built when the model is created). "
-                         "Rebuild it with -t1 and the range you need.\n"
+            std::cerr << "[warn] -angle / -smin / -smax only apply when CREATING a model; "
+                         "they cannot change a loaded model (its angle/scale grids are fixed).\n"
+                         "       To narrow the range at SEARCH time use -find-angle / "
+                         "-find-angle-extent / -find-smin / -find-smax (no rebuild needed).\n"
                       << "       model currently searches angle "
                       << (int)(modelCfg.angleStart * 180 / CV_PI) << ".."
                       << (int)((modelCfg.angleStart + modelCfg.angleExtent) * 180 / CV_PI)
@@ -582,7 +657,8 @@ int main(int argc, char** argv)
                       << "   preprocess = " << std::fixed << std::setprecision(1)
                       << p.preprocessMs << " ms"
                       << "   search = " << p.searchMs << " ms"
-                      << "   total = " << p.preprocessMs + p.searchMs << " ms\n";
+                      << "   total = " << p.preprocessMs + p.searchMs << " ms"
+                      << (p.timedOut ? "   [TIMEOUT: partial result]" : "") << "\n";
             if (p.detections)
                 for (size_t k = 0; k < p.detections->size(); k++)
                 {

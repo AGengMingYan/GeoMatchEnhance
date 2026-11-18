@@ -29,8 +29,8 @@
 //-----------------------------------------------------------------------
 #define GEOMATCH_VERSION_MAJOR 1
 #define GEOMATCH_VERSION_MINOR 2
-#define GEOMATCH_VERSION_PATCH 1
-#define GEOMATCH_VERSION_STRING "1.2.1"
+#define GEOMATCH_VERSION_PATCH 2
+#define GEOMATCH_VERSION_STRING "1.2.2"
 
 
 //-----------------------------------------------------------------------
@@ -76,6 +76,22 @@ struct Config
                                   // cap (every hysteresis pixel becomes a point),
                                   // which is what Halcon's create_shape_model does
     int    numLevels    = 0;      // 0 = auto
+    // 金字塔最粗一层的最短边下限（像素），决定模型能建多深（= 搜索最多能从
+    // 多粗的一层开始）。默认 24 是历史行为：101x102 模板给 3 层、顶层 26x26。
+    // 调到 12 会多一层（顶层 12x13），粗扫位置数 ÷4，实测 4096x4096 纯平
+    // 360° 从 53.8 ms 降到 12.0 ms。代价是弱/小目标更容易被粗层糊掉，
+    // 改小务必验召回。只在 CREATE 时生效，改了要重建模型。
+    int    minSide      = 24;
+    // Halcon create_shape_model 的 Optimization（'none' / 'auto' /
+    // 'point_reduction_low|medium|high'）。本库把它映射到点数预算 maxPoints
+    // （见 MatchParams::optimization），只为让 Halcon 配方能原样搬过来。
+    // 空（默认）= 不改 maxPoints。
+    std::string optimization = "";
+    // Halcon Contrast 的**多段幅值区间**：[lo1,hi1,lo2,hi2,...]（每两项一对，
+    // 单位同 contrast/minContrast 的内部 Sobel 幅值，即界面灰度差 x4）。
+    // 空（默认）= 用 contrast/minContrast 的单段滞后阈值。
+    // 非空 = 种子和连接都要求幅值落在任意一段 [lo,hi] 内。
+    std::vector<double> contrastBands;
     cv::Mat mask;                 // CV_8U, non-zero = region that may contribute edge points
     // Drop edge chains shorter than this (pixels).  Halcon's create_shape_model
     // has NO such parameter -- it has no point budget at all, so the fragmented
@@ -110,6 +126,26 @@ struct Config
     int    minChainLen = 2;
 
     // ---- search ----
+    // Halcon 的 find_shape_model(..., NumLevels, ...)：搜索最多用模型的多少层，
+    // 从最细的一层往粗数。0（默认）= 用模型的全部层，即历史行为。
+    //   * 调小 → 从更细的层开始：位置数变多、更慢，弱/小目标不容易被粗层糊掉。
+    //   * 上限是模型层数（由 Config::minSide 决定），再大也只会被截断。
+    // 与 Config::numLevels（建模层数）不同：这个**不需要重建模型**。
+    int    findLevels   = 0;
+
+    // ---- Halcon find_shape_model 的搜索期角度/尺度子范围 ----
+    // Halcon 允许在**搜索时**再给一次 AngleStart/AngleExtent/ScaleMin/ScaleMax，
+    // 是建模范围的子集。我们原来没有，只能重建模型。
+    //   angleExtent <= 0（默认） -> 用模型自己的整个角度范围
+    //   angleExtent  > 0        -> 只搜 [angleStartDeg, angleStartDeg+angleExtentDeg]
+    //   findScaleMax <= 0（默认）-> 用模型自己的整个尺度范围
+    // 位姿集合是模型网格的子集（不会产生新位姿），但结果列表可能变。
+    float  findAngleStartDeg  = 0.f;
+    float  findAngleExtentDeg = 0.f;   // 0 = 用模型的全部角度
+    float  findScaleMin       = 0.f;   // 0 = 用模型的全部尺度
+    float  findScaleMax       = 0.f;
+    // 超时（毫秒），0 = 不限。超时返回已找到的结果，见 Matcher::lastSearchTimedOut()。
+    int    timeoutMs          = 0;
     // 0.7: 默认评分阈值。默认 scoreMode 是 0（mean，Halcon 语义），同一位姿的
     // 分数比旧 positive-mean 低约 0.10。追召回可手动调低，但建议配合 minCoverage
     // / scoreMode 抑制误检；Raise it/lower it once you have measured your data.
@@ -243,6 +279,7 @@ struct BatchProgress
     size_t      index = 0, total = 0;
     int         matches = 0;
     double      preprocessMs = 0, searchMs = 0, readMs = 0, drawMs = 0;
+    bool        timedOut = false;      // Config::timeoutMs 触发的提前结束
     const std::vector<Detection>* detections = nullptr;
 };
 
@@ -290,6 +327,10 @@ public:
 
     // repeat the search n times and keep the timings of the last run
     std::vector<Detection> detectTimed(const cv::Mat& gray, int loops, Timing* timing = nullptr) const;
+
+    // true = 上一次 detect() 触发了 Config::timeoutMs，返回的是"到目前为止
+    // 找到的结果"，不完整（对齐 Halcon 的 set_shape_model_param('timeout')）。
+    bool lastSearchTimedOut() const;
 
     //---- pose & geometry (host / robot integration) ----------------------
     //

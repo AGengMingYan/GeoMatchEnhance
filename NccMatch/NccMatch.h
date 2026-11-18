@@ -88,6 +88,21 @@ struct NccFindParams
     // Halcon's NumLevels in find_ncc_model: coarsest level to start from,
     // 0 = use every level the model has.
     int    numLevels  = 0;
+
+    // ---- Halcon find_ncc_model 的搜索期角度子范围 ----
+    // Halcon 在搜索时再给一次 AngleStart/AngleExtent，可以是建模范围的子集。
+    //   angleExtent <= 0（默认）-> 用模型自己的整个角度范围（历史行为）
+    //   angleExtent  > 0        -> 只搜 [angleStart, angleStart+angleExtent]
+    //                              角度按 2*pi 取模，跨 ±pi 的区间也能表达
+    // 只筛粗扫用哪些角度，位姿仍取自模型的网格，不会产生新位姿。
+    double angleStart  = 0.0;
+    double angleExtent = -1.0;
+
+    // 超时（毫秒），0 = 不限（默认）。对齐 Halcon 的
+    // set_ncc_model_param('timeout', ...)：超时返回已找到的结果而不是报错，
+    // 由 lastSearchTimedOut() 告知调用方结果不完整。
+    int    timeoutMs  = 0;
+
     int    debug      = 0;
 };
 
@@ -172,6 +187,9 @@ public:
 
     double lastPreprocessTime() const;
     double lastSearchTime() const;
+    // true = 上一次 findNccModel() 因为 NccFindParams::timeoutMs 提前结束，
+    // 返回的结果不完整。
+    bool   lastSearchTimedOut() const;
 
 private:
     // reference point of a result, in template pixel coordinates:

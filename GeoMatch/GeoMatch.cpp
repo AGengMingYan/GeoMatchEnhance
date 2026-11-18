@@ -119,6 +119,9 @@ MatchParams Config::toMatchParams() const
     p.minContrast  = minContrast;
     p.maxPoints    = maxPoints;
     p.numLevels    = numLevels;
+    p.minSide      = minSide;
+    p.optimization = optimization;
+    p.contrastBands = contrastBands;
     p.mask         = mask;
     p.minChainLen  = minChainLen;
     return p;
@@ -140,6 +143,13 @@ FindParams Config::toFindParams() const
     p.minCoverage = minCoverage;
     p.skipWeight = skipWeight;
     p.cellMissMax = cellMissMax;
+    p.numLevels  = findLevels;
+    // 搜索期角度/尺度子范围（Halcon 语义）。0/-1 表示"用模型自己的范围"。
+    p.angleStart  = findAngleStartDeg * CV_PI / 180.0;
+    p.angleExtent = (findAngleExtentDeg > 0.f) ? (findAngleExtentDeg * CV_PI / 180.0) : -1.0;
+    p.scaleMin    = findScaleMin;
+    p.scaleMax    = findScaleMax;
+    p.timeoutMs   = timeoutMs;
     return p;
 }
 
@@ -171,6 +181,7 @@ bool Matcher::ready() const { return core_ && core_->isCreated(); }
 
 cv::Mat     Matcher::modelGray()       const { return ready() ? core_->getModelGray() : cv::Mat(); }
 int         Matcher::modelPointCount() const { return ready() ? core_->modelPointCount() : 0; }
+bool        Matcher::lastSearchTimedOut() const { return ready() ? core_->lastSearchTimedOut() : false; }
 int         Matcher::numLevels()       const { return ready() ? core_->numLevels() : 0; }
 cv::Point2f Matcher::modelCenter()     const { return ready() ? core_->modelCenter() : cv::Point2f(); }
 cv::Size    Matcher::modelSize()       const { return ready() ? core_->modelSize(0) : cv::Size(); }
@@ -207,6 +218,7 @@ bool Matcher::load(const std::string& file)
     cfg_.contrast    = p.contrast;      // lo/hi both come from the model
     cfg_.maxPoints   = p.maxPoints;
     cfg_.numLevels   = p.numLevels;
+    cfg_.minSide     = p.minSide;
     cfg_.minChainLen = p.minChainLen;
     modelLabel_ = file;
     return true;
@@ -774,6 +786,7 @@ BatchReport Matcher::runBatch(const std::vector<std::string>& files,
             pr.searchMs     = tm.searchMs;
             pr.readMs       = readMs;
             pr.drawMs       = drawMs;
+            pr.timedOut     = lastSearchTimedOut();
             pr.detections   = &rep.detections.back();
             onImage(pr);
         }

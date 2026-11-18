@@ -443,6 +443,19 @@ struct App
     bool  autoHi         = true;       // 高阈值跟随低阈值(见 hiFor())
     int   maxPoints      = 1200;
     int   numLevels      = 0;          // 0 = 自动
+    // 金字塔最粗层最短边下限（库的 MatchParams::minSide）。默认 24 = 历史行为。
+    // 调小能多建一层：粗扫位置数 ÷4、角度数 ÷2，大图能快数倍。
+    // 经验规则：想要 N 层需 minSide <= 模板短边 / 2^(N-1)。
+    // 代价是弱/小目标更容易被粗层糊掉，改小要验召回。
+    int   minSide        = 24;
+    int   findLevels     = 0;          // 搜索用几层(库的 FindParams::numLevels)，0 = 全部
+    // 搜索期角度子范围（Halcon find_shape_model 的 AngleStart/AngleExtent）。
+    // 0 = 用模型的全部角度；可以对已建的模型直接用，不需要重建。
+    float findAngleStartDeg  = 0.f;
+    float findAngleExtentDeg = 0.f;
+    // 搜索超时（毫秒），0 = 不限。超时返回已找到的结果并在日志里标注。
+    int   timeoutMs      = 0;
+
     float minScore       = 0.70f;       // 默认评分方式是 mean(与 Halcon 一致)。
                                         // 滑块可在 0.05~1.00 间调整；追召回时调低，
                                         // 并配合最小覆盖率 / 评分方式抑制误检。
@@ -495,7 +508,12 @@ struct App
     float nccAngleStartDeg  = -180.f;
     float nccAngleExtentDeg = 360.f;
     float nccAngleStepDeg   = 0.f;     // 0 = 自动(1 度)
-    int   nccModelLevels    = 0;       // 0 = 自动
+    int   nccModelLevels    = 0;       // 建模层数, 0 = 自动
+    int   nccFindLevels     = 0;       // 搜索层数, 0 = 用模型的全部层 (NccFindParams::numLevels)
+    // 搜索期角度子范围（Halcon find_ncc_model 的 AngleStart/AngleExtent）
+    float nccFindAngleStartDeg  = 0.f;
+    float nccFindAngleExtentDeg = 0.f;  // 0 = 用模型的全部角度
+
     int   nccMetric         = 0;       // 0 = use_polarity, 1 = ignore_global_polarity
 
     //---- NCC 搜索参数 ----
@@ -594,6 +612,7 @@ struct App
         c.contrast     = contrast    * kSobelPerGray;
         c.maxPoints    = maxPoints;
         c.numLevels    = numLevels;
+        c.minSide      = minSide;
         c.mask         = mask;
         c.minScore     = minScore;
         c.maxMatches   = maxMatches;
@@ -608,6 +627,11 @@ struct App
         c.minCoverage  = minCoverage;
         c.skipWeight   = skipWeight;
         c.cellMissMax  = cellMissMax;
+        c.findLevels   = findLevels;
+        // 搜索期角度子范围 + 超时：都是搜索参数，不需要重建模型
+        c.findAngleStartDeg  = findAngleStartDeg;
+        c.findAngleExtentDeg = findAngleExtentDeg;
+        c.timeoutMs          = timeoutMs;
         c.boxMode      = boxMode;
         c.showContour    = showContour;
         c.showPoints     = showPoints;
@@ -627,6 +651,7 @@ struct App
         contrast    = (float)(c.contrast    / kSobelPerGray);
         maxPoints   = c.maxPoints;
         numLevels   = c.numLevels;
+        minSide     = c.minSide;
         minScore    = (float)c.minScore;
         maxMatches  = c.maxMatches;
         minDistance = (float)c.minDistance;
@@ -638,8 +663,8 @@ struct App
         minCoverage = c.minCoverage;
         skipWeight  = c.skipWeight;
         cellMissMax = c.cellMissMax;
-        // boxMode 只影响画出来的样子，不写进模型文件；加载模型时保留界面上
-        // 当前的选择，不要被 Matcher::load() 重置出来的默认值覆盖。
+        // findLevels（搜索层数）/ timeoutMs / 搜索角度范围 只影响搜索，不写进模型文件；
+        // 加载模型时保留界面上当前的选择，不要被 Matcher::load() 的默认值覆盖。
     }
 };
 
@@ -968,13 +993,18 @@ static void runNccMatch(App& a, int loops)
     fp.maxMatches = a.nccMaxMatches;
     fp.maxOverlap = a.nccMaxOverlap;
     fp.subpixel   = a.nccSubpixel;
-    fp.numLevels  = 0;              // 0 = 用模型自己的层数
+    fp.numLevels  = a.nccFindLevels;   // 0 = 用模型自己的层数；>0 = 从该层开始粗扫
+    // 搜索期角度子范围（不重建模型）
+    fp.angleStart  = (double)a.nccFindAngleStartDeg * CV_PI / 180.0;
+    fp.angleExtent = (a.nccFindAngleExtentDeg > 0.f)
+                     ? (double)a.nccFindAngleExtentDeg * CV_PI / 180.0 : -1.0;
 
     // 复现留痕: 原图只在换图时落盘一次，参数/结果每次都记
     if (a.tgtPath != g_reproTarget) { g_reproTarget = a.tgtPath; reproSave("target.jpg", a.tgtGray); }
     logf("NCC 搜索参数: 最小分数 %.2f 最大匹配 %d 最大重叠 %.2f 亚像素 %d Metric %d "
-         "角度 %.1f..%.1f 次数 %d 目标=%s",
+         "搜索层数 %d 角度 %.1f..%.1f 次数 %d 目标=%s",
          a.nccMinScore, a.nccMaxMatches, a.nccMaxOverlap, a.nccSubpixel, a.nccMetric,
+         a.nccFindLevels,
          a.nccAngleStartDeg, a.nccAngleStartDeg + a.nccAngleExtentDeg, loops, a.tgtPath.c_str());
 
     const int loopsUsed = std::max(1, loops);
@@ -1851,12 +1881,13 @@ static void drawPanel()
     //---- NCC 模式: 只有旋转/极性，没有梯度提取参数 ----
     if (a.matchMode == 1)
     {
-        if (group("NCC 模型参数: 旋转与极性", true))
+        if (group("NCC 模型参数: 旋转 / 极性 / 层数", true))
         {
             changedModel |= sliderF("起始角(度)",  &a.nccAngleStartDeg,  -180.f, 180.f, "%.0f", commitModel);
             changedModel |= sliderF("角度范围(度)", &a.nccAngleExtentDeg,   0.f, 360.f, "%.0f", commitModel);
             changedModel |= sliderF("角度步长(度, 0=自动)", &a.nccAngleStepDeg, 0.f, 5.f, "%.2f", commitModel);
-            changedModel |= sliderI("金字塔层数(0=自动)", &a.nccModelLevels, 0, 8, commitModel);
+            // 这是**建模**层数（模型能建多深）；搜索用几层在「③ 搜索参数 → 搜索层数」里。
+            changedModel |= sliderI("建模层数上限(0=自动)", &a.nccModelLevels, 0, 8, commitModel);
             {
                 const char* items[] = { "use_polarity (要求明暗一致)",
                                         "ignore_global_polarity (允许整体反相)" };
@@ -1868,7 +1899,8 @@ static void drawPanel()
                 }
             }
             textDimWrapped("NCC 只搜索旋转、不搜索尺度，所以这里没有缩放参数。"
-                           "角度范围 360 度时画布要放大到对角线(搜索变慢)，已知角度就收窄。");
+                           "角度范围 360 度时画布要放大到对角线(搜索变慢)，已知角度就收窄。"
+                           "「建模层数上限」决定模型能建多深；实际搜索用几层在「③ 搜索参数」里调。");
             endGroup();
         }
 
@@ -1915,7 +1947,20 @@ static void drawPanel()
         }
 
         changedModel |= sliderI("最大点数(0=不限)", &a.maxPoints, 0, 4000, commitModel);
-        changedModel |= sliderI("金字塔层数(0=自动)", &a.numLevels, 0, 8, commitModel);
+        textDimWrapped("低阈值决定\"哪些边弱到可以放弃\"，高阈值是滞后起点，两者之间相连的弱边会被保住。"
+                       "低阈值拉大 = 从弱边开始逐圈啃掉特征(类似腐蚀)；拉到 255 特征全消失。");
+        endGroup();
+    }
+
+    //---- 金字塔结构：只决定"建几层/最粗一层多粗"，与上面选哪些边无关。
+    //     原来混在「特征提取」里，容易让人以为它影响边的选取。
+    //     注意这里**没有**“搜索层数”—— 那个是搜索参数，在「③ 搜索参数」里。
+    if (group("模板参数: 金字塔结构 (建几层 / 多粗)", false))
+    {
+        changedModel |= sliderI("层数上限(0=自动)", &a.numLevels, 0, 8, commitModel);
+        // 最粗层最短边：调小 = 多建一层 = 粗扫位置数 ÷4，大图能快数倍。
+        // 只在建模时生效，所以走 commitModel（改了要重建模型）。
+        changedModel |= sliderI("最粗层最短边(px)", &a.minSide, 8, 64, commitModel);
         if (a.numLevels == 1)
         {
             // 1 层 = 放弃由粗到精，粗扫描直接跑在全分辨率上(实测慢 130 倍)，
@@ -1923,8 +1968,11 @@ static void drawPanel()
             textWarnWrapped("层数 = 1 会退化成全分辨率暴力搜索，比 3 层慢约 130 倍，"
                             "而且匹配结果完全相同(最终精度始终在 level 0 上算)。建议改回 0(自动)。");
         }
-        textDimWrapped("低阈值决定\"哪些边弱到可以放弃\"，高阈值是滞后起点，两者之间相连的弱边会被保住。"
-                       "低阈值拉大 = 从弱边开始逐圈啃掉特征(类似腐蚀)；拉到 255 特征全消失。");
+        textDimWrapped("最粗层最短边调小 = 多建一层：粗扫位置数 ÷4、角度数 ÷2，大图能快数倍。"
+                       "经验规则：想要 N 层需「最短边 <= 模板短边 / 2^(N-1)」"
+                       "(110px 模板要 <=13、101px 要 <=12 才多一层)。"
+                       "代价是弱/小目标更容易被粗层糊掉，改小务必验召回。"
+                       "实测 qfn1(2048x2448/360°/101px)：24 -> 49 ms，12 -> 9 ms。");
         endGroup();
     }
 
@@ -2220,7 +2268,7 @@ static void drawPanel()
         {
             changedSearch |= sliderF("最小分数", &a.nccMinScore, 0.05f, 1.00f, "%.2f", commitSearch);
             textDimWrapped("NCC 分数范围 [-1, 1]：0.5 左右算「较像」，0.8 以上基本确定。"
-                           "实例数 / 最大重叠 / 亚像素 在「③ 搜索参数」里。");
+                           "实例数 / 最大重叠 / 亚像素 / 搜索层数 在「③ 搜索参数」里。");
             endGroup();
         }
         return;         // 覆盖率、评分方式、极性都是形状匹配专有
@@ -2270,6 +2318,8 @@ static void drawPanel()
             textWarnWrapped("「忽略逐点极性」走标量扫描，比默认慢数倍；只在确实有局部反光时用。");
         else if (a.metric == 1)
             textDimWrapped("「忽略整体反转」把两遍扫描取较大值，耗时约为默认的 2 倍。");
+        textDimWrapped("注意：Shape 的极性是「搜索参数」（在这里调，同一个模型可随时切换）；"
+                       "NCC 的极性是「建模参数」（在② 模板参数里，改了要重建模型）。");
         if (a.minCoverage > 0.f)
             textDimWrapped("0 = 关闭。覆盖率 = 模型点里梯度方向一致的占比，结果表\"覆盖\"列就是它。"
                            "调低最小分数后冒出来的相似结构通常能拿高分，但只对上模型的一部分，覆盖率明显偏低。"
@@ -2302,6 +2352,12 @@ static void drawPanel()
         {
             changedSearch |= sliderI("最大匹配数", &a.nccMaxMatches, 1, 64, commitSearch);
             changedSearch |= sliderF("最大重叠", &a.nccMaxOverlap, 0.f, 1.f, "%.2f", commitSearch);
+            // Halcon find_ncc_model 的 NumLevels：搜索从模型的哪一层开始，0 = 全部层。
+            // 与上面「NCC 模型参数」里的建模层数是两件事，改了不需要重建模型。
+            changedSearch |= sliderI("搜索层数(0=全部)", &a.nccFindLevels, 0, 8, commitSearch);
+            // 搜索期角度子范围（Halcon find_ncc_model 的 AngleStart/AngleExtent）
+            changedSearch |= sliderF("搜索角度起点(度)", &a.nccFindAngleStartDeg, -180.f, 180.f, "%.0f", commitSearch);
+            changedSearch |= sliderF("搜索角度范围(0=全部)", &a.nccFindAngleExtentDeg, 0.f, 360.f, "%.0f", commitSearch);
             {
                 const char* items[] = { "关闭", "插值(默认，抛物线)" };
                 itemWidthForLabel("亚像素");
@@ -2318,15 +2374,21 @@ static void drawPanel()
         return;         // NCC 模式不显示覆盖率/评分方式/贪婪度等形状匹配参数
     }
 
-    //---- 结果筛选 ----
+    //---- 结果筛选（只影响"报几个/怎么画"，不影响打分） ----
+    //     NCC 模式不进这个组：它自己的 drawResult 固定画框，boxMode 对它无效，
+    //     而实例数/重叠已经在上面「NCC 搜索参数」里了。
     if (group("结果筛选 (实例数 / 去重 / 框样式)", true))
     {
         changedSearch |= sliderI("最大匹配数", &a.maxMatches, 1, 64, commitSearch);
-        changedSearch |= sliderF("最小间距(px)", &a.minDistance, 0.f, 300.f, "%.0f", commitSearch);
+        // 最大重叠在前：它是推荐手段（与模板尺寸/缩放无关）；最小间距是旧口径，
+        // 只为兼容保留，两者取严。
         changedSearch |= sliderF("最大重叠(1=关闭)", &a.maxOverlap, 0.f, 1.f, "%.2f", commitSearch);
         if (a.maxOverlap < 0.999f)
             textDimWrapped("两个实例的模型框重叠超过该比例时只保留高分那个（按交集/较小框面积），"
                            "与模板尺寸和缩放无关，比「最小间距」更通用。");
+        changedSearch |= sliderF("最小间距(px)", &a.minDistance, 0.f, 300.f, "%.0f", commitSearch);
+        textDimWrapped("最小间距是旧口径（两个中心的最小像素距离），与模板尺寸有关、"
+                       "换模板就得重调；能用「最大重叠」就优先用那个。两项同时生效，取更严的那个。");
         {
             // 结果框样式只影响画出来的样子，不影响匹配结果
             const char* items[] = { "固定方框(水平，尺寸=模板x缩放)",
@@ -2339,14 +2401,45 @@ static void drawPanel()
                 commitSearch  = true;
             }
         }
-        textDimWrapped("多实例场景把最大匹配数调大；最小间距用来抑制相邻周期的重复检测。"
-                       "固定方框尺寸恒定、不随角度摇摆，多帧之间位置更好对比。");
+        textDimWrapped("多实例场景把最大匹配数调大；固定方框尺寸恒定、不随角度摇摆，"
+                       "多帧之间位置更好对比。（框样式只影响 Shape 绘制）");
         endGroup();
     }
 
-    //---- 性能与加速 ----
-    if (group("性能与加速", false))
+    //---- 速度与精度：全是**搜索时**生效的参数，不重建模型。
+    //     Halcon 的 find_shape_model 把这几项放在同一组签名里
+    //     (MinScore, NumMatches, MaxOverlap, SubPixel, NumLevels, Greediness)，
+    //     其中 MinScore/NumMatches/MaxOverlap 在最常调的地方，剩下三项在这里。
+    if (group("速度与精度 (搜索层数 / 贪婪度 / 亚像素)", false))
     {
+        // Halcon find_shape_model 的 NumLevels：搜索最多用模型几层（从最细层数起）。
+        // 纯速度/召回取舍，**不需要重建模型**。上限是模型的层数。
+        changedSearch |= sliderI("搜索层数(0=全部)", &a.findLevels, 0, 8, commitSearch);
+        // 搜索期角度子范围（Halcon find_shape_model 的 AngleStart/AngleExtent）：
+        // 对已建的模型直接用，不需要重建；范围 0 = 用模型的全部角度。
+        changedSearch |= sliderF("搜索角度起点(度)", &a.findAngleStartDeg, -180.f, 180.f, "%.0f", commitSearch);
+        changedSearch |= sliderF("搜索角度范围(0=全部)", &a.findAngleExtentDeg, 0.f, 360.f, "%.0f", commitSearch);
+        if (a.findAngleExtentDeg > 0.f)
+        {
+            char msg[240];
+            std::snprintf(msg, sizeof(msg),
+                          "只搜 %.0f..%.0f 度（模型范围不变，不用重建）：角度数按比例减少，"
+                          "这是 Halcon 在搜索时再给一次 AngleStart/AngleExtent 的做法。",
+                          a.findAngleStartDeg, a.findAngleStartDeg + a.findAngleExtentDeg);
+            textDimWrapped(msg);
+        }
+        // 超时（Halcon set_shape_model_param('timeout')）：超时返回已找到的结果
+        changedSearch |= sliderI("超时(ms, 0=不限)", &a.timeoutMs, 0, 2000, commitSearch);
+        if (a.findLevels > 0 && a.findLevels <= a.matcher.numLevels())
+        {
+            char msg[256];
+            std::snprintf(msg, sizeof(msg),
+                          "从模型的第 %d 层开始粗扫(模型共 %d 层)：每多一层位置数 ÷4、角度数 ÷2。"
+                          "调小 = 从更细的层开始，更慢但弱/小目标更稳。",
+                          a.findLevels, a.matcher.numLevels());
+            textDimWrapped(msg);
+        }
+
         changedSearch |= sliderF("贪婪度", &a.greediness, 0.3f, 1.f, "%.2f", commitSearch);
         {
             // 亚像素模式(Halcon 的 SubPixel)
@@ -2361,7 +2454,8 @@ static void drawPanel()
             }
         }
         textDimWrapped("贪婪度越大越快，但可能漏检。亚像素选「最小二乘」会在插值结果上再迭代"
-                       "拟合，边缘较软/低对比时位置更稳。");
+                       "拟合，边缘较软/低对比时位置更稳。搜索层数的上限由「② 模板参数 → 金字塔结构」"
+                       "决定（模型建了几层）。");
         if (ImGui::Checkbox("OpenCL", &a.useOpenCL))
         {
             changedSearch = true;
