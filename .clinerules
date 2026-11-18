@@ -594,6 +594,201 @@ python -c "import zipfile;z=zipfile.ZipFile('dl.zip1');print(z.testzip(), len(z.
 | `SM_PREP_SERIAL=1` | `gradientHalves` 退回串行（A/B 预处理并行收益） |
 | `SM_PREP_BAND=N` | 预处理行带高度，默认 32 行 |
 
+### 7.13 速度瓶颈的「量到哪里」清单（2026-11-18 复测，数据见 `_ai_tmp/perf_bottleneck_2026-11-18.md`）
+
+- **Shape qfn1**（2048×2448 / 360° / 102×102，44.9 ms search）：粗扫点积 ~30 ms（67%）、
+  extract 9.4 ms（21%）、merge 1.6、refine+subpixel 4.0；preprocess 2.7。线程扩展
+  1→229 ms、16→44.1（5.2×）、20→45.8（**16 线程就饱和**）。
+- **NCC qfn1** 285 ms：**每角度 2 次 `cv::filter2D` 占 90%**（微基准：`[I,I²]` 两通道 7.53 +
+  单通道 3.61，归一化 1.07，3×3 取峰 0.10，共 12.31 ms/角度 @level2 38×38 画布）。
+  线程扩展 1→1589、20→279（5.7×），与 Shape 同一个天花板。
+- **`cv::filter2D` 单次调用内部不并行**（同一调用 1 线程 12.65 vs 20 线程 12.31 ms）
+  ⇒ NCC 的并行粒度只能到「角度」；想再快必须减**每角度工作量**（积分图 / FFT / 角度步长）。
+- **线程数要随任务数封顶**：data1（±10°）粗层只有 **9 个 pose**，实测 8 线程 8.0 ms、
+  16 线程 8.2、20 线程 8.3 —— **小网格上加线程是负收益**。评估并行收益前先看 `poses` 数。
+- **SI/SI2 用积分图（矩形域）是 NCC 最大的一块未吃的回退**：`NccMatch.cpp` 已注释说明
+  「为了按旋转掩膜精确归一化」改成两个 filter2D，代价是粗扫 61% 的时间；
+  粗层只用于排名，改回矩形积分图 + refine 仍按掩膜精确重算，预计大图 -60%。
+- **`RotTpl::c0/c1/spanOk`（逐行有效区间）已经存在且 refine 在用（`scoreAtSpan`），
+  粗扫却没用** —— 改积分图时直接复用，不要重新造。
+
+### 7.13.1 「Halcon 靠边缘链反向查表才 8 ms」是**错的**（2026-11-18 实测推翻）
+
+旧说法（曾写在 `docs/与Halcon差距清单.md` §9.5.1）说 Halcon 按图像边缘点反向查表、
+代价 ∝ 边缘像素数。**实测证伪**，不要再用它解释大图差距，也不要据此设计新路径：
+
+| 实验（m3 101×102，360°） | 我们 | Halcon |
+|---|---|---|
+| 2048² 纯平 vs 8px 网格（≈200 万边缘） | 10.8 → 11.9 ms（1.10×） | 2.55 → 3.31 ms（1.30×） |
+| 纯平 512²/1024²/2048²/4096² | 1.0/3.8/10.4/**49.5** ms | 0.80/1.09/3.70/**9.22** ms |
+
+- 若代价 ∝ 边缘数，网格图应慢上千倍；实测只差 30%。
+- 4096² **零边缘**纯平仍要 9.22 ms ⇒ 它也在逐位置扫。
+- 1024²→4096²：面积 ×16、耗时 ×8.5 ⇒ **边际代价 ∝ 面积 = ∝ 位置数**。
+
+**真正的差异（按贡献排序）**：
+
+1. **搜索起始层**（第一因素）。Halcon `find_*_shape_model(..., NumLevels)` 可指定从哪层开始；
+   4096² 纯平实测 NumLevels=2/3/4/5 → **190.8 / 19.1 / 7.68 / 9.65 ms**（auto=4 → 10.3）。
+   每多一层 ≈ 4× 更少位置 × 2× 更少角度。
+   **我们被 `ShapeMatch.cpp:271` 的 `minSide = 24` 卡住**：m3 只能到 L2（26×26），
+   Halcon 能到 L3（13×13）。自证：同一顶层模板 26×26，m3(3 层,1024²)=53.8 ms vs
+   m1(4 层,512²)=**12.0 ms（4.5×）**；单位成本 0.83/0.68 ns per (位置×pose)。
+   套到 qfn1：**多一层 ≈ 10 ms ≈ Halcon 的 8.38 ms**。
+2. **在线判定 vs 物化 score map**。我们是「物化 float map + 第二遍 3×3 找峰」，
+   第二遍占 30%（4096² 纯平 53.8 → 37.7 ms，`SM_NO_EXTRACT=1` 差值）；Halcon 没有这一遍。
+3. **粗层点数预算**（未量化）。
+- **不要**再归因为 SIMD：Halcon 是 **x86 SSE2**，我们 x64 AVX2，同一顶层下仍被它快 2.8×。
+- 内容确实有影响但两边同量级（折算每 MP：Halcon ×3、我们 ×2.8），不是差距来源。
+- 改 `minSide` 需要验召回：层越深，弱目标越容易被粗层糊掉（`dataset/sample` 全量逐字符比对）。
+
+详见 `_ai_tmp/halcon_why_fast_2026-11-18.md`。
+
+### 7.13.2 已落地：`MatchParams::minSide` + `FindParams::numLevels`（2026-11-18）
+
+大图差距的第一因素（搜索起始层）已开放成两个参数，**双架构零回归**：
+
+| 参数 | 语义 | 默认 |
+|---|---|---|
+| `MatchParams::minSide` / CLI `-min-side` | 建模：金字塔最粗层最短边下限（原为硬编码 24） | 24 |
+| `FindParams::numLevels` / CLI `-find-levels` | 搜索：最多用模型几层（Halcon `NumLevels` 语义） | 0 = 全部 |
+
+**经验规则**：想要 N 层，需要 `minSide <= 模板短边 / 2^(N-1)`。
+所以「改小 minSide 却不快」通常是因为没跨过整除边界（例：110px 模板要 `minSide<=13`、
+101px 要 `<=12` 才多一层；`16` 对它们无效）。
+
+实测（x64，`-loops 5` 取最小）：
+
+| 场景 | 默认 24 | 更深 | 加速 |
+|---|---|---|---|
+| qfn1 2448×2048 / 360° / 101px | 48.0 ms | `-min-side 12` → **8.3 ms** | 5.8× |
+| case1 154px / 360° / 700×700 | 34.5 ms | `-min-side 16` → **10.9 ms** | 3.2× |
+| data2 110px / ±100° | 7.9 ms | `-min-side 12` → **2.6 ms** | 3.0× |
+| data1 140px / ±10° / 1280×1024 | 7.7 ms | `-min-side 16` → **4.8 ms** | 1.6× |
+
+`-find-levels`（4 层模型）2/3/4 → 450 / 44.9 / **8.3 ms**，**不需要重建模型**。
+
+**召回验证结论**：`minSide=16` 在 data1(6)/data2(11)/case1(7)/synth(64)/qfn1 上
+**逐字符零回归**；`minSide=12` 在 data2 丢 1 个 0.654 分（−91.7°）的弱目标。
+**默认保持 24，改小必须用现场图验召回。**
+
+**零回归验证方法（可复用）**：`git worktree add _ai_tmp/wt_old HEAD` →
+在 worktree 里编 x64+x86 → 用同一份 `_ai_tmp/baseline.ps1` 跑同一批图 →
+`python _ai_tmp/cmp_bl.py old.txt new.txt` 分段比对。
+看的是「新 vs 旧 / 同架构」，**不要**拿 x64 对 x86（case1/synth 本来就有 ±0.002 的
+浮点累加差异，是历史现象，不是回归）。
+脚本细节：`matches/search/total` 的毫秒数要正则替换掉再比，只比 `#n s= c= a= k= pos=`。
+
+### 7.13.3 Halcon 匹配 API 还剩哪些参数没对齐（2026-11-18 读头文件逐签名对照）
+
+详见 `_ai_tmp/halcon_api_gap_2026-11-18.md`。`HShapeModel.h` / `HNCCModel.h` 的签名是硬证据。
+
+**已对齐**：Shape 建模的 NumLevels/Angle*/Contrast/MinContrast、搜索的 MinScore/NumMatches(MaxOverlap)/
+Greediness/SubPixel/NumLevels；NCC 建模与搜索**全部参数**；序列化、`GetShapeModelContours`→`modelChains`、
+Origin、`Get*Params`→`params()`。
+
+**未对齐（按优先级）**：
+
+1. **P0 搜索期角度/尺度子范围**。Halcon `FindShapeModel(Image, AngleStart, AngleExtent, ...)` /
+   `FindScaledShapeModel(..., ScaleMin, ScaleMax, ...)` 在**搜索时**再给一次范围（可以是建模范围的子集）。
+   我们 `FindParams` 没有这些字段，`-load` + `-angle` 直接告警拒绝。
+   实测（同一个 360° 模型 + qfn1 5MP）：Halcon `-angle-extent` 360/20/2° → **4.93 / 2.68 / 1.65 ms**；
+   我们要重建模型：case1 360/90/20° → 12.9 / 7.3 / 6.7 ms。
+   **改法只 20 行**：`angleGrid_`/`scaleGrid_` 是「步长×索引」，把 `[start, start+extent]` 映射成索引子集。
+   精度上安全：**位姿集合是原集合的子集 ⇒ 不会凭空产生新位姿**；但**结果列表可能变**——
+   若同一物理目标在范围外还有一个近乎等分的角度位姿，NMS 的胜者会换（分数差通常 <0.01）。
+   所以验收口径是「范围内的真值全部仍在、分数不变」，而不是「逐字符一致」。
+2. **P0 `timeout`**。Halcon 靠 `Set*ModelParam('timeout', ...)`；我们没有超时，5MP+360° NCC 最坏 285 ms 无上限。
+3. **P1 自动定参** `DetermineShapeModelParams` / `DetermineNccModelParams`：Halcon 能传「想问哪些参数」
+   拿推荐值（`contrast`/`min_contrast`/`angle_step`）。我们只有应用层 `minChainLen` 建议。
+   这条能直接消灭「默认 12/30 vs 需要 120/160」这个踩得最多的坑。
+4. **P1 多模型同搜** `FindShapeModels`/`FindNccModels`（跨模型统一 NMS + 共享预处理）。
+5. **P2** `Contrast` 支持**多区间**（`[lo1,hi1,lo2,hi2]` 选特定幅值段，我们只有单段）；
+   `Optimization` 字符串（实测三种模式点数相同，只作迁移兼容）；
+   各向异性 `ScaleR/ScaleC`（`CreateAnisoShapeModel`）。
+6. **P3** XLD/CAD 建模、`SubPixel='minimum_distance'`、`ignore_color_polarity`、
+   `InspectShapeModel`（我们 `drawModelFeatures` 已基本覆盖）。
+
+**语义差异（文档化即可，不算缺失）**：Halcon 的 `Metric` 是**建模参数**（XLD 模型可用
+`SetShapeModelMetric` 后改），我们是**搜索参数**（更灵活，可每次搜索切换）。
+
+### 7.13.4 已补齐的参数（2026-11-18 第二轮）
+
+上一节列的 P0/P2 参数级缺口已全部落地，**双架构零回归**：
+
+| 参数 | 位置 | 实测 |
+|---|---|---|
+| 搜索期角度子范围 `FindParams::angleStart/angleExtent`（CLI `-find-angle/-find-angle-extent`） | Shape + NCC | qfn1 全范围 9.80 → ±10° **5.00 ms**；NCC case1 14.39 → 10.18 ms。范围内真值分数/位置**逐位不变** |
+| 搜索期尺度子范围 `FindParams::scaleMin/scaleMax`（CLI `-find-smin/-find-smax`） | Shape | 同上 |
+| `FindParams::timeoutMs` / `NccFindParams::timeoutMs`（CLI `-timeout`） | Shape + NCC | 超时**返回已找到的结果**，`lastSearchTimedOut()` + 输出 `[TIMEOUT: partial result]` |
+| `MatchParams::optimization`（CLI `-optimization`） | Shape 建模 | 映射到 `maxPoints`（×1/0.75/0.50/0.33），case1 1200→900/600/396 点 |
+| `MatchParams::contrastBands`（CLI `-bands`） | Shape 建模 | 多段幅值区间；case1 默认 0.983 → `12,60` 0.805 → `0,40,120,400` 0.599 |
+
+**三个必须记住的实现坑**：
+
+1. **子范围抽稀要在"选中的列表"上做，不是在全局网格上按 `1<<top` 取模**。
+   在整个网格上取模时，一旦请求范围窄于粗层角度步长（360° 模型要 ±2°），
+   可能**一个粗层位姿都选不到**。
+2. **"落空就退回全部"是错的**：NCC 粗层角度步长 = 1°×2^level（3 层即 16°），
+   请求 ±2° 时网格无点，退回全部 23 个角度会让**窄范围反而变慢**
+   （实测 extent=4° 3.36 ms vs extent=20° 0.93 ms）。正确做法是
+   **取离范围中心最近的那一个粗角度**，误差交给 refine 的 ±2 步窗口收敛。
+   修完两边都单调：Shape 9.80/9.30/5.00/4.30/4.10、NCC 14.39/13.52/10.18/10.54/10.30。
+3. **模型文件版本要跟着加字段**：`minSide` 进 v4、`optimization`+`contrastBands` 进 v5，
+   读老版本时回落默认值（= 历史行为），否则 `-load` 后新参数静默丢失
+   （实测踩到：`-t1 -optimization` 当时没解析，写出来还是 1200 点）。
+
+**CLI 输出一律用英文**：控制台是 GBK，新加的中文字符串会显示成乱码
+（`[TIMEOUT: 结果不完整]` 实测乱码），已改回 `[TIMEOUT: partial result]`。
+
+
+### 7.14 架构级：Shape / NCC 都**不能**并发搜同一模型，头文件注释是错的（2026-11-18 实测）
+
+`ShapeMatch.h` 写着「findShapeModel() const only reads, so one built model may be
+searched from several threads」，`NccMatcher::findNccModel` 也标了 `const`。
+**两个都不成立**，实测（2 线程共享一个匹配器对象）：
+
+| 模块 | 输入 | 结果 |
+|---|---|---|
+| Shape | 同图并发（4/8 线程） | 0 差异 → **假阳性**，写进去的字节相同 |
+| Shape | **不同图、同尺寸** | **16/20 次返回另一张图的结果**（串台） |
+| Shape | **不同图、不同尺寸** | **exit `-1073741819`（0xC0000005 访问违规）** |
+| NCC | 同尺寸 | 0/30 次失败 → 侥幸安全 |
+| NCC | **不同尺寸** | **2/10 ~ 4/10 次丢匹配**（应 3 个只报 1 个） |
+
+**两个模块同一个根因：可变的「每帧状态」挂在模型 / 匹配器对象上。**
+
+- Shape：`srcPyramid_/srcGx_/srcGy_/srcQ8_/srcM8_` 是 `ShapeMatcher` 成员
+  （`ShapeMatch.h:326~334`），`prepareSource()` 每帧 `create()` 重分配；实现还**没有 const**
+  （`ShapeMatch.cpp:3048`）。
+- NCC 更隐蔽：`LevelData::mapW/mapH`（`NccMatch.cpp:94`，注释自己写着 "per search"）
+  是**模型数据里的每帧字段**，`prepareLevel()` 每帧覆盖。同尺寸时两线程写的值相同，
+  所以同尺寸测不出来。
+- 次因：`Impl::xformCache`（Shape）/ `Impl::rotCache`（NCC）都是无锁 `unordered_map`，
+  「只在串行预建段写」只是**单次调用内**的串行，两个线程各自进入该段仍然并发。
+
+三条通用规则：
+
+1. **验证并发缺陷必须用「不同内容 + 不同尺寸」的输入**。同图 / 同尺寸会掩盖竞争
+   （写的字节相同）。不同尺寸才会暴露 `cv::Mat::create` 重分配与 per-search 尺寸字段。
+2. **判断一个匹配器能否并发，看「每帧中间状态放在哪」**：放对象成员里 = 不能并发
+   （无论头文件怎么承诺、标没标 const）。要并发就抽成 `SearchContext`（每次调用一份）。
+3. **跨调用缓存必须有归属**：要么加锁，要么按线程隔离，不要靠「只在某个段写」的约定 ——
+   那个约定只在单线程调用时成立。
+
+复现：`_ai_tmp/arch_concurrent2.cpp`（Shape，不同图）+
+`_ai_tmp/arch_concurrent_ncc.cpp`（NCC）+ `arch_concurrent.cpp`（同图假阳性对照）。
+
+
+**其它结构性结论（详见 `_ai_tmp/arch_review_2026-11-18.md`）**：
+
+- `XForm` 混了粗扫数据（`ox/oy/np`，8 B/点）和精化数据（`fx/fy/nx/ny`，16 B/点）：
+  粗扫占 67% 时间却让 2/3 的数组陪跑 → 拆 `XFormCoarse`/`XFormFine`。
+- 候选池去重是 O(n²) 插入式（`ShapeMatch.cpp:3277`），**顺序依赖**是「二维并行会改结果」
+  的根因 → 换网格哈希去重可同时解决。
+- **不要为了「更优雅」重写**：内核层（SoA + 8 位量化 + 贪心早停）已是最优形态；
+  单文件 4008 行属可读性问题，拆分有内联风险且无收益。
+
 ---
 
 ## 8. GUI / ImGui
@@ -619,6 +814,19 @@ python -c "import zipfile;z=zipfile.ZipFile('dl.zip1');print(z.testzip(), len(z.
    endif()
    ```
    校验：PE 头 `e_lfanew+0x5C` 的 Subsystem == 2（WINDOWS）而非 3（CONSOLE）。
+7. **建模参数 / 搜索参数必须按「改了要不要重建模型」分组**：本库一共有三处「层数」——
+   `MatchParams::numLevels`（建模上限）、`MatchParams::minSide`（建模最粗层）、
+   `FindParams::numLevels`（搜索用几层），NCC 再来一对
+   （`NccParams::numLevels` / `NccFindParams::numLevels`）。
+   搜索期那一项必须挂在 `changedSearch/commitSearch` 上，**绝不能并进 `changedModel`**
+   （否则拖一下滑块就重建模型）；标签也要写「建模层数上限」vs「搜索层数」，
+   只写「金字塔层数」必然被误读。
+8. **ImGui 文本不走 Markdown**：`textWrapped("**重点**")` 会原样显示星号，
+   强调用「」或另开带颜色的 `textWarnWrapped`。
+9. **一个控件对某个匹配器无效时必须写出来**：`boxMode` 只作用于 Shape 的 `drawResult`
+   （`NccMatch.cpp` 里没有这个字段），但下拉框在共用的「结果筛选」组里。
+   同理 Shape 的 `metric` 是**搜索参数**、NCC 的 `metric` 是**建模参数** ——
+   同一界面上语义不同，不写说明就会被当成 bug。
 
 ### 8.1 GUI 自动化（合成鼠标事件本机可用）
 
@@ -747,8 +955,8 @@ python -c "import zipfile;z=zipfile.ZipFile('dl.zip1');print(z.testzip(), len(z.
 | 项 | 值 |
 |---|---|
 | 评分 | `scoreMode = 0`（mean）；`skipWeight = 0`；`cellMissMax = 0.35`；`minCoverage = 0` |
-| 搜索 | `minScore = 0.7`（库）/ `0.5`（CLI 示例）；`maxMatches = 12/20`；`maxOverlap = 1.0`（=关，Halcon 默认 0.5） |
-| 建模 | `contrast = 30` / `minContrast = 12`（Sobel）；`maxPoints = 1200`；`numLevels = 0`（auto） |
+| 搜索 | `minScore = 0.7`（库）/ `0.5`（CLI 示例）；`maxMatches = 12/20`；`maxOverlap = 1.0`（=关，Halcon 默认 0.5）；`numLevels = 0`（= 模型全部层） |
+| 建模 | `contrast = 30` / `minContrast = 12`（Sobel）；`maxPoints = 1200`；`numLevels = 0`（auto）；`minSide = 24`（金字塔最粗层最短边） |
 | NCC | 最粗层 `minSide = 9`；角度步长 1°@level0；无尺度维度 |
 | GUI 缩放滑块 | `scaleMin 0.2 ~ scaleMax 4.0`（自定区间，库不校验） |
 | 版本 | 1.2.0（`GeoMatch.h` + `CMakeLists.txt` 两处同步） |

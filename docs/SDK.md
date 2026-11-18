@@ -191,7 +191,10 @@ find_package(GeoMatch REQUIRED)
 | `contrast` | `30.0` | 滞后**高**阈值（灰度差），种子边 |
 | `minContrast` | `12.0` | 滞后**低**阈值（灰度差），弱边能否保留 |
 | `maxPoints` | `1200` | 最多保留多少个模型点 |
-| `numLevels` | `0` | 金字塔层数；`0` = 自动。**不要填 1** |
+| `numLevels` | `0` | 金字塔层数上限；`0` = 自动。**不要填 1** |
+| `minSide` | `24` | 金字塔最粗一层的**最短边下限（像素）**，即"模型能建多深"。多一层 → 粗扫位置数 ÷4、角度数 ÷2。经验规则：想要 N 层需 `minSide <= 模板短边 / 2^(N-1)`。实测 qfn1 2448×2048 / 360° / 101px 模板：`24` → 48.0 ms，`12` → **8.3 ms**。代价是弱/小目标容易被粗层糊掉（`12` 在 data2 丢 1 个 0.654 的弱目标；`16` 全数据集零回归）。**建模参数，改了要重建模型** |
+| `optimization` | 空 | Halcon `create_shape_model` 的 `Optimization`（`"none"` / `"auto"` / `"point_reduction_low|medium|high"`）。**映射到 `maxPoints`**（×1 / ×1 / ×0.75 / ×0.50 / ×0.33），因为实测 Halcon 三种模式点数相同、本库真正的控点旋钮是 `maxPoints`。只为配方迁移；要精确控点请用 `maxPoints` |
+| `contrastBands` | 空 | Halcon `Contrast` 的**多段幅值区间** `[lo1,hi1,lo2,hi2,...]`（内部 Sobel 幅值 = 界面灰度差 ×4）。空 = 用 `contrast`/`minContrast` 的单段滞后阈值；非空 = 种子和连接都要求幅值落在**任意一段**内。用来"只要中等边、丢掉高光强边" |
 | `mask` | 空 | `CV_8U`，非零 = 参与建模 |
 | `minChainLen` | `2` | 丢弃短于这个长度（像素）的孤立边缘链。**散斑/密集纹理模板的关键参数，详见 5.7** |
 
@@ -201,6 +204,10 @@ find_package(GeoMatch REQUIRED)
 |---|---|---|
 | `minScore` | `0.7` | 最低分数 |
 | `maxMatches` | `12` | 最多返回几个实例 |
+| `numLevels` | `0` | Halcon `find_shape_model` 的 `NumLevels`：搜索最多用模型的多少层（从最细层数起）。`0` = 全部（历史行为）。调小 → 从更细层开始（更慢、弱目标更稳）；上限是模型层数。**搜索参数，不需要重建模型**。实测 qfn1（4 层模型）`2/3/4` = 450 / 44.9 / **8.3 ms** |
+| `angleStart` / `angleExtent` | `0` / `-1` | Halcon `find_shape_model` 的搜索期角度子范围。`angleExtent <= 0` = 用模型全部角度；`> 0` = 只搜 `[angleStart, angleStart+angleExtent]`（按 2π 取模，跨 ±180 的区间也能表达）。**搜索参数**。实测 qfn1 全范围 9.80 → ±10° **5.00 ms**；范围内真值分数/位置逐位不变 |
+| `scaleMin` / `scaleMax` | `0` / `0` | Halcon `find_scaled_shape_model` 的搜索期尺度子范围。`scaleMax <= 0` = 用模型全部尺度 |
+| `timeoutMs` | `0` | Halcon `set_shape_model_param('timeout')` 语义：超时**返回已找到的结果**（不是报错），用 `lastSearchTimedOut()` 判断是否完整。检查点在每个粗扫位姿/refine 候选之间，所以实际超出约一个位姿的耗时 |
 | `minDistance` | `30.0` | 两实例中心的最小像素距离 |
 | `maxOverlap` | `1.0` | Halcon 的 `MaxOverlap`；1.0 = 关闭，0.5 是 Halcon 默认 |
 | `greediness` | `0.9` | 搜索贪心度，越大越快越可能漏 |
@@ -632,6 +639,8 @@ if (!m.create(tpl, cfg)) { /* 建不出来：见下面的"调过头" */ }
 | `maxOverlap` | `0.5` | 实例重叠超过这个比例只留高分那个 |
 | `subpixel` | `1` | `0` 关 / `1` 抛物线 |
 | `numLevels` | `0` | 从哪一层开始搜，0 = 用模型的层数 |
+| `angleStart` / `angleExtent` | `0` / `-1` | Halcon `find_ncc_model` 的搜索期角度子范围：`angleExtent <= 0` = 模型全部角度。实测 case1 14.39 → ±10° **10.18 ms**。范围窄于该层角度步长（1°×2^level）时取最近的粗角度，误差由 refine 收敛 |
+| `timeoutMs` | `0` | 超时毫秒数，超时返回已找到的结果，`lastSearchTimedOut()` 标记不完整 |
 | `debug` | `0` | 1 = 打印分段耗时，2 = 再打印候选表 |
 
 ### 6.3 `geomatch::NccResult`
@@ -745,10 +754,13 @@ printf("chains %d  pts/chain %.1f\n", chains,
 
 - **建模不是线程安全的**：`create()` / `load()` / `createNccModel()` 会改对象状态，
   同一个对象不要多线程同时建模。
-- **搜索是线程安全的**：`detect()` / `findNccModel()` 都是 `const`，
-  一个建好的模型可以被多线程同时搜。
-- **多相机 / 多工位**：每个线程一个 `Matcher`，各自 `load()` 同一个 `.shm` 即可
-  （模型文件只读）。
+- **⚠ 搜索目前也不是线程安全的**：`detect()` / `findNccModel()` 虽然标了 `const`，
+  但内部把**每帧的中间状态**存在对象里（Shape 的金字塔/梯度/量化面 `srcPyramid_` 等，
+  NCC 的 `LevelData::mapW/mapH`），并且会**重新分配**这些缓冲。实测（2 线程共享一个对象）：
+  Shape 不同图同尺寸 → 80% 的概率返回"另一张图"的结果；不同尺寸 → `0xC0000005` 崩溃；
+  NCC 不同尺寸 → 20~40% 丢匹配（同图/同尺寸测不出来，因为写进去的字节相同）。
+- **多相机 / 多工位**：**每个线程一个 `Matcher` 对象**，各自 `load()` 同一个 `.shm`
+  （模型文件只读，可共享文件）。
 - **内部并行**：库内部用 `cv::parallel_for_` 吃满所有核。宿主程序自己也开线程池时，
   可以用 `cv::setNumThreads(N)` 限制，避免过度订阅。
 - **OpenCL**：默认开启，但很多机器只有集显、收益为负。测过再决定
