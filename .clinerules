@@ -923,6 +923,22 @@ searched from several threads」，`NccMatcher::findNccModel` 也标了 `const`�
 
 ## 12. 文档图片与样例数据
 
+### 12.0 文档分工（改文档前先读这节）
+
+用户明确要求过：**README 只放两件事**（这个库干什么 + 最小 API），其余全部下沉。
+
+| 内容 | 唯一归属 | 不要写进 |
+|---|---|---|
+| 项目定位、最小 API、已对标函数表、文档导航 | `README.md`（保持在 150 行内） | — |
+| **参数的默认值 / 取值范围 / 含义 / 适用场景 / 调参顺序** | `docs/参数手册.md` | README、GUI 说明（只写"界面上在哪、拖了会怎样"） |
+| GUI 逐控件的默认值与影响 | `docs/GeoGUIDemo使用说明.md` | 参数手册（不重复数值推导） |
+| API 签名、集成、线程安全 | `docs/SDK.md` | — |
+| 与 Halcon 的差距 / 结论 / 实测 | `docs/与Halcon差距清单.md` + 对比报告 | README |
+| 文档索引 | `docs/README.md` | — |
+
+规矩：**同一件事只在一个文件里讲深**，其他地方只放一句结论 + 链接。
+新增文档必须同时在 `docs/README.md` 索引里挂上，否则等于没写。
+
 - README 的图（`docs/model_info.png`、`docs/match_result*.jpg`）都是 **CLI 画出来的**，不是 GUI 截图：
   `GeoMatchDemo -t case1\temp.jpg -d case1 -o _ai_tmp\docout -loops 5 -minscore 0.70 -max 12 -noshow`
   → 取 `out\model_info.png` 与结果图。**`-o` 目录要先 `mkdir`**（不存在时 `model_info.png` 静默不生成）。
@@ -959,7 +975,7 @@ searched from several threads」，`NccMatcher::findNccModel` 也标了 `const`�
 | 建模 | `contrast = 30` / `minContrast = 12`（Sobel）；`maxPoints = 1200`；`numLevels = 0`（auto）；`minSide = 24`（金字塔最粗层最短边） |
 | NCC | 最粗层 `minSide = 9`；角度步长 1°@level0；无尺度维度 |
 | GUI 缩放滑块 | `scaleMin 0.2 ~ scaleMax 4.0`（自定区间，库不校验） |
-| 版本 | 1.2.0（`GeoMatch.h` + `CMakeLists.txt` 两处同步） |
+| 版本 | 1.2.2（`GeoMatch.h` + `CMakeLists.txt` 两处同步） |
 | 文档入口 | `docs/README.md`（入门 / API / 结论汇总 / 专题 / 历史归档） |
 
 **已知短板与优先级**：见 `docs/与Halcon差距清单.md`（P0：搜索 ROI、建模对比度自适应、Shape 大图性能；
