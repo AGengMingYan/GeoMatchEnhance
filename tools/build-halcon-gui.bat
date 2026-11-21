@@ -6,7 +6,8 @@
 @rem
 @rem 依赖：
 @rem   HalconDemo/Halcon17/{include, x86sse2-win32, bin}
-@rem   OpenCV455_MSVC32/{include, opencv_world455.lib, opencv_world455.dll}
+@rem   OpenCV 32 位（扁平布局：include/ + opencv_world455.lib/.dll）
+@rem     候选：仓库根\OpenCV455_MSVC32、D:\Develop\OpenCV455_32、D:\develop2\OpenCV455_32
 @rem   imgui/imgui/imgui-master/imgui-master
 @rem
 @rem 输出：HalconDemo/bin/HalconGUIDemo.exe（Win32，可直接双击运行）
@@ -14,6 +15,17 @@
 @rem ========================================================================
 @echo off
 setlocal EnableDelayedExpansion
+
+@rem 本文件是 UTF-8(无 BOM) 且含中文注释。默认 GBK 控制台下 cmd 会按 GBK
+@rem 解码，累积错位后会把某些行首的 "@rem" 吃掉、把注释当命令执行
+@rem （实测输出 "系统找不到指定的文件" / "不是内部或外部命令"）。
+@rem 因此先把代码页切到 65001 再让 cmd 继续逐行解析，结束时还原调用者的代码页。
+set "GM_SAVED_CP="
+for /f "tokens=* delims=" %%L in ('chcp') do set "GM_CP_LINE=%%L"
+@rem chcp 的输出随语言变化（"Active code page: 936" / "活动代码页: 936"），
+@rem 只有最后一个 token 恒为数字，别用 tokens=2 取（会拿到 "code"）。
+for %%t in (!GM_CP_LINE!) do set "GM_SAVED_CP=%%t"
+chcp 65001 >nul
 
 @rem ---- 脚本目录(tools/) 与仓库根 ----
 set "SCRIPT_DIR=%~dp0"
@@ -24,8 +36,14 @@ set "HALCON_ROOT=%REPO_ROOT%HalconDemo\Halcon17"
 set "HALCON_LIB=%HALCON_ROOT%\x86sse2-win32"
 set "HALCON_BIN=%HALCON_ROOT%\bin"
 
-@rem ---- 32 位 OpenCV（仓库内扁平布局） ----
-set "OPENCV32=%REPO_ROOT%OpenCV455_MSVC32"
+@rem ---- 32 位 OpenCV（扁平布局：include/ + opencv_world455.lib） ----
+@rem 仓库自带的 OpenCV455_MSVC32 在部分机器上不存在，按顺序回退到本机安装的
+@rem 32 位 OpenCV。候选顺序与 tools\build-x86.bat / CMakeLists.txt 一致。
+@rem （不写 for /f：路径里的 "(x86)" 会撕裂 if( ... ) 块的括号计数，见 .clinerules）
+set "OPENCV32="
+if not defined OPENCV32 if exist "%REPO_ROOT%OpenCV455_MSVC32\opencv_world455.lib" set "OPENCV32=%REPO_ROOT%OpenCV455_MSVC32"
+if not defined OPENCV32 if exist "D:\Develop\OpenCV455_32\opencv_world455.lib" set "OPENCV32=D:\Develop\OpenCV455_32"
+if not defined OPENCV32 if exist "D:\develop2\OpenCV455_32\opencv_world455.lib" set "OPENCV32=D:\develop2\OpenCV455_32"
 
 @rem ---- ImGui ----
 set "IMGUI_ROOT=%REPO_ROOT%imgui\imgui\imgui-master\imgui-master"
@@ -35,8 +53,13 @@ if not exist "%HALCON_LIB%\halconcpp.lib" (
     echo [error] 找不到 Halcon 32 位库: %HALCON_LIB%\halconcpp.lib
     exit /b 1
 )
-if not exist "%OPENCV32%\opencv_world455.lib" (
-    echo [error] 找不到 32 位 OpenCV: %OPENCV32%\opencv_world455.lib
+if not defined OPENCV32 (
+    echo [error] 找不到 32 位 OpenCV（需要 opencv_world455.lib + include\opencv2）
+    echo         尝试过的位置:
+    echo           %REPO_ROOT%OpenCV455_MSVC32
+    echo           D:\Develop\OpenCV455_32
+    echo           D:\develop2\OpenCV455_32
+    echo         请把本机 32 位 OpenCV 加到上面的候选列表里
     exit /b 1
 )
 if not exist "%IMGUI_ROOT%\imgui.cpp" (
@@ -113,4 +136,5 @@ if not exist "%OUT_DIR%\opencv_world455.dll" (
 echo.
 echo [info] build OK: %OUT_EXE%
 echo [info] run: "%OUT_EXE%" case1   ^(DLL 已在同目录，可直接双击^)
+if defined GM_SAVED_CP chcp %GM_SAVED_CP% >nul
 endlocal

@@ -742,6 +742,87 @@ Origin、`Get*Params`→`params()`。
 （`[TIMEOUT: 结果不完整]` 实测乱码），已改回 `[TIMEOUT: partial result]`。
 
 
+### 7.13.5 大模板检不到的两个几何/阈值根因（2026-11-19 实测，含日志复盘方法）
+
+现场图（1440×1080 的焊盘阵列）里框 400~937 px 的大模板，经常出现
+「模板明明在视野里、OpenCV `TM_CCOEFF_NORMED` = 1.0000，我们却 0 命中」。
+两个**互不相关**的原因，判定顺序如下。
+
+#### 先看「搜索耗时」定位是哪一类
+
+| 现象 | 指向 |
+|---|---|
+| `search = 0.0~0.1 ms`，结果 0 | **粗层没有任何候选**（分数图整片 -1 或被 `topTarget` 卡掉） |
+| `search` 正常（几十 ms）但分数低 | 评分口径/对比度问题 |
+
+`-debug 2` 看两行就够：`mapMax=` 与 `candidates=`；
+再往下逐层看 `level N: n=… best=…`（分数**逐层下降**说明候选本来就不对）。
+
+#### 根因 A：正方形核把真值中心挤出可搜索范围（**最容易被误判成"贴边"**）
+
+搜索按 `K×K` 正方形核建分数图（`XForm::R = max|点偏移|`，还要叠加角度膨胀），
+候选中心只能取 `[R, dim-1-R]`：
+
+```
+ShapeMatch.cpp:1720  scoreMap.create(rows - K + 1, cols - K + 1, CV_32F)
+ShapeMatch.cpp:1279  const int y = yi + R;     // 中心 y ∈ [R, rows-1-R]
+```
+
+模板越大、越**非正方形**、越靠近图像下/右边缘，被排除的边界带越宽。
+
+| 案例 | 模板 | 真值中心 | 正方形核可搜索 y | 结果 |
+|---|---|---|---|---|
+| 1 | 728×599 (R=364) | y=763.5 | [364, 715] | 763.5 越界 → 0 命中 |
+| 2 | 937×755 (R=468) | y=646.5 | [468, 611] | 646.5 越界 → 0 命中 |
+
+**判据（可直接对现场算）**：`max(w, h) <= 2 * (H-1 - centerY)`，
+超出就是必检不到。案例 2：`937 > 2*(1079-646.5) = 865` → 必然失败。
+
+**10 分钟验证法（不用改代码）**：把搜索图底部/右侧 `BORDER_REPLICATE` 补边，
+让真值中心进范围，再跑一次——命中即证明是几何约束：
+
+```
+案例 2 补 64 px 后：s=0.997 pos=(756.97; 646.00) ← 精确命中真值
+案例 1 补 728 px 后：s=0.998 pos=(971.01; 762.99)
+```
+
+修法 = 矩形核 `Rx/Ry`（逐角度按实际点偏移算，`Kx=2Rx+1`/`Ky=2Ry+1`），
+要动 `XForm` + 4 个扫描内核（含 AVX2）+ `correlate` + 候选坐标换算。
+注意：**即使修好，非正方形大模板 + 大角度范围在 45° 附近仍会检不到**
+（旋转后真的放不下，`K > 图高`），那是正确的几何拒绝，按 `-find-angle` 收窄即可。
+
+#### 根因 B：最粗层点数 < 8 时整层判死（2026-11-19 已修）
+
+`minKept = std::max(8, n/4)` 在 `n < 8` 时恒大于 `n` ⇒ `cnt <= n < minKept`
+⇒ 该层每个位置都写 `vDead = -1`。而 Shape **从最粗层开始且没有 NCC 那套退层回退**
+（`NccMatch.cpp:851` 有 `coarseFloor`，Shape 没有）⇒ 整帧 0 命中。
+
+实测：400×400 模板建到 25×25 只剩 **4 点**（`minKept` 要 8）→ level4 全死；
+`-find-levels 4` 却能命中 `s=0.999`。
+
+**已改成 `minKeptFor(n) = max(1, min(n, max(8, n/4)))`**（6 处调用点统一）：
+`n>=8` 逐位不变、`n=1..7` 退化为 n、`n=0` 仍判死且避免 `0/0`→NaN。
+回归：data1/data2/case1/synth/qfn1 双架构 201 行**逐字符一致**。
+
+用 `modelActivePoints(level)` 可以一键查各层点数（`_ai_tmp/tkl/probe_levels.cpp`）。
+
+#### 还没修：小模板「level1+ 点数 = 0」
+
+`sq_180/240/300` 的 level1 及以上 `activePoints = 0`（对比度 5.5/3 对 pyrDown 后的
+弱边太高），`-find-levels 1` 能命中 `s=1.000` 但慢（366~572 ms）。
+`minKept` 救不了（确实无点可评）。正确修法是**选顶层时跳过 `activePoints == 0` 的层**
+或建模对比度自适应（P1 短板）。
+
+#### 复盘方法（通用，省时间）
+
+1. **先确认模板本身没坏**：GUI 存出的 `template.png` 与源图 ROI 做 `np.array_equal`
+   + `cv2.matchTemplate(TM_CCOEFF_NORMED)`（应为 1.0000）。
+   本机日志里的 PNG 是密文，要先 `cat` 解密才能读。
+2. **用 `-find-levels 1` 排除金字塔**：level0 全扫还 0 命中 ⇒ 与层数、`minKept` 无关。
+3. **补边实验**区分「几何约束」与「评分/对比度」。
+4. 只有确认几何没问题，才去动对比度/评分口径。
+
+
 ### 7.14 架构级：Shape / NCC 都**不能**并发搜同一模型，头文件注释是错的（2026-11-18 实测）
 
 `ShapeMatch.h` 写着「findShapeModel() const only reads, so one built model may be
@@ -866,6 +947,14 @@ searched from several threads」，`NccMatcher::findNccModel` 也标了 `const`�
 7. **验证批处理判定逻辑时别用 `cmd` 的 `echo >` 造测试文件**（落盘是密文，`findstr` 一行都匹配不到）；
    用 `Copy-Item` 或 `[IO.File]::WriteAllText`。
 8. **`.ps1` 含中文必须 UTF-8 带 BOM**（PS 5.1 按 GBK 解析无 BOM 文件，报一串假语法错误）。
+9. **`.bat` 含中文注释必须开头 `chcp 65001`**：`.bat` 是 UTF-8 无 BOM、而控制台默认 936 时，
+   cmd 按 GBK 逐行解码会累积错位，把某些行首的 `@rem` **吃掉当命令执行**
+   （实测报 `系统找不到指定的文件` / `'熷悗浼氭妸' 不是内部或外部命令`，而且不影响编译，极易忽略）。
+   写法：开头 `chcp 65001 >nul`，结尾还原调用者的代码页；
+   解析 `chcp` 的输出要取**最后一个 token**（`Active code page: 936` / `活动代码页: 936`，
+   用 `tokens=2 delims=: ` 会拿到英文 `code` → `Parameter format not correct`）。
+10. **`@rem` 行里不要出现 `<` 或 `>`**：`@rem 候选：<repo>\...` 会被 cmd 当重定向执行，
+    同一行/后续行的 `@rem` 都可能被吃掉。写「仓库根」或加引号。
 
 ---
 
@@ -975,7 +1064,7 @@ searched from several threads」，`NccMatcher::findNccModel` 也标了 `const`�
 | 建模 | `contrast = 30` / `minContrast = 12`（Sobel）；`maxPoints = 1200`；`numLevels = 0`（auto）；`minSide = 24`（金字塔最粗层最短边） |
 | NCC | 最粗层 `minSide = 9`；角度步长 1°@level0；无尺度维度 |
 | GUI 缩放滑块 | `scaleMin 0.2 ~ scaleMax 4.0`（自定区间，库不校验） |
-| 版本 | 1.2.2（`GeoMatch.h` + `CMakeLists.txt` 两处同步） |
+| 版本 | 1.2.3（`GeoMatch.h` + `CMakeLists.txt` 两处同步） |
 | 文档入口 | `docs/README.md`（入门 / API / 结论汇总 / 专题 / 历史归档） |
 
 **已知短板与优先级**：见 `docs/与Halcon差距清单.md`（P0：搜索 ROI、建模对比度自适应、Shape 大图性能；

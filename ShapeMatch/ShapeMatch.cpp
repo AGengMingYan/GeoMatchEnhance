@@ -1233,6 +1233,24 @@ void ShapeMatcher::correlate(int level, int aIdx, int sIdx, cv::Mat& scoreMap, i
 //=======================================================================
 namespace
 {
+    // 每个位置至少要保留多少个"有效点"，否则判为 dead（写 -1）。
+    //
+    // 旧写法 `std::max(8, n / 4)` 在 n < 8 时**恒大于 n**：一个 400x400 的模板
+    // 建到第 5 层只剩 4 个点，于是 cnt（<= n = 4）永远达不到 8，该层每个位置都
+    // 被写成 -1 —— 整张分数图全死。Shape 的搜索从最粗层开始、且没有 NCC 那套
+    // "退一层重扫"的回退，所以最粗层全死 = 整帧 0 命中（`-find-levels 4` 却能
+    // 命中 s=0.999 就是这么来的）。
+    //
+    // 改成"不超过 n 的下限"后：
+    //   * n >= 8：max(8, n/4) <= n，结果与旧值**逐位相同**（回归不受影响）；
+    //   * n = 1..7：下限退化为 n，弱层照常评分，不再整层判死；
+    //   * 下限仍保留 1：n = 0 的理论情况下让 minKept = 0 会使 cnt 恒为 0，
+    //     平均变成 0/0（AVX 路径直接产出 NaN）。
+    inline int minKeptFor(int n)
+    {
+        return std::max(1, std::min(n, std::max(8, n / 4)));
+    }
+
     class ScanInvoker : public cv::ParallelLoopBody
     {
     public:
@@ -1266,7 +1284,7 @@ namespace
             // decent fraction of the model points actually has usable gradient
             // magnitude in the search image, otherwise the division by the
             // kept count could blow noise up to a "perfect" score.
-            const int   minKept = std::max(8, n / 4);
+            const int   minKept = minKeptFor(n);
             const float invKept = 1.f / (float)minKept;
 
             // the gradient images are CV_16F (half) -> half the memory traffic
@@ -1561,7 +1579,7 @@ namespace
             const int16_t* SM_RESTRICT poy = xf->oy.data();
             const int32_t* SM_RESTRICT pnp = xf->np.data();
 
-            const int   minKept = std::max(8, n / 4);
+            const int   minKept = minKeptFor(n);
             const float invN = 1.f / n;
             const int xEnd = w - R;
             const float qdot = kQ8Dot;
@@ -1793,7 +1811,7 @@ namespace
         const float* pny = xf.ny.data();
         float sum = 0.f;
         int   cnt = 0;
-        const int minKept = std::max(8, n / 4);
+        const int minKept = minKeptFor(n);
         const float lim = limit * n;
         for (int k = 0; k < n; k++)
         {
@@ -1851,7 +1869,7 @@ namespace
         const int n = xf.n;
         float sum = 0.f;
         int   cnt = 0;
-        const int minKept = std::max(8, n / 4);
+        const int minKept = minKeptFor(n);
         for (int k = 0; k < n; k++)
         {
             const float gx = sampleF16Bilinear(sx, ay + xf.fy[k], ax + xf.fx[k]);
@@ -2044,7 +2062,7 @@ namespace
 
         // 默认口径（skipWeight = 0）：mean/clipped 对全部 n 个模型点取平均 = Halcon；
         // 设了 skipWeight 则只对"有效点"取平均，coverage 仍以全部 n 为分母。
-        const int minKept = std::max(8, n / 4);
+        const int minKept = minKeptFor(n);
         double sum = 0.0, posSum = 0.0, absSum = 0.0;
         int cnt = 0;
         for (int k = 0; k < n; k++)
@@ -2530,7 +2548,7 @@ void ShapeMatcher::scanLocalPolarity(int level, const XForm& xf, cv::Mat& scoreM
 
     auto scanRows = [&](int y0, int y1)
     {
-        const int minKept = std::max(8, n / 4);
+        const int minKept = minKeptFor(n);
         for (int y = y0; y < y1; y++)
         {
             float* orow = scoreMap.ptr<float>(y);
